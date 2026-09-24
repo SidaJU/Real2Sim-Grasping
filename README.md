@@ -230,3 +230,50 @@ UsdPhysics.MassAPI.Apply(obj).GetMassAttr().Set(0.5)
 | T2 3DGS 重建 | ⬜ 待做 | |
 | T3 资产化 + 物理 | ⬜ 待做 | |
 | T4 抓取 + 评估 | ⬜ 待做 | |
+
+---
+
+## 版本库说明（换一台电脑继续做）
+
+本仓库只存放**个人产出**，方便在任意电脑上 clone 后继续学、继续做。
+
+| 入库内容 | 说明 |
+|---|---|
+| `ECOSPLATNOTES/` | EcoSplat 学习笔记（HTML，双击即可离线打开，无外部依赖） |
+| `docs/` | 3DGS / Real2Sim 各阶段笔记（Lesson、Problem、Supplement 系列） |
+| `scripts/` | 各阶段可执行脚本 |
+| `README.md` | 本手册 |
+
+**不入库的内容**（规则见 `.gitignore`）：
+
+| 排除项 | 原因 |
+|---|---|
+| `ecoSplat/`、`dust3r/` | 上游仓库克隆，自带 `.git`（放进仓库会被当成 submodule，文件传不上去）；且 `ecoSplat` 含 845MB 权重，远超 GitHub 单文件 100MB 上限 |
+| `results/` | 训练产物（183MB ckpt + 60MB ply） |
+| `*.log`、`*.err` | 过程日志 |
+
+### 换电脑后复原环境
+
+```bash
+# 1) 拉本仓库（笔记 + 文档 + 脚本）
+git clone https://github.com/SidaJU/Real2Sim-Grasping.git
+
+# 2) 重新 clone 上游代码（笔记里引用的源码行号对应这两个仓库）
+git clone https://github.com/KAIST-VICLab/EcoSplat.git ecoSplat
+git clone https://github.com/naver/dust3r.git dust3r
+
+# 3) 下载 EcoSplat 预训练权重（845MB；只在要跑推理时才需要）
+curl -L -o ecoSplat/pretrained_weights/ecosplat-spfsplat-re10k.ckpt \
+  https://huggingface.co/quan5609/EcoSplat/resolve/main/ecosplat-spfsplat-re10k.ckpt
+```
+
+> 笔记**只有一份**，就在 `ECOSPLATNOTES/`。
+> 改完直接：`git add -A` → `git commit -m "说明"` → `git push`，不需要任何同步脚本。
+
+### EcoSplat 学习进度
+
+- [x] Ch.01 输入与预处理（patch 切块 / 归一化 / pos 网格坐标）
+- [x] Ch.02 Transformer 骨干（原笔记复习 + 真实维度对齐 + 全部实算）
+- [ ] Ch.03 Cross-Attention（多视角聚合，257 × 514 的由来）
+- [ ] Ch.04 RoPE 与 curope（CUDA 算子入口）
+- [ ] Ch.05 多视角路由与输出头（DPT head / pose head）
