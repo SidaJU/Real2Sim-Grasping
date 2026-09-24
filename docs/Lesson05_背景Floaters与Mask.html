@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 05 · 背景 Floaters：成因与 Mask 治理</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    line-height:1.75;
+  }
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+
+  .callout{
+    background:var(--indigo-soft); border:1px solid #c7d2fe; border-left:5px solid var(--indigo);
+    border-radius:10px; padding:18px 22px; margin:24px 0;
+  }
+  .callout strong{color:var(--indigo)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+
+  .card{background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px;
+        box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  .card.bad{border-left:5px solid var(--red)}
+  .card.good{border-left:5px solid var(--green)}
+  .card.warn{border-left:5px solid var(--amber)}
+  .card h4{margin:0 0 10px; font-size:1rem}
+  .card.bad h4{color:var(--red)}
+  .card.good h4{color:var(--green)}
+  .card.warn h4{color:var(--amber)}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig img{display:block; width:100%; height:auto; border-radius:8px}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.92rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line)}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+
+  .chain{display:flex; flex-direction:column; gap:0; margin:20px 0}
+  .chain .node{background:#fff; border:2px solid var(--indigo); border-radius:10px;
+               padding:10px 18px; text-align:center; font-weight:600}
+  .chain .arrow{text-align:center; color:var(--indigo); font-size:1.4rem; line-height:1.4; font-weight:700}
+  .chain .node.loop{border-color:var(--red); color:var(--red)}
+  .chain .arrow.loop{color:var(--red)}
+
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{
+    content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600;
+  }
+  footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Lesson 05 · 背景 Floaters：成因与 Mask 治理</h1>
+  <div class="sub">为什么训着训着会"长出"一团灰白色的雾，以及怎么用一张黑白图把它掐灭</div>
+</header>
+
+<div class="callout">
+  <strong>核心结论：</strong>floaters 不是 bug，是 <strong>densification（自适应密度控制）在背景区域失控</strong>。
+  3DGS 必须解释照片里的每一个像素；当背景无法被收敛（位姿误差 + 纯色无纹理）时，
+  「误差大 → 梯度大 → 分裂更多 → 还是拟合不好」形成恶性循环，高斯数量 <strong>133 倍爆炸</strong>。
+  <strong>Mask 切断的是这条链的第一环</strong>：背景区域 loss=0 → 梯度=0 → 永不分裂。
+</div>
+
+<h2>1 · 现象</h2>
+
+<div class="grid2">
+  <div class="fig">
+    <img src="assets/floaters_before.png" alt="before: 灰白色 floaters 包围着重建的盒子">
+    <figcaption><strong>修复前</strong>：盒子周围一大团灰白色半透明高斯（背景泡沫），
+      还有白色"尖刺"沿相机方向伸展。 COLMAP baseline，无 mask。</figcaption>
+  </div>
+  <div class="fig">
+    <img src="assets/floaters_after.png" alt="after: 大团 floaters 消失">
+    <figcaption><strong>修复后</strong>：大团 floaters 消失，盒子轮廓干净，
+      只剩少量贴脸小高斯（下一步可用 cull 阈值压）。</figcaption>
+  </div>
+</div>
+
+<p>用户的原始观察非常准确：<strong>"训练刚开始没有灰白色背景球，训着训着从饼干盒周围生出来"</strong>
+——这个"从周围长出来"的位置信息，正是定位成因的关键线索（见 §3）。</p>
+
+<h2>2 · 数据证据：高斯数量的爆炸曲线</h2>
+
+<div class="fig">
+<svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <!-- 对数刻度 y 轴: 1k..1M -->
+  <g stroke="#e2e8f0" stroke-width="1">
+    <line x1="70" y1="250" x2="880" y2="250"/>
+    <line x1="70" y1="185" x2="880" y2="185"/>
+    <line x1="70" y1="120" x2="880" y2="120"/>
+    <line x1="70" y1="55"  x2="880" y2="55"/>
+  </g>
+  <g font-size="11" fill="#94a3b8" text-anchor="end">
+    <text x="62" y="254">1k</text><text x="62" y="189">10k</text>
+    <text x="62" y="124">100k</text><text x="62" y="59">1M</text>
+  </g>
+
+  <!-- bars: log10 scale, base y=250, per decade 65px -->
+  <!-- initial 3613 -> h=(3.558-3)*65=36 -->
+  <rect x="100" y="214" width="70" height="36" fill="#94a3b8"/>
+  <text x="135" y="206" font-size="12" text-anchor="middle" fill="#475569">3,613</text>
+  <text x="135" y="270" font-size="11" text-anchor="middle" fill="#64748b">初始点云</text>
+
+  <!-- no-mask 34279 @1600 -> h=(4.535-3)*65=100 -->
+  <rect x="240" y="150" width="70" height="100" fill="#dc2626"/>
+  <text x="275" y="142" font-size="12" text-anchor="middle" fill="#dc2626" font-weight="700">34,279</text>
+  <text x="275" y="270" font-size="11" text-anchor="middle" fill="#64748b">无mask @1600</text>
+
+  <!-- no-mask 480673 @8900 -> h=(5.682-3)*65=174 -->
+  <rect x="380" y="76" width="70" height="174" fill="#dc2626"/>
+  <text x="415" y="68" font-size="13" text-anchor="middle" fill="#dc2626" font-weight="700">480,673</text>
+  <text x="415" y="270" font-size="11" text-anchor="middle" fill="#64748b">无mask @8900</text>
+
+  <!-- mask 15318 @1600 -> h=(4.185-3)*65=77 -->
+  <rect x="560" y="173" width="70" height="77" fill="#059669"/>
+  <text x="595" y="165" font-size="12" text-anchor="middle" fill="#059669" font-weight="700">15,318</text>
+  <text x="595" y="270" font-size="11" text-anchor="middle" fill="#64748b">mask @1600</text>
+
+  <!-- mask 35638 @14900 -> h=(4.552-3)*65=101 -->
+  <rect x="700" y="149" width="70" height="101" fill="#059669"/>
+  <text x="735" y="141" font-size="12" text-anchor="middle" fill="#059669" font-weight="700">35,638</text>
+  <text x="735" y="270" font-size="11" text-anchor="middle" fill="#64748b">mask @14900</text>
+
+  <!-- annotation -->
+  <path d="M415,60 C460,30 520,40 560,55" stroke="#059669" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+  <text x="480" y="32" font-size="12" fill="#059669" font-weight="700">差 13.5 倍</text>
+  <text x="735" y="130" font-size="11" text-anchor="middle" fill="#059669">0 split（分裂已停止）</text>
+</svg>
+<figcaption>对数刻度。无 mask：1600 步就 34,279，8900 步冲到 48 万还在涨；
+有 mask：14900 步稳定在 3.5 万，且日志显示 <code>0 GSs split</code> —— 增殖已被切断。</figcaption>
+</div>
+
+<h2>3 · 机制：一条恶性循环链</h2>
+
+<div class="chain">
+  <div class="node">背景占画面 80%+（白桌面 + 白背景）</div>
+  <div class="arrow">↓</div>
+  <div class="node">3DGS 必须解释每一个像素 → 初期背景靠少量高斯"糊"着 → loss 大</div>
+  <div class="arrow">↓</div>
+  <div class="node">densification 判据 = 累积视图空间梯度超阈值 → "这里细节不够，分裂！"</div>
+  <div class="arrow">↓</div>
+  <div class="node loop">高斯变多 → 但背景仍然拟合不好 → 梯度依然大 → 继续分裂 ……</div>
+</div>
+
+<div class="card bad">
+  <h4>循环为什么停不下来：位姿误差 18 cm 是共犯</h4>
+  <p>如果所有照片对"桌面在哪"意见一致，背景最终能收敛成一块干净的平面，梯度会降下去，分裂自然停止
+  （真值版正是这样）。但 COLMAP 位姿误差 18 cm —— 每张照片眼里的桌面位置都不一样，
+  <strong>不存在一个能同时满足所有照片的背景解</strong> → 梯度永远不降 → 分裂永远不停。</p>
+</div>
+
+<div class="card warn">
+  <h4>为什么"从盒子周围生出来"</h4>
+  <p>densification 优先分裂<strong>误差最大</strong>的区域。物体边缘（阴影、接触面、半透明轮廓）
+  是全图误差峰值所在 → 最先分裂 → 新高斯从边缘向外蔓延进背景。
+  这就是用户观察到"从饼干盒周围生出来"的原因，也是 3DGS 文献里典型的
+  <strong>floaters / background foam</strong>。</p>
+</div>
+
+<h2>4 · 解决方案</h2>
+
+<h3>4.1 第一道：清理初始点云（训练前）</h3>
+<p>降 <code>peak_threshold</code> 救注册率的副作用：白桌面上也提出噪声特征，
+初始点云 22% 是远处杂点、37% 是灰色桌面点。两道过滤（均不需真值）：</p>
+<ul>
+  <li><strong>track 长度过滤</strong>：被 &lt; 3 张图看到的点大多是误匹配产物 → 丢 1,151 个</li>
+  <li><strong>统计离群剔除</strong>（open3d）→ 再丢 159 个</li>
+</ul>
+<pre>4923 → 3,613   (scripts/28_filter_colmap_init.py)</pre>
+
+<h3>4.2 第二道：Mask（训练中，核心手段）</h3>
+
+<p><strong>原理一句话</strong>：把 GT 图和渲染图在 mask 外同时置黑 → 背景区域 loss = 0
+→ 梯度 = 0 → densification 永不触发。切断循环链的第一环。</p>
+
+<div class="fig">
+<svg viewBox="0 0 920 260" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <!-- left: no mask -->
+  <text x="40" y="30" font-size="15" font-weight="700" fill="#dc2626">无 mask：全图都有 loss</text>
+  <rect x="40" y="50" width="360" height="150" fill="#fef2f2" stroke="#fecaca" stroke-width="2" rx="8"/>
+  <rect x="150" y="95" width="140" height="70" fill="#fbbf24" stroke="#b45309" rx="4"/>
+  <text x="220" y="135" font-size="12" text-anchor="middle" fill="#78350f">物体</text>
+  <text x="220" y="225" font-size="12" text-anchor="middle" fill="#dc2626">背景区域也在算 loss → 梯度大 → 分裂</text>
+
+  <line x1="460" y1="40" x2="460" y2="230" stroke="#e2e8f0" stroke-dasharray="4 4"/>
+
+  <!-- right: with mask -->
+  <text x="520" y="30" font-size="15" font-weight="700" fill="#059669">有 mask：背景 loss = 0</text>
+  <rect x="520" y="50" width="360" height="150" fill="#0f172a" stroke="#334155" stroke-width="2" rx="8"/>
+  <rect x="630" y="95" width="140" height="70" fill="#fbbf24" stroke="#b45309" rx="4"/>
+  <text x="700" y="135" font-size="12" text-anchor="middle" fill="#78350f">物体</text>
+  <text x="700" y="225" font-size="12" text-anchor="middle" fill="#059669">背景置黑 → loss=0 → 梯度=0 → 永不分裂</text>
+  <text x="700" y="245" font-size="11" text-anchor="middle" fill="#64748b">GT × mask 和 渲染 × mask 同时置黑</text>
+</svg>
+<figcaption>mask 外的区域在 GT 与渲染图上同为纯黑 → 逐像素差为零 → 不产生任何梯度。</figcaption>
+</div>
+
+<h4>代码链路（nerfstudio 实测，5 步）</h4>
+<ol class="steps">
+  <li><strong>生成</strong>：<code>29_make_colmap_masks.py</code> — 色度阈值
+      <code>max(RGB)-min(RGB) &gt; 40</code> + <code>binary_fill_holes</code> 填洞 → 单通道 PNG（物体 255 / 背景 0）</li>
+  <li><strong>配对</strong>：<code>colmap_dataparser.py:178-181</code> — 按<strong>同名 + .png</strong> 找 mask</li>
+  <li><strong>读取</strong>：<code>data_utils.py:35</code> — <code>.bool()</code> 把 0/255 转成 False/True
+      （所以 255 不会把 loss 乘爆）</li>
+  <li><strong>上 GPU</strong>：<code>full_images_datamanager.py:131</code> —
+      <code>--pipeline.datamanager.masks-on-gpu True</code> → 进入 <code>batch["mask"]</code></li>
+  <li><strong>生效</strong>：<code>splatfacto.py:707-715</code> —
+      <code>gt_img *= mask; pred_img *= mask</code></li>
+</ol>
+
+<div class="card warn">
+  <h4>mask 生成本身有两个坑</h4>
+  <p><strong>① 不能用"非白"阈值</strong>：实测桌面亮度 207~214，任何"不是纯白就算物体"的规则都会把整张桌子判成物体。
+  必须用<strong>色度</strong>（物体是饱和的红/黄，桌面是灰白）。</p>
+  <p><strong>② 盒子自身的白色印刷区会被误排除</strong>：CHEEZ-IT 文字的白底色度极低 → mask 中间出现黑洞
+  → 那些像素没有 loss → 盒子表面重建出洞。解法：<code>binary_fill_holes</code>
+  把被物体剪影完全包围的背景区填掉（纯形态学操作，无需真值）。</p>
+</div>
+
+<h2>5 · 效果核对</h2>
+
+<table>
+  <thead><tr><th>指标</th><th>无 mask</th><th>有 mask</th></tr></thead>
+  <tbody>
+    <tr><td>初始高斯</td><td class="num">3,613</td><td class="num">3,613（同一点云）</td></tr>
+    <tr><td>step 1600</td><td class="num">34,279</td><td class="num">~15,000</td></tr>
+    <tr><td>step 8900</td><td class="num" style="color:#dc2626">480,673（仍指数增长）</td><td class="num">—</td></tr>
+    <tr><td>step 14900</td><td class="num">—</td><td class="num" style="color:#059669">35,638（0 split，已稳定）</td></tr>
+    <tr><td>视觉</td><td>大团灰白 floaters 包围物体</td><td>floaters 消失，物体轮廓干净</td></tr>
+  </tbody>
+</table>
+
+<p>无 mask 版在 <strong>step 1600 就达到了 mask 版训到 14900 步的总量</strong>——
+之后多出来的 45 万个高斯，全部是背景泡沫。</p>
+
+<h2>6 · 可复用经验</h2>
+
+<div class="grid2">
+  <div class="card warn">
+    <h4>看到"训着训着长出雾"</h4>
+    <p>先看日志 <code>Now having X GSs</code> 的增速。指数增长 = 背景区域梯度失控，
+    光调参数（cull 阈值、scale 正则）只是止血，<strong>要切断 loss 来源</strong>（mask / 背景）。</p>
+  </div>
+  <div class="card good">
+    <h4>mask 是"解释权"的取舍</h4>
+    <p>加了 mask，背景就不再被建模——物体悬浮、没有环境。对<strong>抓取</strong>这正是想要的；
+    对<strong>场景级重建</strong>则不适用。先想清楚你要什么。</p>
+  </div>
+  <div class="card warn">
+    <h4>阈值要用对物理量</h4>
+    <p>"物体 vs 背景"的区别是<strong>色度</strong>（饱和度）不是亮度。
+    先采样实测背景的亮度/色度分布，再定阈值——拍脑袋定 240 会把整张桌子框进去。</p>
+  </div>
+  <div class="card good">
+    <h4>floaters 的根因排序</h4>
+    <p>① 背景无约束被强行解释（mask 可治）② 位姿误差让背景无解（治本要修位姿）
+    ③ 初始点云混入背景种子（训前清理）。三个一起治，缺一可能复发。</p>
+  </div>
+</div>
+
+<footer>
+  相关文件：<code>29_make_colmap_masks.py</code>（色度阈值 + 填洞）、
+  <code>28_filter_colmap_init.py</code>（初始点云清理）、
+  <code>run_train_colmap_masked.bat</code>（带 mask 训练）、
+  <code>assets/floaters_before.png · floaters_after.png</code>（对比截图）<br>
+  Lesson 系列：01 初始点云 · 02 gsplat 编译 · 03 初始化与自洽性 · 04 COLMAP 调参 · 05 背景 Floaters 与 Mask
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Problem 02 · 坐标系陷阱：训练"在跑"但永不收敛（含通用排查手册）</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+       font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75}
+  .wrap{max-width:1000px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--red); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.85rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.82rem; line-height:1.6}
+  pre.bad{border-left:4px solid var(--red)}
+  pre.good{border-left:4px solid var(--green)}
+
+  .callout{background:var(--red-soft); border:1px solid #fecaca; border-left:5px solid var(--red);
+           border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--red)}
+  .callout.blue{background:var(--indigo-soft); border-color:#c7d2fe; border-left-color:var(--indigo)}
+  .callout.blue strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:780px){.grid2{grid-template-columns:1fr}}
+  .card{background:#fff; border:1px solid var(--line); border-radius:12px; padding:18px 22px;
+        box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  .card.bad{border-left:5px solid var(--red)}
+  .card.good{border-left:5px solid var(--green)}
+  .card.warn{border-left:5px solid var(--amber)}
+  .card h4{margin:0 0 8px; font-size:1rem}
+  .card.bad h4{color:var(--red)} .card.good h4{color:var(--green)} .card.warn h4{color:var(--amber)}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig img{display:block; width:100%; height:auto; border-radius:8px}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:16px 0}
+  th,td{padding:10px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+
+  ul,ol{margin:10px 0; padding-left:22px}
+  li{margin:5px 0}
+  .tag{display:inline-block; background:#fee2e2; color:#991b1b; border-radius:4px;
+       padding:1px 7px; font-size:.8rem; font-weight:700; margin-right:6px}
+  .tag.ok{background:#d1fae5; color:#065f46}
+  footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Problem 02 · 坐标系陷阱：训练"在跑"但永不收敛</h1>
+  <div class="sub">一个不报错、loss 正常、step 照涨，但物体永远在相机背后的 bug —— 附通用排查手册</div>
+</header>
+
+<div class="callout">
+  <strong>一句话：</strong>07 脚本多乘了一个把 USD 位姿转成"OpenCV"的 <code>FLIP</code> 矩阵。
+  但 nerfstudio/gsplat 用的是 <strong>OpenGL 约定（相机看 -Z）</strong>，而 USD 位姿本来就是 -Z。
+  这一乘让所有相机<strong>转了 180°</strong>，物体跑到相机背后 → 渲染 accumulation 恒为 0 →
+  梯度全 0 → densify 永不触发 → 模型永远停在"半透明初始点云"。
+</div>
+
+<h2>1 · 问题长什么样</h2>
+
+<div class="fig">
+  <img src="assets/floaters_before.png" alt="半透明点云：训练冻结时的样子">
+  <figcaption>典型症状：画面上永远是<strong>半透明、颗粒状的点云</strong>，没有实体表面，
+  怎么训都不变致密。</figcaption>
+</div>
+
+<div class="grid2">
+  <div class="card bad">
+    <h4>最迷惑人的地方</h4>
+    <ul>
+      <li><strong>不报错</strong>——全程没有 exception</li>
+      <li><strong>loss 有值</strong>（0.26~0.42），看起来在正常优化</li>
+      <li><strong>step 一直涨</strong>，进度条正常走完 30000 步</li>
+      <li>checkpoint 正常保存（900MB）</li>
+    </ul>
+    <p style="font-size:.9rem;color:var(--muted)">唯一线索：结果永远是初始点云的样子。</p>
+  </div>
+  <div class="card good">
+    <h4>一眼识破的判据</h4>
+    <ul>
+      <li><strong>Eval PSNR 恒定 3.76</strong>（step 100 → 16900 一动不动）</li>
+      <li><strong>0 GSs split / 0 duplicated</strong>（densify 完全没工作）</li>
+      <li><strong>opacity unique = 1</strong>（23785 个高斯的 opacity 全是初始值 -2.197）</li>
+    </ul>
+    <p style="font-size:.9rem;color:var(--muted)">这三项任一出现，训练就是死的。</p>
+  </div>
+</div>
+
+<h2>2 · 07 脚本是什么？每次训练都要跑吗？</h2>
+
+<p><code>07_build_init.py</code> 是<strong>数据集构建器</strong>，不参与训练本身。它把 06 在 Isaac Sim 里抓到的原始数据，翻译成 nerfstudio 能吃的格式：</p>
+
+<table>
+  <thead><tr><th style="width:28%">输入（06 的产物）</th><th>07 做什么</th><th style="width:26%">输出（喂给训练）</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>rgb_XXXX.npy</code><br><code>depth_XXXX.npy</code><br><code>intrinsics.json</code></td>
+      <td>
+        ① 曝光归一化（让每帧亮度一致）<br>
+        ② 丢弃曝光异常帧<br>
+        ③ 写相机位姿 <code>transform_matrix</code><br>
+        ④ 深度反投影 → 初始化点云<br>
+        ⑤ 深度图另存（供 TSDF 用）
+      </td>
+      <td>
+        <code>images/*.png</code><br>
+        <code>transforms.json</code><br>
+        <code>points3D.ply</code> ← 关键<br>
+        <code>depth/*.npy</code>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout blue">
+  <strong>什么时候需要跑 07？</strong>
+  <ul style="margin:8px 0 0">
+    <li><strong>✅ 需要跑</strong>：重新采集后（跑完 06）、或修改过 07/06 的逻辑后</li>
+    <li><strong>❌ 不用跑</strong>：只调训练参数（改 bat 的步数、学习率、densify 阈值等）</li>
+  </ul>
+  <p style="margin:8px 0 0">这次因为 <strong>07 产出的位姿本身就是错的</strong>，所以必须重跑 07 重新生成数据——光改训练参数是救不回来的。</p>
+</div>
+
+<h2>3 · 根因：坐标系约定</h2>
+
+<h3>三种约定，别搞混</h3>
+
+<table>
+  <thead><tr><th>约定</th><th>相机朝向</th><th>谁在用</th></tr></thead>
+  <tbody>
+    <tr><td><strong>OpenGL / Blender</strong></td><td>相机看 <strong>-Z</strong>，+Y 上，+X 右</td><td><strong>nerfstudio、gsplat、USD</strong></td></tr>
+    <tr><td><strong>OpenCV / COLMAP</strong></td><td>相机看 <strong>+Z</strong>，+Y 下，+X 右</td><td>COLMAP、多数 SfM 库</td></tr>
+    <tr><td><strong>USD 相机</strong></td><td>相机看 <strong>-Z</strong>（同 OpenGL）</td><td>Isaac Sim</td></tr>
+  </tbody>
+</table>
+
+<p><strong>关键：USD 和 nerfstudio 都用 -Z，本来不需要任何转换。</strong></p>
+
+<h3>错误代码</h3>
+
+<pre class="bad"># 07_build_init.py（旧）
+FLIP = np.diag([1.0, -1.0, -1.0, 1.0])   # 注释: "USD(OpenGL) -> OpenCV(nerfstudio)"
+...
+c2w_cv = look_at_c2w(eye, TARGET) @ FLIP  # ← 多此一举，把相机转了 180°</pre>
+
+<div class="callout">
+  <strong>为什么是 180°？</strong><br>
+  右乘 <code>diag(1,-1,-1)</code> 会把 c2w 的 <strong>Y 列和 Z 列同时取反</strong>。
+  这不是"坐标约定转换"，而是把相机的<strong>朝向翻转</strong>了——
+  就像让人转身背对目标。结果物体全在相机背后。
+</div>
+
+<h3>修复</h3>
+
+<pre class="good"># 保持 USD/OpenGL 原样，不做任何翻转
+FLIP = np.eye(4)   # no-op: USD/OpenGL c2w is what nerfstudio expects
+
+# 但反投影用的是 OpenCV 相机轴，同步翻转：
+pc = np.stack([x_, -y_, -z[valid], ones], axis=0)   # OpenCV axes -> OpenGL(-Z fwd)
+pw = c2w_cv @ pc</pre>
+
+<h2>4 · 实锤证据</h2>
+
+<div class="fig">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <text x="20" y="24" font-size="14" font-weight="700">相机朝向反了 180°：物体从"正前方"变成"正后方"</text>
+
+  <!-- BEFORE -->
+  <text x="60" y="60" font-size="13" font-weight="700" fill="#dc2626">修复前：相机背对物体</text>
+  <circle cx="150" cy="150" r="14" fill="#334155"/>
+  <text x="150" y="190" font-size="11" text-anchor="middle" fill="#334155">相机</text>
+  <path d="M138,150 L40,150" stroke="#dc2626" stroke-width="3" marker-end="url(#ar1)"/>
+  <circle cx="60" cy="150" r="9" fill="#fbbf24"/>
+  <text x="60" y="215" font-size="11" text-anchor="middle" fill="#dc2626">物体（在背后）</text>
+  <text x="30" y="240" font-size="11" fill="#64748b">accumulation = 0，无梯度</text>
+
+  <defs><marker id="ar1" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+    <path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/></marker>
+    <marker id="ar2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+    <path d="M0,0 L10,4 L0,8 z" fill="#059669"/></marker></defs>
+
+  <line x1="460" y1="40" x2="460" y2="230" stroke="#e2e8f0" stroke-dasharray="4 4"/>
+
+  <!-- AFTER -->
+  <text x="520" y="60" font-size="13" font-weight="700" fill="#059669">修复后：相机正对物体</text>
+  <circle cx="610" cy="150" r="14" fill="#334155"/>
+  <text x="610" y="190" font-size="11" text-anchor="middle" fill="#334155">相机</text>
+  <path d="M624,150 L722,150" stroke="#059669" stroke-width="3" marker-end="url(#ar2)"/>
+  <circle cx="740" cy="150" r="9" fill="#fbbf24"/>
+  <text x="740" y="215" font-size="11" text-anchor="middle" fill="#059669">物体（在正前方）</text>
+  <text x="530" y="240" font-size="11" fill="#64748b">accumulation &gt; 0，梯度正常</text>
+</svg>
+<figcaption>同一个场景，只是相机矩阵差一个 FLIP，物体从"看得见"变成"在背后"。</figcaption>
+</div>
+
+<table>
+  <thead><tr><th>检查项</th><th>修复前</th><th>修复后</th></tr></thead>
+  <tbody>
+    <tr><td>点云质心落在视锥内的相机数</td><td class="num" style="color:#dc2626"><strong>0 / 89</strong></td><td class="num" style="color:#059669"><strong>99 / 99</strong></td></tr>
+    <tr><td>训练视角渲染 accumulation</td><td class="num" style="color:#dc2626"><strong>0.0</strong></td><td class="num" style="color:#059669">有内容</td></tr>
+    <tr><td>参数梯度（opacity/means）</td><td class="num" style="color:#dc2626"><strong>0.000e+00</strong></td><td class="num" style="color:#059669">非零</td></tr>
+    <tr><td>densify（step 600 的 split 数）</td><td class="num" style="color:#dc2626"><strong>0</strong></td><td class="num" style="color:#059669"><strong>20,702</strong></td></tr>
+    <tr><td>高斯数（step 700）</td><td class="num">23,785（冻结）</td><td class="num" style="color:#059669"><strong>181,328</strong></td></tr>
+    <tr><td>初始点云点数</td><td class="num">23,785</td><td class="num" style="color:#059669"><strong>150,000</strong></td></tr>
+    <tr><td>Eval PSNR</td><td class="num" style="color:#dc2626">3.76（恒定）</td><td class="num" style="color:#059669"><strong>6.5 → 31</strong></td></tr>
+    <tr><td>几何自检（x/y vs YCB 官方尺寸）</td><td class="num">—</td><td class="num" style="color:#059669">误差 <strong>0.000 m</strong></td></tr>
+  </tbody>
+</table>
+
+<div class="callout green">
+  <strong>连带发现：</strong>初始点云从 23,785 恢复到 <strong>150,000</strong>。
+  因为 FLIP 让反投影坐标也错了，Z 裁剪误杀了大部分点——这解释了为什么
+  <strong>09-16 能训（当时 15 万点）、09-17 20:41 重写后变成 23785 就再也不动了</strong>。
+</div>
+
+<h2>5 · 分析过程：我们走过的弯路</h2>
+
+<p>这份清单的价值在于——<strong>下次遇到同类问题，按顺序排除，别重复踩</strong>。</p>
+
+<table>
+  <thead><tr><th style="width:24%">怀疑对象</th><th style="width:38%">现象支持它吗</th><th>如何排除</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="tag">误判 1</span>gsplat JIT 编译</td>
+      <td>viewer 黑屏、渲染空——很像 Lesson02 的编译问题</td>
+      <td>删除 build 目录用正确环境重编，<strong>仍然黑</strong>；且隔离测试证明 kernel 正常</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 2</span>显卡驱动</td>
+      <td>RTX 5060 是 sm_120 新架构；驱动 610.62 + CUDA UMD 13.3 与 torch cu128 并存</td>
+      <td>驱动目录时间是 7 月（没在故障点更新）；重启无效；隔离测试梯度非零 → 排除</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 3</span>torch FileBaton 锁</td>
+      <td>进程挂着不动、CPU 不涨、无报错</td>
+      <td>确实是<strong>真实存在</strong>的坑（强杀进程留下的 lock），但它只解释"卡住在 Caching"，不解释"训练不收敛"</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 4</span>cache_images 死锁</td>
+      <td>卡在 "Caching / undistorting images"</td>
+      <td>改 cpu 缓存能过 Caching，但训练<strong>照样不更新参数</strong> → 两个独立问题</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 5</span>orientation-method</td>
+      <td>数据是 Z-up，nerfstudio 默认 Y-up；<code>none</code> 很可疑</td>
+      <td>改成 <code>up</code> 后 600 步，opacity 仍然 unique=1 → 排除</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 6</span>densify 阈值太高</td>
+      <td>初始点稀疏 → 梯度小 → 不触发</td>
+      <td>阈值降 20 倍（0.00001）后<strong>仍然 0 split</strong> → 排除</td>
+    </tr>
+    <tr>
+      <td><span class="tag">误判 7</span>GradScaler 跳过</td>
+      <td>loss 正常但参数不动，很像 scaler 检测到 inf/nan 后跳过</td>
+      <td><code>grad_scaler enabled=False</code>（本来就关着），且 backward 后梯度就是 0 → 排除</td>
+    </tr>
+    <tr>
+      <td><span class="tag ok">真凶</span>相机朝向反 180°</td>
+      <td>accumulation=0、质心在相机背后（z=+0.93）、0/89 可见</td>
+      <td><strong>直接投影验证</strong>：质心在 +Z 侧 → 相机背对 → 根因确认</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout blue">
+  <strong>方法论教训：</strong>前 7 次都在猜"什么东西坏了"，第 8 次改成<strong>直接测量物理量</strong>
+  （把点云质心投影到相机系，看 z 的符号），一击命中。
+  <strong>不要靠现象猜，要去量那个能一锤定音的量。</strong>
+</div>
+
+<h2>6 · 下次直接用的排查手册</h2>
+
+<h3>症状：训练"在跑"但结果不收敛</h3>
+
+<ol>
+  <li>
+    <strong>先看三个数字</strong>（有任一命中 → 训练是死的）：
+    <pre>Eval PSNR 是否恒定？（3.76 恒定 = 渲染是黑图）
+日志里 "0 GSs split" 是否一直出现？（densify 死）
+ckpt 的 opacity 取值数是否 = 1？（参数从未更新）</pre>
+  </li>
+  <li>
+    <strong>分离"数据问题"还是"环境问题"</strong>：
+    <pre># 用完全无关的干净数据（如官方 truck）跑几百步
+# 能收敛 → 是你的数据问题；也不收敛 → 环境问题</pre>
+  </li>
+  <li>
+    <strong>隔离 gsplat 本身</strong>（前向+反向都要测）：
+    <pre>构造 200 个大高斯放在相机正前方 2m 处
+rasterization(...)  → rgb mean 应 &gt; 0
+loss.backward()     → 各参数 grad norm 应 &gt; 0</pre>
+  </li>
+  <li>
+    <strong>直接测量：点云在不在相机前面</strong>（本次的决定性一步）：
+    <pre>pc = (xyz @ w2c[:3,:3].T) + w2c[:3,3]
+# nerfstudio 用 -Z 约定：可见意味着 pc[:,2] 为负
+z = -pc[:,2]                      # 深度
+u = fx*(pc[:,0]/z) + cx
+v = fy*(pc[:,1]/z) + cy
+inside = (z&gt;0) &amp; (0&lt;=u&lt;W) &amp; (0&lt;=v&lt;H)</pre>
+    若 inside 为 0 → <strong>相机朝向/坐标约定错了</strong>。
+  </li>
+  <li>
+    <strong>检查渲染的 accumulation</strong>（比 rgb 更敏感）：
+    <pre>o = model.get_outputs(train_cameras[0:1])
+o["accumulation"].mean()   # 0.0 = 一个高斯都没覆盖任何像素</pre>
+  </li>
+</ol>
+
+<h3>坐标约定速查</h3>
+
+<table>
+  <thead><tr><th>数据来源</th><th>约定</th><th>喂给 nerfstudio 要不要转</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Isaac Sim / USD 相机</strong></td><td>OpenGL（看 -Z）</td><td><strong>❌ 不要转</strong>（直接写 c2w）</td></tr>
+    <tr><td><strong>COLMAP</strong></td><td>OpenCV（看 +Z）</td><td>nerfstudio 的 colmap parser 会自动处理</td></tr>
+    <tr><td><strong>nerfstudio transforms.json</strong></td><td>OpenGL（看 -Z）</td><td>—</td></tr>
+    <tr><td>深度反投影公式 <code>X=(u-cx)z/fx</code></td><td>OpenCV 相机轴</td><td>算完要用 <code>(X,-Y,-Z)</code> 再乘 c2w</td></tr>
+  </tbody>
+</table>
+
+<h2>7 · 顺带修掉的另外两个坑</h2>
+
+<div class="grid2">
+  <div class="card warn">
+    <h4>① torch FileBaton 锁残留</h4>
+    <p>强杀 CUDA 进程会在 <code>gsplat_cuda/</code> 留下 <code>lock</code> 文件，
+    后续所有进程 import gsplat 时<strong>无限等待</strong>：CPU 不动、不报错、就是挂着。</p>
+    <pre>del %LOCALAPPDATA%\torch_extensions\torch_extensions\Cache\py310_cu128\gsplat_cuda\lock</pre>
+  </div>
+  <div class="card warn">
+    <h4>② gpu 图像缓存死锁</h4>
+    <p><code>cache_images: gpu</code> 时，datamanager 在线程池里做 <code>.to(cuda)</code>，
+    Windows 上偶发死锁（卡在 "Caching / undistorting images"）。</p>
+    <pre>--pipeline.datamanager.cache-images cpu</pre>
+  </div>
+</div>
+
+<h2>8 · 最终成果</h2>
+
+<table>
+  <thead><tr><th>指标</th><th>修复前</th><th>修复后</th></tr></thead>
+  <tbody>
+    <tr><td>Eval PSNR</td><td class="num" style="color:#dc2626">3.76（恒定）</td><td class="num" style="color:#059669"><strong>6.5 → 31.0</strong></td></tr>
+    <tr><td>Train PSNR 峰值</td><td class="num">乱跳不上升（2.6~17）</td><td class="num" style="color:#059669"><strong>41.45</strong></td></tr>
+    <tr><td>最终高斯数</td><td class="num">23,785</td><td class="num" style="color:#059669"><strong>403,745</strong></td></tr>
+    <tr><td>初始点云</td><td class="num">23,785</td><td class="num" style="color:#059669"><strong>150,000</strong></td></tr>
+    <tr><td>几何自检</td><td class="num">—</td><td class="num" style="color:#059669">x/y 误差 <strong>0.000 m</strong></td></tr>
+  </tbody>
+</table>
+
+<footer>
+  相关脚本：<code>07_build_init.py</code>（数据集构建，已修复 FLIP）、
+  <code>08_verify_cloud.py</code>（几何自检）、<code>06_capture_multiring.py</code>（Isaac Sim 采集）<br>
+  相关笔记：Problem 01 SIFT 失效 · Lesson 01 初始点云 · Lesson 02 gsplat 编译 · Lesson 05 背景 Floaters
+</footer>
+
+</div>
+</body>
+</html>

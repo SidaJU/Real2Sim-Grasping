@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 01 · 初始点云：从「随机撒点」到「真值深度反投影」</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    line-height:1.75;
+  }
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+
+  .callout{
+    background:var(--indigo-soft); border:1px solid #c7d2fe; border-left:5px solid var(--indigo);
+    border-radius:10px; padding:18px 22px; margin:24px 0;
+  }
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+
+  .q{
+    background:var(--amber-soft); border:1px solid #fde68a; border-left:5px solid var(--amber);
+    border-radius:10px; padding:16px 20px; margin:20px 0;
+  }
+  .q b{color:var(--amber)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+
+  .card{background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px;
+        box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  .card.bad{border-left:5px solid var(--red)}
+  .card.good{border-left:5px solid var(--green)}
+  .card.warn{border-left:5px solid var(--amber)}
+  .card.indigo{border-left:5px solid var(--indigo)}
+  .card h4{margin:0 0 10px; font-size:1rem}
+  .card.bad h4{color:var(--red)}
+  .card.good h4{color:var(--green)}
+  .card.warn h4{color:var(--amber)}
+  .card.indigo h4{color:var(--indigo)}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig img{display:block; width:100%; height:auto; border-radius:8px}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.92rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line)}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+
+  .chain{display:flex; flex-direction:column; gap:0; margin:20px 0}
+  .chain .node{background:#fff; border:2px solid var(--indigo); border-radius:10px;
+               padding:10px 18px; text-align:center; font-weight:600}
+  .chain .arrow{text-align:center; color:var(--indigo); font-size:1.4rem; line-height:1.4; font-weight:700}
+
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{
+    content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600;
+  }
+
+  .io{display:grid; grid-template-columns:1fr auto 1fr; gap:14px; align-items:center; margin:18px 0}
+  .io .col{display:flex; flex-direction:column; gap:10px}
+  .io .chip{background:#fff; border:1px solid var(--line); border-left:4px solid var(--indigo);
+            border-radius:8px; padding:9px 14px; font-size:.9rem}
+  .io .chip small{display:block; color:var(--muted); font-size:.78rem}
+  .io .mid{font-size:2rem; color:var(--indigo); font-weight:700}
+  .io .chip.out{border-left-color:var(--green)}
+  @media(max-width:760px){.io{grid-template-columns:1fr} .io .mid{text-align:center}}
+
+  .kbd{display:inline-block; background:#0f172a; color:#e2e8f0; padding:2px 8px;
+       border-radius:5px; font-size:.85em; font-family:ui-monospace,Consolas,monospace}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Lesson 01 · 初始点云：从「随机撒点」到「真值深度反投影」</h1>
+  <div class="sub">
+    项目：Real2Sim-Grasping（Isaac Sim 渲染 → 3DGS 重建 → 资产化 → 抓取）<br>
+    本篇核心：<strong>3DGS 为什么需要初始点云</strong>、<strong>points3D.ply 到底是怎么算出来的</strong>、
+    以及我们怎么在没有 COLMAP 的情况下拿到比 COLMAP 好 68 倍的点云。
+  </div>
+</header>
+
+<!-- ============================ 0. 问题 ============================ -->
+<div class="q">
+  <b>💬 本篇要回答的问题</b><br>
+  「这个初始点云 <code>points3D.ply</code> 是怎么计算出来的？<strong>输入什么、算法是什么、输出什么</strong>？」
+</div>
+
+<h2>1. 一句话总结</h2>
+
+<div class="callout">
+  3DGS 不是从零「长」出物体，而是从一批<strong>种子高斯球</strong>开始优化。
+  种子的初始位置决定了成败：<strong>给对了形状 → 精修即可；给错了（随机撒点）→ 永远收敛不成形</strong>。
+  我们用 Isaac Sim 的<strong>真值深度图反投影</strong>生成了 15 万点的种子，实测几何误差 &lt; 0.3 mm。
+</div>
+
+<h2>2. 什么是初始点云</h2>
+
+<p>一批带颜色的 3D 点：<code>(x, y, z, r, g, b)</code>。</p>
+
+<p>3DGS 启动时把每个点变成<strong>一个 3D 高斯球</strong>（位置 + 大小 + 颜色 + 透明度），
+之后靠自适应密度控制（缺细节处分裂、多余处剔除）把它打磨成实体表面。</p>
+
+<div class="grid2">
+  <div class="card good">
+    <h4>✓ 有初始点云</h4>
+    雕塑家拿到<strong>已凿出粗胚的石料</strong>，只需精修表面细节。
+  </div>
+  <div class="card bad">
+    <h4>✗ 无初始点云</h4>
+    拿到<strong>一堆散沙</strong>，要凭空捏出形状——沙子在手里只会越攥越散。
+  </div>
+</div>
+
+<!-- ============================ 3. 核心：怎么算的 ============================ -->
+<h2>3. 【核心】points3D.ply 是怎么算出来的</h2>
+
+<p>反投影是<strong>拍照的逆过程</strong>。拍照是把 3D 世界压成 2D 像素（丢失深度）；
+反投影则是拿着深度图，把每个 2D 像素<strong>推回</strong>它原本的 3D 位置。</p>
+
+<h3>3.1 输入什么（4 样）</h3>
+
+<div class="io">
+  <div class="col">
+    <div class="chip"><code>rgb_XXXX.npy</code><small>RGB 图 640×640 uint8 —— 只用来取点的颜色</small></div>
+    <div class="chip"><code>depth_XXXX.npy</code><small>真值深度图 640×640 float —— <strong>核心输入</strong>，每像素一个 z</small></div>
+    <div class="chip"><code>intrinsics.json</code><small>相机内参：分辨率 + focal_mm + h_aperture_mm → 算出 fx, fy, cx, cy</small></div>
+    <div class="chip"><code>相机位姿 c2w</code><small>脚本按轨道公式算出来（不是读的）：3 个高度 × 36 个方位</small></div>
+  </div>
+  <div class="mid">→</div>
+  <div class="col">
+    <div class="chip out"><code>points3D.ply</code><small>150,000 行 ASCII：x y z r g b（世界坐标，米）</small></div>
+    <div class="chip out"><code>transforms.json</code><small>真实内参 + <code>ply_file_path</code> 字段 + 99 帧位姿</small></div>
+  </div>
+</div>
+
+<p>采集脚本 <code>06_capture_multiring.py</code> 在 Isaac Sim 里绕物体转三圈
+（低 0.05 m / 中 0.15 m / 高 0.30 m，每圈 36 个方位 = 108 帧），
+每一帧<strong>同时</strong>抓 RGB 和真值深度。这就是仿真相比真实世界的「特权」：
+真实相机只能给你 RGB，深度得靠 COLMAP 去猜。</p>
+
+<h3>3.2 算法：反投影（一图看懂）</h3>
+
+<div class="fig">
+<svg viewBox="0 0 900 350" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- 光轴 -->
+  <line x1="95" y1="180" x2="700" y2="180" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="560" y="172" fill="#64748b" font-size="13">光轴（view axis）</text>
+
+  <!-- 图像平面 -->
+  <line x1="330" y1="60" x2="330" y2="305" stroke="#1e293b" stroke-width="4"/>
+  <text x="336" y="48" fill="#1e293b" font-size="14" font-weight="600">图像平面</text>
+  <text x="336" y="322" fill="#64748b" font-size="12">640 × 640 px</text>
+
+  <!-- 主点 -->
+  <circle cx="330" cy="180" r="5" fill="#1e293b"/>
+  <text x="300" y="200" fill="#1e293b" font-size="12">主点 (cx, cy)</text>
+
+  <!-- 目标像素 -->
+  <circle cx="330" cy="120" r="6" fill="#dc2626"/>
+  <text x="150" y="112" fill="#dc2626" font-size="13" font-weight="600">像素 (u, v)</text>
+  <line x1="330" y1="180" x2="330" y2="120" stroke="#dc2626" stroke-width="2"/>
+  <text x="337" y="155" fill="#dc2626" font-size="12">v − cy</text>
+
+  <!-- 光心 -->
+  <circle cx="640" cy="180" r="9" fill="#4f46e5"/>
+  <text x="652" y="176" fill="#4f46e5" font-size="14" font-weight="600">光心 C</text>
+  <text x="652" y="196" fill="#64748b" font-size="12">（相机位置，由 c2w 给出）</text>
+
+  <!-- 焦距 f -->
+  <line x1="330" y1="248" x2="640" y2="248" stroke="#4f46e5" stroke-width="1.5"/>
+  <text x="470" y="242" fill="#4f46e5" font-size="13" text-anchor="middle">焦距 fx = 342.07 px</text>
+
+  <!-- 射线：C -> 像素 -> 延长到 P -->
+  <line x1="640" y1="180" x2="130" y2="55" stroke="#dc2626" stroke-width="2.5"/>
+
+  <!-- 3D 点 -->
+  <circle cx="130" cy="55" r="9" fill="#059669"/>
+  <text x="60" y="38" fill="#059669" font-size="14" font-weight="600">P = (X, Y, Z)</text>
+  <text x="60" y="80" fill="#64748b" font-size="12">物体表面上的真实点</text>
+
+  <!-- z 标注 -->
+  <line x1="130" y1="228" x2="640" y2="228" stroke="#059669" stroke-width="2"/>
+  <text x="370" y="222" fill="#059669" font-size="14" font-weight="600" text-anchor="middle">z（深度值，来自 depth_XXXX.npy）</text>
+  <text x="370" y="262" fill="#64748b" font-size="12" text-anchor="middle">沿光轴量到 P 的距离 —— 注意不是斜边长度</text>
+
+  <!-- 公式框 -->
+  <rect x="600" y="280" width="270" height="62" rx="8" fill="#0f172a"/>
+  <text x="614" y="302" fill="#e2e8f0" font-size="13" font-family="ui-monospace,Consolas,monospace">X = (u − cx) · z / fx</text>
+  <text x="614" y="322" fill="#e2e8f0" font-size="13" font-family="ui-monospace,Consolas,monospace">Y = (v − cy) · z / fy</text>
+  <text x="614" y="336" fill="#e2e8f0" font-size="13" font-family="ui-monospace,Consolas,monospace">Z = z</text>
+</svg>
+<figcaption>
+  图 1 · 反投影的几何关系（侧视图）。已知像素坐标 (u,v) 和深度 z，
+  沿着「光心 → 该像素」这条射线走 z 那么远，就回到 3D 点 P。
+</figcaption>
+</div>
+
+<div class="callout">
+  <strong>为什么公式这么简单？</strong>因为这是<strong>相似三角形</strong>。
+  图像平面上像素偏离主点 <code>(u−cx)</code>，物体在 z 处偏离光轴 <code>X</code>，
+  两者之比等于距离之比：<code>(u−cx) / fx = X / z</code> → 反解出 <code>X = (u−cx)·z/fx</code>。
+  焦距 fx 在这里就是「图像平面到光心的距离」，单位是像素。
+</div>
+
+<h3>3.3 完整算法步骤（99 张图逐张执行）</h3>
+
+<ol class="steps">
+  <li><strong>深度有效性过滤</strong> —— <code>isfinite(z) &amp; (0.01 &lt; z &lt; 0.6)</code>。
+      丢掉无效值和远处的墙，只留物体与近处桌面。</li>
+  <li><strong>隔点采样</strong> —— <code>STRIDE = 2</code>，每 2 个像素取 1 个 →
+      每张图 320×320 = <strong>102,400</strong> 个候选点。</li>
+  <li><strong>反投影到相机系</strong> —— 套用图 1 的公式，得到 <code>(X, Y, Z)</code>。</li>
+  <li><strong>坐标轴翻转</strong> —— 公式用的是 OpenCV 约定（+Y 向下、+Z 向前），
+      而我们的 c2w 是 OpenGL 约定（+Y 向上、−Z 向前），所以要 <code>[X, −Y, −Z]</code>。
+      <em>这一步当初做反了，高斯全跑到相机背后，详见 §7 bug C。</em></li>
+  <li><strong>变换到世界系</strong> —— <code>p_world = c2w @ p_cam</code>。
+      每个点顺手带上该像素的颜色 <code>rgb[v, u]</code>。</li>
+  <li><strong>半径裁剪</strong> —— <code>|xy| &lt; 0.35 m</code>，切掉远处桌面
+      （实测：不做这一步，远桌面点日后会变成满屏 floaters，见 Lesson 05）。</li>
+  <li><strong>随机降采样</strong> —— 99 张图累加后远超上限，随机抽到 <code>MAX_PTS = 150,000</code>。</li>
+</ol>
+
+<div class="fig">
+<svg viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- 真值位姿侧 -->
+  <text x="200" y="26" fill="#059669" font-size="15" font-weight="600" text-anchor="middle">✓ 真值位姿（我们）：99 张点云完美重合</text>
+  <ellipse cx="200" cy="130" rx="120" ry="58" fill="none" stroke="#059669" stroke-width="2"/>
+  <text x="200" y="216" fill="#64748b" font-size="12" text-anchor="middle">相机轨道 半径 25 cm</text>
+  <!-- 物体 -->
+  <rect x="168" y="112" width="64" height="36" rx="3" fill="#059669" opacity="0.18" stroke="#059669" stroke-width="2"/>
+  <!-- 相机 -->
+  <g fill="#059669">
+    <circle cx="80" cy="130" r="7"/><circle cx="320" cy="130" r="7"/>
+    <circle cx="140" cy="72" r="7"/><circle cx="260" cy="72" r="7"/>
+    <circle cx="140" cy="188" r="7"/><circle cx="260" cy="188" r="7"/>
+  </g>
+  <!-- 射线汇聚 -->
+  <g stroke="#059669" stroke-width="1.6" opacity="0.75">
+    <line x1="86" y1="128" x2="172" y2="122"/>
+    <line x1="86" y1="132" x2="172" y2="140"/>
+    <line x1="314" y1="128" x2="228" y2="122"/>
+    <line x1="314" y1="132" x2="228" y2="140"/>
+    <line x1="146" y1="78" x2="180" y2="112"/>
+    <line x1="146" y1="80" x2="220" y2="112"/>
+    <line x1="254" y1="78" x2="220" y2="112"/>
+    <line x1="254" y1="80" x2="180" y2="112"/>
+    <line x1="146" y1="182" x2="180" y2="148"/>
+    <line x1="146" y1="180" x2="220" y2="148"/>
+    <line x1="254" y1="182" x2="220" y2="148"/>
+    <line x1="254" y1="180" x2="180" y2="148"/>
+  </g>
+  <!-- 表面点紧密 -->
+  <g fill="#059669">
+    <circle cx="174" cy="124" r="2.4"/><circle cx="180" cy="130" r="2.4"/><circle cx="186" cy="136" r="2.4"/>
+    <circle cx="192" cy="128" r="2.4"/><circle cx="204" cy="134" r="2.4"/><circle cx="216" cy="126" r="2.4"/>
+    <circle cx="222" cy="132" r="2.4"/><circle cx="176" cy="144" r="2.4"/><circle cx="204" cy="144" r="2.4"/>
+  </g>
+
+  <!-- COLMAP 侧 -->
+  <text x="680" y="26" fill="#dc2626" font-size="15" font-weight="600" text-anchor="middle">✗ COLMAP 位姿（误差 18 cm）：点云发散成雾</text>
+  <ellipse cx="680" cy="130" rx="120" ry="58" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="680" y="216" fill="#64748b" font-size="12" text-anchor="middle">同样的相机轨道，但位置算错了</text>
+  <rect x="648" y="112" width="64" height="36" rx="3" fill="#dc2626" opacity="0.10" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <g fill="#dc2626">
+    <circle cx="560" cy="130" r="7"/><circle cx="800" cy="130" r="7"/>
+    <circle cx="620" cy="72" r="7"/><circle cx="740" cy="72" r="7"/>
+    <circle cx="620" cy="188" r="7"/><circle cx="740" cy="188" r="7"/>
+  </g>
+  <g stroke="#dc2626" stroke-width="1.4" opacity="0.55">
+    <line x1="566" y1="128" x2="652" y2="116"/>
+    <line x1="566" y1="132" x2="652" y2="146"/>
+    <line x1="794" y1="128" x2="708" y2="118"/>
+    <line x1="794" y1="132" x2="708" y2="144"/>
+    <line x1="626" y1="78" x2="660" y2="106"/>
+    <line x1="626" y1="80" x2="700" y2="106"/>
+    <line x1="734" y1="78" x2="700" y2="106"/>
+    <line x1="734" y1="80" x2="660" y2="106"/>
+    <line x1="626" y1="182" x2="660" y2="154"/>
+    <line x1="626" y1="180" x2="700" y2="154"/>
+    <line x1="734" y1="182" x2="700" y2="154"/>
+    <line x1="734" y1="180" x2="660" y2="154"/>
+  </g>
+  <!-- 散开的点云 -->
+  <g fill="#dc2626" opacity="0.5">
+    <circle cx="655" cy="108" r="2.6"/><circle cx="672" cy="122" r="2.6"/><circle cx="690" cy="100" r="2.6"/>
+    <circle cx="700" cy="140" r="2.6"/><circle cx="664" cy="150" r="2.6"/><circle cx="686" cy="158" r="2.6"/>
+    <circle cx="712" cy="118" r="2.6"/><circle cx="646" cy="134" r="2.6"/><circle cx="716" cy="150" r="2.6"/>
+    <circle cx="676" cy="146" r="2.6"/><circle cx="694" cy="130" r="2.6"/>
+  </g>
+  <text x="680" y="240" fill="#dc2626" font-size="12" text-anchor="middle">每个相机把同一点投到不同位置 → 高斯只能分裂成多份</text>
+</svg>
+<figcaption>
+  图 2 · 99 张图的点云为什么能直接拼在一起。关键在于<strong>位姿是否精确</strong>：
+  真值位姿下所有视角的点落在同一表面上；位姿有 18 cm 误差时，同一个表面点被投到不同地方，
+  拼出来就是一团雾——这也是 COLMAP 版背景发灰、物体「分裂」的根因。
+</figcaption>
+</div>
+
+<h3>3.4 一个容易踩的坑：深度值有两种定义</h3>
+
+<div class="fig">
+<svg viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- 左：沿光轴 -->
+  <text x="215" y="24" fill="#059669" font-size="15" font-weight="600" text-anchor="middle">✓ Isaac Sim：distance_to_image_plane</text>
+  <circle cx="400" cy="140" r="8" fill="#4f46e5"/>
+  <text x="410" y="136" fill="#4f46e5" font-size="13" font-weight="600">光心 C</text>
+  <circle cx="120" cy="70" r="9" fill="#059669"/>
+  <text x="42" y="56" fill="#059669" font-size="13" font-weight="600">P</text>
+  <line x1="400" y1="140" x2="120" y2="70" stroke="#1e293b" stroke-width="2.5"/>
+  <line x1="400" y1="140" x2="120" y2="140" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <line x1="120" y1="140" x2="120" y2="70" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="250" y="132" fill="#059669" font-size="14" font-weight="600" text-anchor="middle">z</text>
+  <text x="250" y="160" fill="#64748b" font-size="11.5" text-anchor="middle">沿光轴的投影距离</text>
+  <rect x="60" y="180" width="330" height="46" rx="8" fill="#ecfdf5" stroke="#059669"/>
+  <text x="74" y="200" fill="#065f46" font-size="13" font-family="ui-monospace,Consolas,monospace">Z = z          ← 可直接代入公式</text>
+  <text x="74" y="218" fill="#64748b" font-size="11.5">Kit 的 depth 默认就是这个</text>
+
+  <!-- 分隔 -->
+  <line x1="450" y1="20" x2="450" y2="226" stroke="#e2e8f0" stroke-width="2"/>
+
+  <!-- 右：欧氏距离 -->
+  <text x="675" y="24" fill="#dc2626" font-size="15" font-weight="600" text-anchor="middle">✗ 欧氏距离（径向深度）</text>
+  <circle cx="860" cy="140" r="8" fill="#4f46e5"/>
+  <text x="800" y="136" fill="#4f46e5" font-size="13" font-weight="600">光心 C</text>
+  <circle cx="580" cy="70" r="9" fill="#dc2626"/>
+  <text x="502" y="56" fill="#dc2626" font-size="13" font-weight="600">P</text>
+  <line x1="860" y1="140" x2="580" y2="70" stroke="#dc2626" stroke-width="3"/>
+  <line x1="860" y1="140" x2="580" y2="140" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="700" y="122" fill="#dc2626" font-size="14" font-weight="600" text-anchor="middle">r</text>
+  <text x="700" y="160" fill="#64748b" font-size="11.5" text-anchor="middle">斜边长度（点到光心的真实距离）</text>
+  <rect x="510" y="180" width="340" height="46" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="524" y="200" fill="#991b1b" font-size="13" font-family="ui-monospace,Consolas,monospace">Z = r · cos θ ≠ r      ← 要换算</text>
+  <text x="524" y="218" fill="#64748b" font-size="11.5">某些深度相机 / 数据集用这个，别混用</text>
+</svg>
+<figcaption>
+  图 3 · 深度的两种定义。两者差一个 <code>cos θ</code>：画面中心几乎相等，
+  越靠画面边缘差得越多。用错定义会让物体边缘向外翻——是个很隐蔽的坑。
+</figcaption>
+</div>
+
+<h3>3.5 输出：点云长什么样（实测）</h3>
+
+<p>对 <code>points3D.ply</code> 实测统计：</p>
+
+<table>
+  <tr><th>指标</th><th>实测值</th><th>说明</th></tr>
+  <tr><td>点数</td><td class="num">150,000</td><td>达到 <code>MAX_PTS</code> 上限，说明候选点远多于此</td></tr>
+  <tr><td>x / y 范围</td><td class="num">±0.349 m</td><td>正好卡在 <code>XY_MAX = 0.35</code> 的裁剪半径</td></tr>
+  <tr><td>z 范围</td><td class="num">0.0250 → 0.0723 m</td><td>下界是桌面，上界是盒顶</td></tr>
+  <tr><td><strong>盒顶高度</strong></td><td class="num"><strong>0.0723 m</strong></td><td>YCB 官方盒高 <strong>0.072 m</strong> → <strong>误差 0.3 mm</strong></td></tr>
+  <tr><td>物体包围盒内</td><td class="num">20,982（14%）</td><td>其余是桌面——物体只占画面 6~9%，很正常</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- 桌面 -->
+  <line x1="60" y1="180" x2="840" y2="180" stroke="#1e293b" stroke-width="4"/>
+  <text x="70" y="200" fill="#1e293b" font-size="13" font-weight="600">桌面 z = 0.0250 m</text>
+  <text x="70" y="220" fill="#64748b" font-size="11.5">点云 z 的下界，实测与场景设置完全吻合</text>
+
+  <!-- 盒子可见部分 -->
+  <rect x="380" y="80" width="140" height="100" fill="#d97706" opacity="0.22" stroke="#d97706" stroke-width="2.5"/>
+  <text x="450" y="136" fill="#92400e" font-size="14" font-weight="600" text-anchor="middle">饼干盒</text>
+  <text x="450" y="156" fill="#92400e" font-size="12" text-anchor="middle">（桌面以上部分）</text>
+
+  <!-- 埋入部分 -->
+  <rect x="380" y="180" width="140" height="46" fill="#dc2626" opacity="0.14" stroke="#dc2626" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="450" y="212" fill="#991b1b" font-size="12" text-anchor="middle">埋进桌面 2.5 cm（永远拍不到）</text>
+
+  <!-- 高度标注 -->
+  <line x1="560" y1="80" x2="560" y2="226" stroke="#059669" stroke-width="1.5"/>
+  <line x1="552" y1="80" x2="568" y2="80" stroke="#059669" stroke-width="2"/>
+  <line x1="552" y1="226" x2="568" y2="226" stroke="#059669" stroke-width="2"/>
+  <text x="580" y="150" fill="#059669" font-size="14" font-weight="600">点云 z 上界</text>
+  <text x="580" y="170" fill="#059669" font-size="14" font-weight="600">= 0.0723 m</text>
+  <text x="580" y="196" fill="#64748b" font-size="12">YCB 真值 0.072 m</text>
+  <text x="580" y="214" fill="#059669" font-size="12" font-weight="600">误差 0.3 mm ✓</text>
+
+  <!-- 点云示意 -->
+  <g fill="#d97706">
+    <circle cx="392" cy="176" r="2.2"/><circle cx="410" cy="172" r="2.2"/><circle cx="428" cy="178" r="2.2"/>
+    <circle cx="446" cy="174" r="2.2"/><circle cx="464" cy="176" r="2.2"/><circle cx="482" cy="172" r="2.2"/>
+    <circle cx="500" cy="177" r="2.2"/><circle cx="386" cy="150" r="2.2"/><circle cx="510" cy="148" r="2.2"/>
+    <circle cx="386" cy="120" r="2.2"/><circle cx="512" cy="118" r="2.2"/>
+    <circle cx="400" cy="88" r="2.2"/><circle cx="430" cy="84" r="2.2"/><circle cx="460" cy="86" r="2.2"/>
+    <circle cx="490" cy="88" r="2.2"/>
+  </g>
+  <g fill="#64748b" opacity="0.6">
+    <circle cx="180" cy="176" r="2"/><circle cx="230" cy="178" r="2"/><circle cx="290" cy="175" r="2"/>
+    <circle cx="640" cy="177" r="2"/><circle cx="700" cy="176" r="2"/><circle cx="760" cy="178" r="2"/>
+    <circle cx="810" cy="175" r="2"/><circle cx="140" cy="177" r="2"/>
+  </g>
+  <text x="420" y="240" fill="#64748b" font-size="11.5" text-anchor="middle">灰点 = 桌面点云（86%），橙点 = 物体表面点云（14%）</text>
+</svg>
+<figcaption>
+  图 4 · 点云的垂直分层结构（实测）。
+  <strong>盒顶 0.0723 m vs YCB 官方 0.072 m</strong>——这条比 x/y 更硬，
+  因为它验证了 z 方向，说明内参、深度、位姿三者完全自洽。
+</figcaption>
+</div>
+
+<h3>3.6 让 nerfstudio 真正加载它</h3>
+
+<p>光有 ply 不够，必须在 <code>transforms.json</code> 里声明字段，否则 parser 仍然走随机初始化：</p>
+
+<pre>{
+  "fl_x": 342.07,
+  "fl_y": 342.07,
+  "ply_file_path": "points3D.ply",   // ← 这一行是关键
+  "frames": [ ... ]
+}</pre>
+
+<p>nerfstudio 源码依据（<code>nerfstudio_dataparser.py</code>）：
+有 <code>ply_file_path</code> → 加载 ply；否则找 colmap 目录；都没有 → <strong>随机初始化</strong>。</p>
+
+<p>点云坐标写成 USD 世界坐标即可，parser 会对点云和相机位姿<strong>施加同一套归一化</strong>。</p>
+
+<!-- ============================ 4. 三方案对比 ============================ -->
+<h2>4. 三种初始化方案对比</h2>
+
+<table>
+  <tr><th>方案</th><th>点的来源</th><th>点数</th><th>精度</th><th>耗时</th><th>我们的结果</th></tr>
+  <tr><td>随机初始化</td><td>包围盒里瞎撒</td><td>随机</td><td>无</td><td>0</td><td>❌ 碎片环 + 白雾</td></tr>
+  <tr><td>COLMAP SfM（真实场景常规）</td><td>图像特征匹配反推</td><td class="num">2,191</td><td>稀疏、尺度任意、位姿误差 18~20 cm</td><td>~2 分钟</td><td>见 §4.1 实测</td></tr>
+  <tr><td><strong>真值深度反投影（仿真）</strong></td><td>渲染深度图 + 位姿</td><td class="num"><strong>150,000</strong></td><td><strong>0.3 mm，稠密</strong></td><td><strong>秒级</strong></td><td>✅ 形状分毫不差</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>关键洞察</strong>：这是 Real2Sim 路线的核心优势——真实场景只能靠 COLMAP 从图像「猜」稀疏点云，
+  <strong>仿真能直接给出真值深度</strong>。真实世界做不到的事，仿真可以。
+</div>
+
+<h3>4.1 我们后来真的跑了 COLMAP（baseline 实测）</h3>
+
+<p>写这篇时还没装 COLMAP，表格里那行是推测。后来为做 A/B 对照补跑了官方流程
+（<code>run_colmap_gs_official.bat</code>，命令序列照抄 3DGS 官方 <code>convert.py</code>）：</p>
+
+<table>
+  <tr><th>指标</th><th>实测结果</th></tr>
+  <tr><td>注册率</td><td class="num"><strong>99 / 99</strong>（调低特征阈值后；初版仅 50/99，顶环 0/27 全灭）</td></tr>
+  <tr><td>稀疏点云</td><td class="num"><strong>4,923 个</strong>（真值深度是 150,000，差 <strong>30 倍</strong>）</td></tr>
+  <tr><td>位姿误差</td><td class="num">相对真值平均 <strong>18.21 cm</strong>（Umeyama 对齐后，<code>13_colmap_vs_gt.py</code>）</td></tr>
+  <tr><td>尺度</td><td class="num">任意，换算系数 0.0507（差约 20 倍）</td></tr>
+  <tr><td>内参</td><td class="num">COLMAP 自估 374.74（真值 342.07，偏 +9%）</td></tr>
+</table>
+
+<p><strong>结论</strong>：COLMAP 给出的位姿虽然歪，但<strong>内部自洽</strong>，所以照样能训出盒子
+（机制见 Lesson 03）；代价是点云密度和精度都远低于真值深度。
+<strong>这个差距就是仿真真值带来的量化收益</strong>，也是本项目 A/B 对照的核心数据。</p>
+
+<!-- ============================ 5. 随机初始化的坑 ============================ -->
+<h2>5. 我们踩的坑：随机初始化</h2>
+
+<h3>现象</h3>
+<p>第一次训练（36 张图）启动日志里出现：</p>
+<pre>Warning: load_3D_points set to true but no point cloud found.
+splatfacto will use random point cloud initialization.</pre>
+
+<p>Viewer 里的结果：<strong>红色高斯碎片沿相机环形分布，物体位置是一团白色雾</strong>，完全不成形。</p>
+
+<h3>为什么会这样</h3>
+<p>splatfacto 默认从 COLMAP 解算出的 <code>points3D.bin</code> 加载种子。
+我们跳过了 COLMAP（位姿是仿真真值），于是 nerfstudio 退化为<strong>在场景包围盒内随机撒点</strong>。</p>
+
+<div class="grid2">
+  <div class="card good">
+    <h4>命运一：看得见的点</h4>
+    落在所有相机都看得到的地方 → 有梯度信号，慢慢长成物体（但密度远远不够）。
+  </div>
+  <div class="card bad">
+    <h4>命运二：看不见的点</h4>
+    落在从任何相机都看不到的地方 → <strong>永远没有梯度，永远停在原地</strong>，
+    成为你看到的「红色碎片环」。
+  </div>
+</div>
+
+<div class="callout">
+  <strong>结论</strong>：碎片不是训练没跑够，是<strong>初始化无解</strong>。加步数只会让雾更厚。
+  （更深入的机制——为什么看不见的点永远没有梯度、为什么位姿更错的 COLMAP 版反而能收敛——见 Lesson 03）
+</div>
+
+<!-- ============================ 6. 隐藏 bug ============================ -->
+<h2>6. 顺带挖出的三个隐藏 bug</h2>
+
+<h3>bug A：垂直内参 fy 错了 35%</h3>
+
+<p>相机 <code>horizontalAperture=20.955</code>、<code>verticalAperture=15.29</code>，比例不是 1:1。
+我按 USD 语义算出 <code>fy=468.8</code>，但实测证明 <strong>Kit 渲染是各向同性的</strong>，
+<code>verticalAperture</code> 根本不参与成像。</p>
+
+<p>判定方法（无歧义）：取画面下方<strong>同属桌面的两行像素</strong>反投影，
+桌面是水平面，二者高度必须相等。</p>
+
+<table>
+  <tr><th>fy 假设</th><th>三行桌面反投影高度</th><th>桌面是否水平</th></tr>
+  <tr><td>fy = fx = 342.07</td><td class="num">0.0253 / 0.0252 / 0.0252</td><td>✅ spread <strong>0.1 mm</strong></td></tr>
+  <tr><td>fy = 468.78（v_aperture）</td><td class="num">0.0426 / 0.0517 / 0.0576</td><td>❌ spread <strong>15 mm</strong>，倾斜</td></tr>
+</table>
+
+<p>诊断脚本：<code>scripts/10_diag_depth.py</code>（比脚本 09 的直方图法可靠得多）。</p>
+
+<h3>bug B：物体陷进桌面 2.5 cm</h3>
+
+<p>自检发现桌面在 <code>z=0.025</code>，而饼干盒底面在 <code>z=0</code> ——
+盒子<strong>埋进桌面 1/3 高度</strong>，那部分永远拍不到。
+（真实场景物体放在桌面上，底部同样不可见，属物理真实；但这里是穿模，需要抬高物体修正。）</p>
+
+<h3>bug C：坐标系翻转方向搞反（曾让高斯全跑到相机背后）</h3>
+
+<p>早期版本对位姿做了 <code>diag(1,−1,−1)</code> 翻转，想把 USD 约定转成「OpenCV 约定」。
+但 nerfstudio 的相机本来就是 OpenGL 约定（看向 −Z），和 USD 完全一致——
+这一转把每个相机都掉了个头，于是：</p>
+
+<pre>accumulation == 0  →  zero gradient  →  无 densification  →  模型冻结成一团半透明点云</pre>
+
+<p><strong>正确做法</strong>：位姿保持 USD/OpenGL 原样，只在<strong>反投影那一步内部</strong>翻转
+（<code>[X, −Y, −Z]</code>），见 §3.3 第 4 步。</p>
+
+<!-- ============================ 7. 几何自检 ============================ -->
+<h2>7. 几何自检：用已知尺寸验证</h2>
+
+<p>点云是否正确，不能靠肉眼看，要和 YCB 官方尺寸比对：</p>
+
+<pre>expected  : 0.164 × 0.213 × 0.072 m   (cracker box)
+measured  : 0.164 × 0.213  (x/y)        → worst x/y error: 0.000 m
+measured  : z_top = 0.0723 m            → z error: 0.3 mm
+VERDICT: OK - geometry is consistent</pre>
+
+<p>x/y 精确命中，z 方向也只差 0.3 mm → <strong>内参、深度、位姿三者完全自洽</strong>。</p>
+
+<p>脚本：<code>scripts/08_verify_cloud.py</code>（点云统计见 §3.5 实测表）。</p>
+
+<!-- ============================ 8. 脚本 ============================ -->
+<h2>8. 相关脚本</h2>
+
+<table>
+  <tr><th>脚本</th><th>运行位置</th><th>作用</th></tr>
+  <tr><td><code>06_capture_multiring.py</code></td><td>Isaac Sim Script Editor</td><td>3 高度 × 36 = 108 帧采集，同步抓 rgb + 真值深度，存真实内参</td></tr>
+  <tr><td><code>07_build_init.py</code></td><td>本机 Python</td><td>npy → PNG + transforms.json（真实内参 + <code>ply_file_path</code>）+ points3D.ply</td></tr>
+  <tr><td><code>08_verify_cloud.py</code></td><td>本机 Python</td><td>用 YCB 已知尺寸做几何自检</td></tr>
+  <tr><td><code>09_diag_fy.py</code></td><td>本机 Python</td><td>早期 fy 判定（直方图法，已弃用）</td></tr>
+  <tr><td><code>10_diag_depth.py</code></td><td>本机 Python</td><td><strong>fy 判定的权威脚本</strong>（桌面水平性判据）</td></tr>
+  <tr><td><code>13_colmap_vs_gt.py</code></td><td>本机 Python</td><td>COLMAP 位姿 vs 仿真真值的误差量化（Umeyama 对齐）</td></tr>
+</table>
+
+<!-- ============================ 9. 经验 ============================ -->
+<h2>9. 可复用的经验</h2>
+
+<ol class="steps">
+  <li><strong>3DGS 结果崩了先查初始化，不要急着加步数。</strong>碎片环 / 贴脸高斯 = 种子不对。</li>
+  <li><strong>仿真数据的内参要从相机 prim 读，不要硬编码。</strong>
+      我们硬编码 10 mm，真实是 11.2 mm，直接导致第一版训飞。</li>
+  <li><strong>几何自检必须有 ground truth。</strong>「看起来差不多」不算验证，拿已知尺寸量（本项目是 YCB 官方尺寸）。</li>
+  <li><strong>判据要选无歧义的。</strong>判定 fy 时，直方图法给出矛盾结果；
+      换成「桌面必须水平」的几何判据后，0.1 mm vs 15 mm，结论一目了然。</li>
+  <li><strong>先确认深度值的定义再套公式。</strong>沿光轴 vs 径向，差一个 cos θ，错了很难察觉。</li>
+  <li><strong>别乱转坐标系。</strong>USD 和 nerfstudio 都是 OpenGL 约定，直接通用；
+      多此一举的 flip 会让高斯跑到相机背后，且症状极具迷惑性（不报错，只是训不动）。</li>
+</ol>
+
+<!-- ============================ 10. 定位 ============================ -->
+<h2>10. 本篇定位与延伸</h2>
+
+<div class="grid2">
+  <div class="card indigo">
+    <h4>本篇（Lesson 01）讲「怎么做」</h4>
+    反投影公式、完整算法步骤、<code>ply_file_path</code> 字段、源码依据、诊断脚本、几何自检方法。
+  </div>
+  <div class="card indigo">
+    <h4>Lesson 03《初始化与自洽性》讲「为什么」</h4>
+    初始化决定收敛、位姿与内参必须成套（含图解）。两篇互补，不重复。
+  </div>
+</div>
+
+<ul>
+  <li><strong>Lesson 02《gsplat 编译与 JIT 缓存》</strong> 是环境问题，与本篇无关，遇到编译报错时再看。</li>
+  <li><strong>Lesson 04《COLMAP 调参》</strong> 记录固定内参、多子模型坑、特征密度调节。</li>
+  <li><strong>Lesson 05《背景 Floaters 与 Mask》</strong> 记录点云里的桌面点如何演变成满屏 floaters，以及 mask 治理。</li>
+  <li><strong>待补</strong>：曝光一致性（自动曝光漂移 214→208 在多视角间制造矛盾，逼出「贴脸私有高斯」；
+      已在 <code>11_check_exposure.py</code> 量化，修复方案写在 <code>06_capture_multiring.py</code>
+      的预热段与 <code>07_build_init.py</code> 的归一化段）。</li>
+</ul>
+
+</div>
+</body>
+</html>

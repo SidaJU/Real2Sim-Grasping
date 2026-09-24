@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Problem 01 · COLMAP 病根：SIFT 在重复图案上的系统性误匹配</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+       font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75}
+  .wrap{max-width:1000px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--red); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.85rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  .kw{background:var(--amber-soft); border:1px solid #fcd34d; border-radius:4px;
+      padding:1px 7px; font-weight:600; font-size:.92em}
+
+  .callout{background:var(--red-soft); border:1px solid #fecaca; border-left:5px solid var(--red);
+           border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--red)}
+  .callout.blue{background:var(--indigo-soft); border-color:#c7d2fe; border-left-color:var(--indigo)}
+  .callout.blue strong{color:var(--indigo)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:780px){.grid2{grid-template-columns:1fr}}
+  .card{background:#fff; border:1px solid var(--line); border-radius:12px; padding:18px 22px;
+        box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  .card.bad{border-left:5px solid var(--red)}
+  .card.good{border-left:5px solid var(--green)}
+  .card.warn{border-left:5px solid var(--amber)}
+  .card h4{margin:0 0 8px; font-size:1rem}
+  .card.bad h4{color:var(--red)} .card.good h4{color:var(--green)} .card.warn h4{color:var(--amber)}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig img{display:block; width:100%; height:auto; border-radius:8px}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:16px 0}
+  th,td{padding:10px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+
+  .chain{display:flex; flex-direction:column; margin:20px 0}
+  .chain .node{background:#fff; border:2px solid var(--indigo); border-radius:10px;
+               padding:9px 18px; text-align:center; font-size:.95rem}
+  .chain .arrow{text-align:center; color:var(--indigo); font-size:1.3rem; line-height:1.3; font-weight:700}
+  .chain .node.bad{border-color:var(--red); color:var(--red)}
+  .chain .arrow.red{color:var(--red)}
+
+  ul{margin:10px 0; padding-left:22px}
+  li{margin:5px 0}
+  footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Problem 01 · COLMAP 病根：SIFT 在重复图案上的系统性误匹配</h1>
+  <div class="sub">一个"少纹理单物体 + 90% 白背景"场景，如何让经典 SfM 管线全线崩溃<br>
+  —— 本篇即 COLMAP 完整笔记：§1-8 病根分析，§9 调参实录（从 2/99 救到 99/99）</div>
+</header>
+
+<h2>0 · 主角：COLMAP 是什么</h2>
+
+<p><strong>COLMAP</strong> 是一个通用的、端到端的 <strong>SfM（运动恢复结构）+ MVS（多视图立体）</strong>
+三维重建管线，提供图形界面和命令行两种接口，支持有序与无序图像集合。
+由 <strong>Johannes L. Schönberger 与 Jan-Michael Frahm</strong> 在 ETH Zurich 期间开发，
+现以 BSD 协议开源并由社区维护——它是三维视觉领域<strong>事实上的标准工具</strong>。</p>
+
+<h3>它解决什么问题</h3>
+<p>给你一堆照片（手机随手拍的、无人机航拍的、机器人绕拍的），回答两个问题：</p>
+<div class="grid2">
+  <div class="card">
+    <h4>问题 1：每张照片是从哪拍的？</h4>
+    <p>→ 输出每张图的<strong>相机位姿</strong>（旋转 R + 平移 t）</p>
+  </div>
+  <div class="card">
+    <h4>问题 2：场景里有什么？</h4>
+    <p>→ 输出<strong>三维结构</strong>（稀疏点云，MVS 阶段还能出稠密点云/网格）</p>
+  </div>
+</div>
+
+<h3>输入与输出</h3>
+<table>
+  <thead><tr><th style="width:18%"></th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><strong>输入</strong></td><td>一组图像（可选：已标定的相机内参，如我们提供的 <code>342.07</code>）</td></tr>
+    <tr><td rowspan="3"><strong>输出</strong></td>
+        <td><code>cameras.bin</code> —— 相机内参（焦距、主点、畸变）</td></tr>
+    <tr><td><code>images.bin</code> —— 每张图的位姿 + 该图上被三角化的 2D 特征点</td></tr>
+    <tr><td><code>points3D.bin</code> —— 稀疏三维点云（<strong>以及每个点被哪些图看到 → track 信息</strong>）</td></tr>
+  </tbody>
+</table>
+
+<h3>它为什么是 3DGS 管线里绕不开的一环</h3>
+<p>3DGS 训练<strong>必须</strong>先有两样东西，而 COLMAP 恰好一次给全：</p>
+
+<div class="fig">
+<svg viewBox="0 0 920 150" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <defs><marker id="a2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+    <path d="M0,0 L10,4 L0,8 z" fill="#4f46e5"/></marker></defs>
+
+  <rect x="20" y="45" width="130" height="60" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+  <text x="85" y="72" font-size="13" text-anchor="middle" fill="#1e293b" font-weight="600">99 张照片</text>
+  <text x="85" y="90" font-size="11" text-anchor="middle" fill="#64748b">（只有 RGB）</text>
+
+  <line x1="155" y1="75" x2="195" y2="75" stroke="#4f46e5" stroke-width="2" marker-end="url(#a2)"/>
+
+  <rect x="200" y="35" width="170" height="80" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="2.5"/>
+  <text x="285" y="58" font-size="13" text-anchor="middle" fill="#4f46e5" font-weight="700">COLMAP（SfM）</text>
+  <text x="285" y="78" font-size="11" text-anchor="middle" fill="#475569">特征 → 匹配 → 对极验证</text>
+  <text x="285" y="96" font-size="11" text-anchor="middle" fill="#475569">→ PnP 增量注册 → BA</text>
+
+  <line x1="375" y1="75" x2="415" y2="75" stroke="#4f46e5" stroke-width="2" marker-end="url(#a2)"/>
+
+  <rect x="420" y="35" width="180" height="80" rx="8" fill="#ecfdf5" stroke="#059669" stroke-width="2.5"/>
+  <text x="510" y="58" font-size="13" text-anchor="middle" fill="#059669" font-weight="700">位姿 + 稀疏点云</text>
+  <text x="510" y="78" font-size="11" text-anchor="middle" fill="#475569">① 相机在哪（训练视角）</text>
+  <text x="510" y="96" font-size="11" text-anchor="middle" fill="#475569">② 高斯球的初始位置</text>
+
+  <line x1="605" y1="75" x2="645" y2="75" stroke="#4f46e5" stroke-width="2" marker-end="url(#a2)"/>
+
+  <rect x="650" y="45" width="150" height="60" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="725" y="72" font-size="13" text-anchor="middle" fill="#d97706" font-weight="700">3DGS 训练</text>
+  <text x="725" y="90" font-size="11" text-anchor="middle" fill="#64748b">→ 可渲染 3D 模型</text>
+
+  <text x="830" y="80" font-size="12" font-weight="700" fill="#d97706">→ mesh → 抓取</text>
+</svg>
+<figcaption>官方 3DGS 的 <code>convert.py</code> 第一步就是跑 COLMAP——本项目的 COLMAP 流程正是照抄它的命令序列。</figcaption>
+</div>
+
+<div class="callout blue">
+  <strong>本项目里它的角色：</strong>作为 <strong>"真实场景 baseline"</strong>。
+  我们假装不知道位姿（虽然在仿真里知道），让 COLMAP 只从 RGB 去估，
+  然后拿仿真真值当标尺去量它错多少——<strong>真实场景永远做不到的量化，正是这个项目的价值所在</strong>。
+</div>
+
+<div class="callout">
+  <strong>一句话定位：</strong>不是 COLMAP 用错了，也不是照片有问题，而是
+  <strong>SIFT 描述子在本场景下天然不具备唯一性</strong>——它产生的误匹配
+  <strong>几何自洽</strong>，连对极几何 + RANSAC 都剔不掉，最终被 Bundle Adjustment 一路吸收，
+  把整个重建系统地拉歪（位姿平均误差 <strong>18.21 cm</strong>）。
+</div>
+
+<h2>1 · 先看结果：问题长什么样</h2>
+
+<div class="fig">
+  <img src="assets/input_contact_sheet.png" alt="输入 COLMAP 的 50 张抽样图接触印相">
+  <figcaption><strong>输入数据本身没问题。</strong>50 张抽样（隔一取一）：99 张全部 640×640，
+  亮度标准差仅 0.79，无损坏、无模糊、无异常曝光。但一眼可见——<strong>每张约 90% 的画面是灰白桌面与背景</strong>，
+  饼干盒只占 6.4%。</figcaption>
+</div>
+
+<div class="grid2">
+  <div class="card bad">
+    <h4>后果 A：位姿整体歪 18 cm</h4>
+    <table style="box-shadow:none;margin:8px 0">
+      <tr><td>平均误差</td><td class="num">18.21 cm</td></tr>
+      <tr><td>中位数 p50</td><td class="num">15.92 cm</td></tr>
+      <tr><td>最好的 3 帧</td><td class="num">3.87 / 4.68 / 8.27 cm</td></tr>
+      <tr><td>误差 &lt; 5cm 的帧</td><td class="num">2 / 99（2%）</td></tr>
+    </table>
+    <p style="font-size:.9rem;color:var(--muted)">相机轨道半径才 25 cm——误差接近其 73%。</p>
+  </div>
+  <div class="card bad">
+    <h4>后果 B：物体"裂开"、背景泡沫爆炸</h4>
+    <ul style="font-size:.92rem">
+      <li>同一表面在不同照片里投影到相差十几厘米的位置</li>
+      <li>高斯只能分裂成多个副本去同时满足矛盾证据 → 裂开 / 重影</li>
+      <li>densification 失控：高斯数 <strong>3,613 → 480,673</strong>（133 倍）</li>
+    </ul>
+  </div>
+</div>
+
+<div class="fig">
+  <img src="assets/floaters_before.png" alt="COLMAP 位姿下的重建结果，布满灰白色 floaters">
+  <figcaption>用 COLMAP 位姿训练出的场景：物体周围生出大量灰白色半透明高斯（background floaters）。
+  根因是位姿不一致让背景无法收敛成平面。</figcaption>
+</div>
+
+<div class="callout blue">
+  <strong>决定性细节：</strong>误差<strong>不是随机散布</strong>。最差的 8 张是
+  <code>rgb_0027 / 0028 / 0029 / 0052 / 0053 / 0054 / 0055</code>——<strong>帧号连续</strong>。
+  说明畸变是空间连续的（整个方位角区间一起偏），而不是个别离群图片。
+  这直接排除了"少数坏图污染"的假设。
+</div>
+
+<h2>2 · 关键词速查（本项目涉及的全部概念）</h2>
+
+<table>
+  <thead><tr><th style="width:22%">关键词</th><th style="width:40%">是什么</th><th>在本项目里的位置</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="kw">相机标定</span><br>Calibration</td>
+      <td>确定相机内参：焦距 <code>fx, fy</code>、主点 <code>cx, cy</code>、畸变。
+      没有它就无法把像素位置换算成三维射线。</td>
+      <td>从 Isaac Sim 相机 prim 读出 <strong>fx = 342.07</strong>，喂给 COLMAP；
+      并锁死 <code>--Mapper.ba_refine_focal_length 0</code></td>
+    </tr>
+    <tr>
+      <td><span class="kw">SIFT</span></td>
+      <td>局部特征：检测"角点/斑点"并生成 128 维描述子，用描述子距离判断两图的点是否同一个。</td>
+      <td><strong>本问题的主角。</strong>默认参数下每图仅 ~434 个特征点</td>
+    </tr>
+    <tr>
+      <td><span class="kw">对极几何</span><br>Epipolar Geometry</td>
+      <td>两台相机看同一个 3D 点时，对应点必须落在对方图像的<strong>极线</strong>上。
+      数学形式：本质矩阵 <strong>E</strong> / 基础矩阵 <strong>F</strong>。</td>
+      <td>COLMAP 用它做几何验证：我们的库里 <code>two_view_geometries = 4851</code>（99 图两两配对全部验证过）</td>
+    </tr>
+    <tr>
+      <td><span class="kw">RANSAC</span></td>
+      <td>鲁棒估计：随机抽样、反复投票，把不符合模型的点当外点剔除。</td>
+      <td><strong>正是它救不了我们</strong>——见 §5</td>
+    </tr>
+    <tr>
+      <td><span class="kw">SfM</span><br>Structure from Motion</td>
+      <td>从多张不同位置的照片，同时恢复<strong>相机位姿</strong>与<strong>稀疏三维结构</strong>。</td>
+      <td>COLMAP 全流程；结果是 99/99 注册、4923 个稀疏点、18.21cm 误差</td>
+    </tr>
+    <tr>
+      <td><span class="kw">三角化</span><br>Triangulation</td>
+      <td>已知两个相机位姿 + 同一点在两图的像素位置 → 两条射线求交 → 该点的 3D 坐标。</td>
+      <td>4923 个稀疏点全部由此得来，所以它们必然落在"多图可见"处</td>
+    </tr>
+    <tr>
+      <td><span class="kw">PnP</span></td>
+      <td>已知一批 3D 点及其在某张图的 2D 投影，反解这张图的相机位姿。</td>
+      <td>增量式 SfM 每注册一张新图就解一次 PnP（EPnP + RANSAC）</td>
+    </tr>
+    <tr>
+      <td><span class="kw">Bundle Adjustment</span></td>
+      <td>联合优化所有位姿 + 所有 3D 点 + 内参，最小化<strong>重投影误差</strong>。</td>
+      <td>它把误匹配"消化"成整体畸变——只保证投影对得上，不保证几何对</td>
+    </tr>
+    <tr>
+      <td><span class="kw">MVS</span><br>Multi-View Stereo</td>
+      <td>位姿已知后，为每个像素估深度 → <strong>稠密</strong>点云。</td>
+      <td>本项目<strong>用仿真渲染的真值深度替代</strong>（15 万点 vs 4923 点，差 30 倍）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>3 · SIFT 到底是什么</h2>
+
+<div class="fig">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <text x="20" y="24" font-size="14" font-weight="700">SIFT 描述子的构造：16×16 邻域 → 4×4 子块 → 每块 8 方向直方图 → 128 维</text>
+
+  <!-- patch -->
+  <rect x="30" y="50" width="130" height="130" fill="#f1f5f9" stroke="#94a3b8"/>
+  <g stroke="#cbd5e1" stroke-width="0.5">
+    <line x1="62.5" y1="50" x2="62.5" y2="180"/><line x1="95" y1="50" x2="95" y2="180"/>
+    <line x1="127.5" y1="50" x2="127.5" y2="180"/>
+    <line x1="30" y1="82.5" x2="160" y2="82.5"/><line x1="30" y1="115" x2="160" y2="115"/>
+    <line x1="30" y1="147.5" x2="160" y2="147.5"/>
+  </g>
+  <circle cx="95" cy="115" r="4" fill="#4f46e5"/>
+  <text x="95" y="200" font-size="11" text-anchor="middle" fill="#64748b">关键点邻域 16×16</text>
+
+  <path d="M175,115 L215,115" stroke="#4f46e5" stroke-width="2" marker-end="url(#ar)"/>
+  <defs><marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+    <path d="M0,0 L10,4 L0,8 z" fill="#4f46e5"/></marker></defs>
+
+  <!-- one sub-block histogram -->
+  <text x="235" y="60" font-size="11" fill="#64748b">取一个 4×4 子块：</text>
+  <rect x="235" y="70" width="110" height="110" fill="#fef3c7" stroke="#d97706"/>
+  <g stroke="#fbbf24" stroke-width="1.5">
+    <line x1="250" y1="170" x2="270" y2="120"/><line x1="275" y1="170" x2="295" y2="110"/>
+    <line x1="300" y1="170" x2="320" y2="140"/>
+  </g>
+  <text x="290" y="198" font-size="11" text-anchor="middle" fill="#64748b">梯度方向</text>
+
+  <path d="M360,125 L400,125" stroke="#4f46e5" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- histogram -->
+  <text x="420" y="60" font-size="11" fill="#64748b">统计成 8 bin 直方图：</text>
+  <rect x="420" y="80" width="150" height="90" fill="#fff" stroke="#94a3b8"/>
+  <g fill="#4f46e5">
+    <rect x="428" y="140" width="14" height="26"/><rect x="448" y="120" width="14" height="46"/>
+    <rect x="468" y="152" width="14" height="14"/><rect x="488" y="132" width="14" height="34"/>
+    <rect x="508" y="160" width="14" height="6"/><rect x="528" y="146" width="14" height="20"/>
+    <rect x="548" y="154" width="14" height="12"/>
+  </g>
+  <text x="495" y="190" font-size="11" text-anchor="middle" fill="#64748b">8 个方向 bin</text>
+
+  <path d="M585,125 L625,125" stroke="#4f46e5" stroke-width="2" marker-end="url(#ar)"/>
+
+  <text x="645" y="80" font-size="12" fill="#1e293b">4×4 子块 × 8 bin</text>
+  <text x="645" y="104" font-size="18" font-weight="700" fill="#4f46e5">= 128 维向量</text>
+  <text x="645" y="132" font-size="11" fill="#64748b">归一化 → 对光照、</text>
+  <text x="645" y="150" font-size="11" fill="#64748b">旋转、尺度有一定不变性</text>
+  <text x="645" y="180" font-size="11" fill="#64748b">匹配判据：两描述子的</text>
+  <text x="645" y="198" font-size="11" fill="#64748b">欧氏距离最近</text>
+</svg>
+<figcaption>SIFT 用局部梯度方向的统计来表达"这个点周围长什么样"，得到一个 128 维指纹。</figcaption>
+</div>
+
+<h3>SIFT 靠什么区分两个点：局部外观的唯一性</h3>
+<p>它<strong>只看关键点周围那一小块</strong>（16×16 像素），完全不知道这个点在整个物体上的位置。
+所以它的判别力完全依赖一件事：<strong>不同位置的局部长相必须不一样</strong>。</p>
+
+<h2>4 · 为什么它在这里失效（核心）</h2>
+
+<div class="fig">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <text x="20" y="24" font-size="14" font-weight="700">重复图案 → 描述子撞车 → 匹配歧义</text>
+
+  <!-- box face with repeating pattern -->
+  <rect x="40" y="60" width="300" height="150" fill="#f8d7c4" stroke="#b45309" stroke-width="2"/>
+  <text x="190" y="52" font-size="11" text-anchor="middle" fill="#78350f">饼干盒正面（图案沿盒身重复）</text>
+  <g>
+    <rect x="60" y="80" width="60" height="45" fill="#dc2626"/><text x="90" y="108" font-size="10" text-anchor="middle" fill="#fff">图案 A</text>
+    <rect x="140" y="80" width="60" height="45" fill="#dc2626"/><text x="170" y="108" font-size="10" text-anchor="middle" fill="#fff">图案 B</text>
+    <rect x="220" y="80" width="60" height="45" fill="#dc2626"/><text x="250" y="108" font-size="10" text-anchor="middle" fill="#fff">图案 C</text>
+    <rect x="60" y="140" width="60" height="45" fill="#dc2626"/><text x="90" y="168" font-size="10" text-anchor="middle" fill="#fff">图案 D</text>
+    <rect x="140" y="140" width="60" height="45" fill="#dc2626"/><text x="170" y="168" font-size="10" text-anchor="middle" fill="#fff">图案 E</text>
+    <rect x="220" y="140" width="60" height="45" fill="#dc2626"/><text x="250" y="168" font-size="10" text-anchor="middle" fill="#fff">图案 F</text>
+  </g>
+
+  <!-- two views -->
+  <text x="400" y="60" font-size="12" font-weight="700">相机 1 看到"图案 A"</text>
+  <circle cx="440" cy="110" r="26" fill="#dc2626"/><text x="440" y="115" font-size="10" text-anchor="middle" fill="#fff">A</text>
+  <text x="400" y="160" font-size="11" fill="#64748b">描述子 d(A)</text>
+
+  <text x="620" y="60" font-size="12" font-weight="700">相机 2 看到"图案 E"</text>
+  <circle cx="660" cy="110" r="26" fill="#dc2626"/><text x="660" y="115" font-size="10" text-anchor="middle" fill="#fff">E</text>
+  <text x="620" y="160" font-size="11" fill="#64748b">描述子 d(E)</text>
+
+  <!-- wrong match -->
+  <line x1="470" y1="110" x2="630" y2="110" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6 4"/>
+  <text x="550" y="100" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">误匹配</text>
+
+  <text x="400" y="200" font-size="12" fill="#dc2626" font-weight="700">
+    || d(A) − d(E) || ≈ 0
+  </text>
+  <text x="400" y="222" font-size="11" fill="#64748b">两个不同的物理点，局部外观几乎相同 → SIFT 分不清</text>
+  <text x="620" y="200" font-size="11" fill="#64748b">正确匹配应该是 A↔A、E↔E，</text>
+  <text x="620" y="222" font-size="11" fill="#64748b">但描述子距离给出的答案不是它。</text>
+</svg>
+<figcaption>CHEEZ-IT 包装的色块与文字沿盒身重复出现，不同位置的局部外观高度相似。</figcaption>
+</div>
+
+<div class="grid2">
+  <div class="card warn">
+    <h4>雪上加霜：90% 白板</h4>
+    <p>纯白桌面与背景<strong>没有任何梯度</strong> → 提不出特征。实测近白像素 85%~94%（平均 89.5%）。
+    所有几何约束只能靠盒子表面那 6.4% 的画面，而这块区域偏偏还是<strong>自相似的</strong>。</p>
+  </div>
+  <div class="card bad">
+    <h4>为什么不是"特征少"那么简单</h4>
+    <p>特征少只会让重建<strong>稀疏</strong>；而我们是<strong>整体歪</strong>。
+    区别在于：少量<strong>随机</strong>误匹配会被 RANSAC 剔除，
+    但重复图案产生的是<strong>成片、方向一致</strong>的误匹配。</p>
+  </div>
+</div>
+
+<h2>5 · 对极几何与 RANSAC 为什么救不了</h2>
+
+<div class="fig">
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <text x="20" y="22" font-size="14" font-weight="700">对极几何：对应点必须落在极线上</text>
+
+  <!-- 3D point -->
+  <circle cx="470" cy="150" r="7" fill="#059669"/>
+  <text x="482" y="146" font-size="12" fill="#059669" font-weight="700">P</text>
+
+  <!-- cameras -->
+  <circle cx="150" cy="70" r="10" fill="#334155"/><text x="118" y="58" font-size="11" fill="#334155">相机 C1</text>
+  <circle cx="790" cy="70" r="10" fill="#334155"/><text x="790" y="58" font-size="11" fill="#334155">相机 C2</text>
+
+  <!-- image planes -->
+  <rect x="110" y="110" width="110" height="80" fill="#eef2ff" stroke="#4f46e5" transform="skewY(12)"/>
+  <rect x="740" y="110" width="110" height="80" fill="#eef2ff" stroke="#4f46e5"/>
+
+  <!-- rays -->
+  <line x1="150" y1="70" x2="470" y2="150" stroke="#059669" stroke-width="1.6"/>
+  <line x1="790" y1="70" x2="470" y2="150" stroke="#059669" stroke-width="1.6"/>
+  <line x1="150" y1="70" x2="790" y2="70" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="5 4"/>
+  <text x="460" y="62" font-size="11" fill="#64748b">基线</text>
+
+  <!-- epipolar line on right image -->
+  <line x1="745" y1="150" x2="845" y2="150" stroke="#dc2626" stroke-width="2.5"/>
+  <circle cx="795" cy="150" r="5" fill="#059669"/>
+  <text x="700" y="196" font-size="11" fill="#dc2626">极线 l'</text>
+  <text x="700" y="214" font-size="11" fill="#64748b">P 在 C2 图中的像点必然落在这条线上</text>
+
+  <text x="110" y="230" font-size="11" fill="#64748b">本质矩阵 E = t×R，基础矩阵 F 内含内参；RANSAC 就是反复猜 E/F，把"离极线太远"的匹配当外点剔除</text>
+</svg>
+<figcaption>极线约束是剔除外点的核心工具——但它只认"几何上是否自洽"。</figcaption>
+</div>
+
+<div class="callout">
+  <strong>这是全篇最关键的一点：</strong>RANSAC 判断的标准是"这个匹配符不符合某个 E 矩阵"，
+  而<strong>不是</strong>"它是不是真的同一个物理点"。<br><br>
+  重复图案造成的误匹配（A↔E）在几何上是<strong>完全自洽的</strong>——它们确实存在于某个合法的相对位姿下。
+  所以极线约束检不出它们，RANSAC 把它们当<strong>内点</strong>保留下来。
+  <strong>能剔掉的只有随机噪声，剔不掉结构性的欺骗。</strong>
+</div>
+
+<h2>6 · 完整根因链</h2>
+
+<div class="chain">
+  <div class="node">场景：单物体 + 纯白桌面，90% 像素无纹理</div>
+  <div class="arrow">↓</div>
+  <div class="node">特征只能来自盒子表面（占画面 6.4%），默认参数下每图仅 ~434 点</div>
+  <div class="arrow">↓</div>
+  <div class="node bad">盒子图案自相似 → 不同位置的 SIFT 描述子撞车</div>
+  <div class="arrow red">↓</div>
+  <div class="node bad">产生成片、方向一致的误匹配（不是随机噪声）</div>
+  <div class="arrow red">↓</div>
+  <div class="node bad">对极几何 / RANSAC 判定"几何自洽" → 全部保留为内点</div>
+  <div class="arrow red">↓</div>
+  <div class="node bad">Bundle Adjustment 最小化重投影误差 → 把矛盾"消化"成整体畸变</div>
+  <div class="arrow red">↓</div>
+  <div class="node bad">输出：位姿平均偏 18.21 cm，但内部自洽 → 能训出形状，几何不可信</div>
+</div>
+
+<h2>7 · 已经排除的假设（排除法）</h2>
+
+<table>
+  <thead><tr><th>假设</th><th>验证方式</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>照片损坏 / 异常帧</td><td>抽样 50 张逐张检查：尺寸一致、亮度 std 0.79、无模糊</td><td class="num">❌ 排除</td></tr>
+    <tr><td>曝光漂移造成帧间矛盾</td><td>已做线性空间曝光归一化（ring 漂移 8.49 → 2.66）</td><td class="num">❌ 排除</td></tr>
+    <tr><td>内参错误</td><td>锁死标定值 <code>ba_refine_focal_length 0</code> 重跑</td><td class="num">⚠ 仅 18.21→16.52cm，非主因</td></tr>
+    <tr><td>少数坏图污染</td><td>误差中位数 15.92、&lt;5cm 仅 2/99、坏帧连续</td><td class="num">❌ 排除（是全体系统性）</td></tr>
+    <tr><td>注册率不足</td><td>提高 <code>peak_threshold</code> 后 99/99 注册</td><td class="num">⚠ 覆盖修好了，精度没救回来</td></tr>
+    <tr><td><strong>SIFT 在自相似图案上的结构性误匹配</strong></td><td>以上全部排除后剩下的唯一解释</td><td class="num"><strong>✅ 确认</strong></td></tr>
+  </tbody>
+</table>
+
+<h2>8 · 为什么"系统性"这个词决定处理方式</h2>
+
+<div class="grid2">
+  <div class="card bad">
+    <h4>如果是随机污染</h4>
+    <p>少数离群点 → <strong>剔除坏图</strong>或加鲁棒损失即可，存在"正确的多数派"可供投票。</p>
+  </div>
+  <div class="card bad">
+    <h4>实际是系统性畸变</h4>
+    <p>全体偏离 + 空间连续 → <strong>不存在正确的多数派</strong>。剔除坏图只会在覆盖上挖洞，
+    剩下的仍平均偏十几厘米。</p>
+  </div>
+</div>
+
+<h3>下一步方向（对症的是"换掉 SIFT 这条路"）</h3>
+<table>
+  <thead><tr><th style="width:26%">路线</th><th>为什么对症</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="kw">前馈式重建</span><br>（DUSt3R / VGGT）</td>
+      <td>用 <strong>Transformer 直接回归 3D</strong>，不依赖局部描述子的唯一性，
+      能利用全局上下文区分"这是盒子左上角还是右下角"。同时输出<strong>稠密</strong> pointmap，
+      顺带解决初始化点云稀疏的问题。<span class="kw">Pixel-aligned</span> 特征预测。</td>
+    </tr>
+    <tr>
+      <td><span class="kw">Epipolar-guided Transformer</span></td>
+      <td>不是"用极线剔除外点"，而是<strong>用极线约束引导注意力</strong>——
+      只在极线上采样特征进行 cross-attention，从机制上就不给重复图案留歧义空间。</td>
+    </tr>
+    <tr>
+      <td>贴标记点（AprilTag）</td>
+      <td>给场景注入<strong>唯一且可分辨</strong>的特征，产线标准做法，但不改算法本身。</td>
+    </tr>
+    <tr>
+      <td>接受，作为 baseline 结论</td>
+      <td>记录"真实场景经典 SfM 在此类场景的能力上限"，这正是本项目 A/B 对照的价值。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>9 · 附录：COLMAP 调参实录（从 2/99 到 99/99）</h2>
+
+<p>上面的病根治不了（SIFT 的结构性缺陷），但下面四个<strong>官方参数开关</strong>能把"完全不可用"救成"能用"。
+全部是 COLMAP 原生参数，真实产线同样适用。</p>
+
+<h3>9.0 实测演进</h3>
+<table>
+  <thead><tr><th>版本</th><th>改动</th><th>注册率</th><th>点云</th><th>位姿误差</th></tr></thead>
+  <tbody>
+    <tr><td>v1</td><td>官方默认（自标定内参）</td><td class="num" style="color:#dc2626">2 / 99</td><td class="num">—</td><td class="num">—</td></tr>
+    <tr><td>v2</td><td>提供标定内参 PINHOLE</td><td class="num">50 / 99</td><td class="num">2,191</td><td class="num">19.91 cm</td></tr>
+    <tr><td>v3</td><td>提高特征密度</td><td class="num">99 / 99（但选了废的子模型）</td><td class="num">646</td><td class="num">—</td></tr>
+    <tr><td>v4</td><td>选最大子模型</td><td class="num" style="color:#059669">99 / 99</td><td class="num">4,923</td><td class="num">18.21 cm</td></tr>
+  </tbody>
+</table>
+<div class="callout" style="background:var(--amber-soft);border-color:#fcd34d;border-left-color:var(--amber)">
+  <strong style="color:var(--amber)">关键观察：</strong>注册率从 50% → 100%，位姿误差只从 19.91 → 18.21 cm。
+  <strong>覆盖完整 ≠ 位姿准确</strong>——再次印证畸变是系统性的。
+</div>
+
+<h3>9.1 开关一：固定内参（标定过的相机就该锁死）</h3>
+<p><strong>问题</strong>：我们提供了标定值 <code>342.07</code>，但 mapper 的 BA 默认继续优化焦距，最终报出
+<code>374.74</code>（+9%）。焦距与位姿在 BA 里<strong>耦合</strong>——焦距错一点，整个场景的尺度与形状就系统性扭曲。</p>
+
+<pre>colmap mapper \
+  --database_path ... --image_path ... --output_path ... \
+  --Mapper.ba_refine_focal_length 0 \
+  --Mapper.ba_refine_principal_point 0 \
+  --Mapper.ba_refine_extra_params 0 \
+  --Mapper.ba_global_function_tolerance=0.000001</pre>
+
+<p><strong>这不违反 baseline 原则</strong>：真实机器人工位本来就有标定好的相机内参，SfM 时固定内参是标准做法。</p>
+
+<table>
+  <thead><tr><th></th><th>Baseline（BA 改焦距→374.74）</th><th>固定内参</th></tr></thead>
+  <tbody>
+    <tr><td>平均误差</td><td class="num">18.21 cm</td><td class="num" style="color:#059669">16.52 cm</td></tr>
+    <tr><td>中位数</td><td class="num">15.92 cm</td><td class="num" style="color:#059669">12.15 cm（−24%）</td></tr>
+    <tr><td>最大</td><td class="num">33.37 cm</td><td class="num">37.06 cm</td></tr>
+    <tr><td>子模型数</td><td class="num">2 个（sparse/0 是废的 9 张）</td><td class="num" style="color:#059669">1 个（干净）</td></tr>
+  </tbody>
+</table>
+<p><strong>结论：有效，但不治本。</strong>绝对误差仍在 16 cm 量级 → 内参被改只是次因，
+主因仍是 §4 讲的 SIFT 结构性误匹配。固定内参是"该做的事"，救不了匹配质量。</p>
+
+<h3>9.2 开关二：多子模型选择 ★ 大坑</h3>
+<div class="callout">
+  <strong>mapper 可能输出多个互不相连的子模型</strong>，而官方 3DGS 的 <code>convert.py</code>
+  <strong>硬编码</strong> <code>--input_path distorted/sparse/0</code>——正好挑中废的那个：
+  <pre style="background:#1e293b;margin:10px 0">distorted/sparse/0  →   9 images,   646 points   ← 断裂分支
+distorted/sparse/1  →  99 images, 4,923 points   ← 真正的主模型</pre>
+  流程一路"成功"没报错，结果只用了 9 张图。
+</div>
+
+<p><strong>解决</strong>：自动选<strong>点数最多</strong>的子模型（bat 里的 PowerShell 一行）：</p>
+
+<pre>for /f %%i in ('powershell -NoProfile -Command "$b='%SRC%\distorted\sparse'; (Get-ChildItem $b -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'points3D.bin') } | Sort-Object { (Get-Item (Join-Path $_.FullName 'points3D.bin')).Length } -Descending | Select-Object -First 1).Name"') do set SUB=%%i
+"%COLL%" image_undistorter --input_path "%SRC%\distorted\sparse\%SUB%" ...</pre>
+
+<p><strong>教训</strong>：不要盲信"官方脚本跑通没报错"。每一步都要检查 <code>points3D.bin</code> 的实际规模。</p>
+
+<h3>9.3 开关三：特征密度（少纹理场景必须调）</h3>
+<p><strong>问题</strong>：默认参数每图仅 <strong>~434 个</strong> SIFT 特征点（纯白桌面零特征），
+顶环（俯视，画面 80% 是白桌面）<strong>27 张全部注册失败</strong>。</p>
+
+<pre>--SiftExtraction.peak_threshold 0.002      # 默认 0.00667
+--SiftExtraction.first_octave -1           # 在 2x 分辨率提取
+--SiftExtraction.max_num_features 16384    # 默认 8192</pre>
+
+<div class="card warn">
+  <h4>代价：提覆盖率是有副作用的</h4>
+  <p>白桌面上也会提取到噪声特征 → 初始点云混进背景点。实测：22% 是远处杂点、37% 是灰色桌面点。
+  这些种子被 densification 大量增殖，就是 §1 里那些弥散的灰白色高斯球。<strong>必须配套清理</strong>。</p>
+</div>
+
+<h3>9.4 开关四：清理初始点云里的背景</h3>
+<table>
+  <thead><tr><th>区域（对齐到真实坐标后）</th><th>点数</th><th>占比</th></tr></thead>
+  <tbody>
+    <tr><td>物体包围盒内</td><td class="num">3,519</td><td class="num">71%</td></tr>
+    <tr><td>近桌面区域</td><td class="num">3,830</td><td class="num">78%</td></tr>
+    <tr><td>远处 / 垃圾点</td><td class="num">1,093</td><td class="num" style="color:#dc2626">22%</td></tr>
+    <tr><td>灰色点（桌面/白色）</td><td class="num">1,814</td><td class="num" style="color:#dc2626">37%</td></tr>
+  </tbody>
+</table>
+
+<p><strong>清理三招（都不需要真值，真实场景可用）</strong>：</p>
+<ol>
+  <li><strong>按 track 长度过滤</strong>（最靠谱）：<code>points3D.bin</code> 存了每个点被哪些图像看到。
+      <strong>track &lt; 3 的点大多是误匹配产物</strong> → 丢掉 1,151 个</li>
+  <li><strong>统计离群点剔除</strong>（open3d <code>remove_statistical_outlier</code>）→ 再丢 159 个</li>
+  <li><strong>写回文件</strong>让 nerfstudio 读到清理后的结果（脚本直接重写 <code>points3D.bin</code>，
+      原文件备份为 <code>.orig</code>）</li>
+</ol>
+<pre>4923 → 3,613   (scripts/28_filter_colmap_init.py)</pre>
+
+<div class="card good">
+  <h4>再加一道：mask（详见 Lesson 05）</h4>
+  <p>splatfacto <strong>确实支持</strong> mask（<code>splatfacto.py:707-715</code>）：GT 与渲染图在 mask 外同时置黑
+  → 背景 loss = 0 → 不增殖。mask 用<strong>色度阈值</strong>生成
+  （<code>max(RGB)-min(RGB) &gt; 40</code>），<strong>不能</strong>用"非白"阈值——桌面亮度 207~214 会被误判成物体。</p>
+</div>
+
+<h3>9.5 可复用经验</h3>
+<ol>
+  <li><strong>COLMAP 跑通 ≠ 结果对</strong>。每一步都要检查产出规模（特征点数、注册数、点云数）。</li>
+  <li><strong>标定过的相机固定内参</strong>，别让 BA 改它。</li>
+  <li><strong>永远检查 mapper 是否输出了多个子模型</strong>，选最大的那个。</li>
+  <li><strong>提特征密度有副作用</strong>：用背景噪声换覆盖率，必须配套点云清理。</li>
+  <li><strong>位姿误差要相对场景尺寸看</strong>：18 cm 在大场景微不足道，在 25 cm 轨道上等于 73%
+      ——<strong>小物体场景对 COLMAP 极其不友好</strong>。</li>
+</ol>
+
+<h3>9.6 相关文件</h3>
+<table>
+  <thead><tr><th>文件</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>run_colmap_gs_official.bat</code></td><td>完整 COLMAP 流程（含多子模型选择、固定内参）</td></tr>
+    <tr><td><code>run_train_colmap.bat</code> / <code>run_train_colmap_masked.bat</code></td><td>用 COLMAP 位姿训练 splatfacto（后者带 mask）</td></tr>
+    <tr><td><code>13_colmap_vs_gt.py</code></td><td>位姿误差量化（Umeyama 对齐），支持传入模型目录做对比</td></tr>
+    <tr><td><code>28_filter_colmap_init.py</code></td><td>清理初始点云里的背景点</td></tr>
+    <tr><td><code>29_make_colmap_masks.py</code></td><td>纯 RGB 色度阈值生成 mask + 填洞</td></tr>
+  </tbody>
+</table>
+
+<footer>
+  数据来源：<code>13_colmap_vs_gt.py</code>（Umeyama 对齐误差）、<code>28/29</code> 脚本、
+  输入图抽样检查、COLMAP <code>database.db</code> 统计。<br>
+  相关笔记：Lesson 01 初始点云 · 03 初始化与自洽性 · 05 背景 Floaters 与 Mask
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 03 · 初始化与自洽性：为什么"位姿更错"的反而能收敛</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    line-height:1.75;
+  }
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+
+  .callout{
+    background:var(--indigo-soft); border:1px solid #c7d2fe; border-left:5px solid var(--indigo);
+    border-radius:10px; padding:18px 22px; margin:24px 0;
+  }
+  .callout strong{color:var(--indigo)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+
+  .card{background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px;
+        box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  .card.bad{border-left:5px solid var(--red)}
+  .card.good{border-left:5px solid var(--green)}
+  .card.warn{border-left:5px solid var(--amber)}
+  .card h4{margin:0 0 10px; font-size:1rem}
+  .card.bad h4{color:var(--red)}
+  .card.good h4{color:var(--green)}
+  .card.warn h4{color:var(--amber)}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.92rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line)}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{
+    content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600;
+  }
+
+  .rank{display:flex; flex-direction:column; gap:12px; margin:20px 0}
+  .rank .row{display:flex; align-items:center; gap:14px; background:#fff; border:1px solid var(--line);
+             border-radius:10px; padding:14px 18px}
+  .rank .no{width:28px; height:28px; border-radius:50%; display:flex; align-items:center;
+            justify-content:center; font-weight:700; color:#fff; flex-shrink:0}
+  .rank .r1{background:var(--green)} .rank .r2{background:var(--amber)} .rank .r3{background:var(--red)}
+  .rank small{color:var(--muted); display:block}
+
+  .kv{font-size:.88rem; color:var(--muted)}
+  footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Lesson 03 · 初始化与自洽性</h1>
+  <div class="sub">为什么位姿错 20cm 的 COLMAP 版训出了盒子，而"位姿全对"的第一版完全训不动</div>
+</header>
+
+<div class="callout">
+  <strong>核心结论：</strong>决定 3DGS <em>能不能收敛</em> 的是 <strong>初始化</strong> 与 <strong>投影自洽性</strong>；
+  决定 <em>训出来的东西能不能信</em> 的才是 <strong>位姿绝对精度</strong>。
+  收敛需要的是"一致的错误"，不是"正确的对半"——第一版把正确的位姿配上了错误的内参和空的初始化，三者互相打架。
+</div>
+
+<h2>0 · 先看清 3DGS 在优化什么</h2>
+<p>场景 = 几十万个高斯球（位置、大小、颜色、透明度）。训练只有一个循环，<strong>梯度是唯一的老师</strong>：</p>
+<ol class="steps">
+  <li>用当前的球，从某个相机位姿<strong>渲染</strong>一张图</li>
+  <li>和真照片<strong>逐像素比误差</strong></li>
+  <li>对误差求梯度：每个球"该往哪挪、变大变小、变什么色"</li>
+  <li>微调所有球，重复几万次</li>
+</ol>
+<p>所以一切都归结为：<strong>第 ③ 步给的指令是不是一致的</strong>。下面两道分水岭，决定指令一致不一致。</p>
+
+<h2>1 · 第一道分水岭：初始化（球的起点在哪）</h2>
+
+<h3>SfM（Structure from Motion，运动恢复结构）</h3>
+<p>你绕一栋没去过的楼拍 100 张照片发给朋友。朋友看完能说出"这张在东南角拍的、那张在正门拍的"
+（<strong>恢复相机的运动</strong>），还能画出楼的轮廓（<strong>恢复结构</strong>）。
+两件事都从"照片是怎么拍出来的"反推出来，所以叫运动恢复结构。COLMAP 干的就是这个。</p>
+
+<div class="grid2">
+  <div class="card">
+    <h4>三角化：两个视角定一个点</h4>
+    <p>两台相机从不同的已知位置拍<strong>同一个角点</strong>。从相机 A 的光心穿过"该点在 A 图里的像素"画一条射线，
+    从相机 B 同样画一条。<strong>两条射线在空中相交，交点就是这个点的 3D 位置。</strong>
+    和你两只眼睛看物体、大脑算距离是同一个原理。</p>
+  </div>
+  <div class="card good">
+    <h4>关键推论</h4>
+    <p>能被三角化的点，必然是<strong>多张照片都拍到了</strong>的点 → 必然落在<strong>物体表面</strong>。
+    COLMAP 那 2191 个点天生就长在盒子上，高斯球从这个起点出发，离正确答案很近。</p>
+  </div>
+</div>
+
+<div class="fig">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <!-- ===== 左：随机初始化 ===== -->
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#dc2626">随机初始化（第一版）</text>
+  <text x="20" y="46" font-size="12" fill="#64748b">点撒在整个包围盒里，大量落在"谁也看不见"的地方</text>
+
+  <!-- 桌面 -->
+  <line x1="20" y1="210" x2="440" y2="210" stroke="#94a3b8" stroke-width="2"/>
+  <text x="24" y="226" font-size="11" fill="#94a3b8">桌面</text>
+
+  <!-- 盒子 -->
+  <rect x="175" y="150" width="90" height="60" fill="#fbbf24" stroke="#b45309" stroke-width="1.5" rx="2"/>
+  <text x="186" y="185" font-size="11" fill="#78350f">饼干盒</text>
+
+  <!-- 三个相机 + 视锥 -->
+  <g fill="#334155">
+    <rect x="52" y="72" width="26" height="17" rx="2"/><polygon points="78,76 90,70 90,91 78,85"/>
+    <rect x="207" y="72" width="26" height="17" rx="2"/><polygon points="233,76 245,70 245,91 233,85"/>
+    <rect x="362" y="72" width="26" height="17" rx="2"/><polygon points="388,76 400,70 400,91 388,85"/>
+  </g>
+  <g stroke="#a5b4fc" stroke-width="1" stroke-dasharray="4 4" fill="none">
+    <path d="M65,89 L175,150 M65,89 L265,150"/>
+    <path d="M220,89 L175,150 M220,89 L265,150"/>
+    <path d="M375,89 L175,150 M375,89 L265,150"/>
+  </g>
+  <polygon points="65,89 175,150 265,150" fill="#6366f1" opacity="0.06"/>
+  <polygon points="375,89 175,150 265,150" fill="#6366f1" opacity="0.06"/>
+
+  <!-- 随机点：锥外=红(死点)，锥内=绿 -->
+  <g>
+    <circle cx="45" cy="105" r="3.5" fill="#dc2626"/><circle cx="130" cy="60" r="3.5" fill="#dc2626"/>
+    <circle cx="300" cy="55" r="3.5" fill="#dc2626"/><circle cx="415" cy="120" r="3.5" fill="#dc2626"/>
+    <circle cx="30" cy="180" r="3.5" fill="#dc2626"/><circle cx="425" cy="185" r="3.5" fill="#dc2626"/>
+    <circle cx="185" cy="228" r="3.5" fill="#dc2626"/><circle cx="255" cy="222" r="3.5" fill="#dc2626"/>
+    <circle cx="150" cy="120" r="3.5" fill="#dc2626"/><circle cx="290" cy="130" r="3.5" fill="#dc2626"/>
+    <circle cx="330" cy="160" r="3.5" fill="#dc2626"/><circle cx="95" cy="150" r="3.5" fill="#dc2626"/>
+    <circle cx="200" cy="175" r="3.5" fill="#059669"/><circle cx="230" cy="165" r="3.5" fill="#059669"/>
+    <circle cx="215" cy="195" r="3.5" fill="#059669"/><circle cx="245" cy="188" r="3.5" fill="#059669"/>
+  </g>
+
+  <g font-size="11">
+    <circle cx="30" cy="245" r="3.5" fill="#dc2626"/><text x="40" y="249" fill="#64748b">没有任何相机的视线经过 → 梯度恒为 0 → 永远悬在半空</text>
+    <circle cx="300" cy="245" r="3.5" fill="#059669"/><text x="310" y="249" fill="#64748b">被看到 → 有梯度</text>
+  </g>
+
+  <!-- 分隔 -->
+  <line x1="460" y1="20" x2="460" y2="230" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3 3"/>
+
+  <!-- ===== 右：SfM 三角化 ===== -->
+  <text x="480" y="26" font-size="15" font-weight="700" fill="#059669">COLMAP 稀疏点云（2191 个）</text>
+  <text x="480" y="46" font-size="12" fill="#64748b">每个点都由多条视线相交而来，必然贴着物体表面</text>
+
+  <line x1="480" y1="210" x2="900" y2="210" stroke="#94a3b8" stroke-width="2"/>
+
+  <rect x="640" y="150" width="90" height="60" fill="#fbbf24" stroke="#b45309" stroke-width="1.5" rx="2"/>
+  <text x="651" y="185" font-size="11" fill="#78350f">饼干盒</text>
+
+  <g fill="#334155">
+    <rect x="505" y="72" width="26" height="17" rx="2"/><polygon points="531,76 543,70 543,91 531,85"/>
+    <rect x="800" y="72" width="26" height="17" rx="2"/><polygon points="826,76 838,70 838,91 826,85"/>
+  </g>
+  <text x="512" y="70" font-size="11" fill="#334155">相机 A</text>
+  <text x="807" y="70" font-size="11" fill="#334155">相机 B</text>
+
+  <!-- 两条射线交于物体表面一点 P -->
+  <line x1="518" y1="89" x2="700" y2="152" stroke="#4f46e5" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <line x1="813" y1="89" x2="660" y2="160" stroke="#4f46e5" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <circle cx="660" cy="153" r="6" fill="#059669"/>
+  <circle cx="660" cy="153" r="12" fill="none" stroke="#059669" stroke-width="1" opacity="0.45"/>
+  <text x="670" y="140" font-size="12" font-weight="700" fill="#059669">P</text>
+  <text x="600" y="128" font-size="11" fill="#4f46e5">A 的视线</text>
+  <text x="700" y="120" font-size="11" fill="#4f46e5">B 的视线</text>
+
+  <text x="480" y="245" font-size="11" fill="#64748b">两条视线在空中相交 → 交点就是 3D 点，位置贴着表面</text>
+</svg>
+<figcaption>左：随机点大量落在无梯度区，永远不动，还会被 densification 继续分裂繁殖。右：三角化点天生在表面。</figcaption>
+</div>
+
+<div class="card bad">
+  <h4>随机初始化为什么会"飞到球外面"</h4>
+  <p>一个球被撒在盒子后上方的半空：36 张照片里没有任何一张的视线经过它 → 不管它是红是绿、挪前挪后，
+  渲染误差都<strong>和它无关 → 梯度恒为零 → 它永远悬在那</strong>。几万个这样的死点就是你看到的红色碎片环。
+  更糟的是，3DGS 的加密（densification）会从这些死点继续分裂，<strong>越繁殖越乱</strong>。</p>
+</div>
+
+<h2>2 · 第二道分水岭：自洽性（位姿和内参必须是一套）</h2>
+
+<div class="grid2">
+  <div class="card">
+    <h4>位姿（外参）</h4>
+    <p>相机<strong>在哪、朝哪看</strong>。决定光心的位置。</p>
+  </div>
+  <div class="card">
+    <h4>内参</h4>
+    <p>镜头的<strong>投影规则</strong>：焦距多少、像素怎么映射。决定射线<strong>往哪个方向偏</strong>。</p>
+  </div>
+</div>
+
+<p>渲染一条光线 = 从<strong>光心</strong>（位姿定）出发，按<strong>焦距规定的角度</strong>（内参定）穿过某个像素。
+<strong>光心对了但角度规则错了，射线照样打到错误的地方。</strong></p>
+
+<div class="fig">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <!-- 左：位姿对 + 内参错 -->
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#dc2626">位姿 ✓ 但内参 ✗（第一版）</text>
+  <text x="20" y="46" font-size="12" fill="#64748b">相机位置是仿真真值，焦距却硬编码成 305.4（真值 342.07，差 12%）</text>
+
+  <!-- 光心 -->
+  <g fill="#334155">
+    <rect x="40" y="115" width="26" height="17" rx="2"/><polygon points="66,119 78,113 78,134 66,128"/>
+  </g>
+  <text x="38" y="155" font-size="11" fill="#334155">光心（位姿正确）</text>
+
+  <!-- 物体（一条竖直边） -->
+  <line x1="330" y1="70" x2="330" y2="190" stroke="#b45309" stroke-width="6" stroke-linecap="round"/>
+  <text x="340" y="130" font-size="11" fill="#78350f">物体边缘</text>
+
+  <!-- 正确焦距射线（绿实线） -->
+  <line x1="66" y1="124" x2="330" y2="70" stroke="#059669" stroke-width="2"/>
+  <line x1="66" y1="124" x2="330" y2="190" stroke="#059669" stroke-width="2"/>
+  <text x="150" y="86" font-size="11" fill="#059669">真实焦距 342.07 → 命中物体</text>
+
+  <!-- 错误焦距射线（红虚线，角度更大） -->
+  <line x1="66" y1="124" x2="330" y2="40" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 4"/>
+  <line x1="66" y1="124" x2="330" y2="220" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="150" y="216" font-size="11" fill="#dc2626">猜的焦距 305.4 → 打偏，视野被撑大 12%</text>
+
+  <text x="20" y="244" font-size="11" fill="#64748b">同一个像素，两条射线打到完全不同的地方 → 高斯只能挪到错误位置去凑</text>
+
+  <line x1="460" y1="20" x2="460" y2="230" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3 3"/>
+
+  <!-- 右：第一版的撕裂 -->
+  <text x="480" y="26" font-size="15" font-weight="700" fill="#dc2626">36 个相机同时把球往自己这边拉</text>
+  <text x="480" y="46" font-size="12" fill="#64748b">为了补偿 12% 的尺寸差（近大远小），每个方向都在抢同一个球</text>
+
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- 抖动的虚影 -->
+  <circle cx="690" cy="140" r="30" fill="none" stroke="#dc2626" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>
+  <circle cx="690" cy="140" r="22" fill="none" stroke="#dc2626" stroke-width="1" stroke-dasharray="3 3" opacity="0.35"/>
+  <circle cx="690" cy="140" r="13" fill="#dc2626"/>
+  <text x="668" y="144" font-size="11" fill="#fff">高斯球</text>
+
+  <g stroke="#dc2626" stroke-width="2" marker-end="url(#ar)">
+    <line x1="560" y1="70" x2="672" y2="126"/>
+    <line x1="640" y1="62" x2="684" y2="122"/>
+    <line x1="740" y1="62" x2="700" y2="122"/>
+    <line x1="820" y1="75" x2="710" y2="126"/>
+    <line x1="560" y1="210" x2="672" y2="155"/>
+    <line x1="645" y1="222" x2="683" y2="158"/>
+    <line x1="740" y1="222" x2="700" y2="158"/>
+    <line x1="825" y1="208" x2="711" y2="155"/>
+  </g>
+  <text x="520" y="60" font-size="11" fill="#dc2626">朝我拉近</text>
+  <text x="826" y="60" font-size="11" fill="#dc2626">朝我拉近</text>
+
+  <text x="480" y="244" font-size="11" fill="#64748b">指令互相矛盾 → 高斯原地抖动、无法定型 → 就是"完全训不动"</text>
+</svg>
+<figcaption>左：位姿与内参必须成套使用。右：内参错 12% 时，每个相机都要求高斯朝自己移动来补偿尺寸差。</figcaption>
+</div>
+
+<h3>COLMAP 版为什么自洽</h3>
+<p>COLMAP 最后给的焦距是 374.74（真值 342.07，照样错了 9%），<strong>但它同时把所有相机位置也调歪了来迁就这个焦距</strong>
+——位姿和内参是在同一个最小二乘里<strong>联合优化</strong>出来的，是一套互相配合的参数。
+拿它自己的位姿 + 自己的内参去投影，每个特征点都能精确落回照片上原来的像素位置。</p>
+
+<div class="fig">
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#059669">COLMAP：整体歪，但内部一致</text>
+  <text x="20" y="46" font-size="12" fill="#64748b">相机环整体歪 20cm、尺度差 30 倍，但每条射线都精确交于物体</text>
+
+  <!-- 歪的相机环 -->
+  <ellipse cx="300" cy="140" rx="190" ry="62" transform="rotate(-14 300 140)"
+           fill="none" stroke="#6366f1" stroke-width="2" stroke-dasharray="6 5"/>
+  <text x="120" y="70" font-size="11" fill="#6366f1">歪掉的相机环（COLMAP 坐标系）</text>
+
+  <!-- 相机 -->
+  <g fill="#334155">
+    <circle cx="130" cy="128" r="8"/><circle cx="215" cy="92" r="8"/>
+    <circle cx="390" cy="98" r="8"/><circle cx="470" cy="140" r="8"/>
+    <circle cx="380" cy="188" r="8"/><circle cx="210" cy="192" r="8"/>
+  </g>
+
+  <!-- 物体 -->
+  <rect x="272" y="126" width="56" height="34" fill="#fbbf24" stroke="#b45309" stroke-width="1.5" rx="2"/>
+
+  <!-- 汇聚的绿射线 -->
+  <g stroke="#059669" stroke-width="1.6" opacity="0.85">
+    <line x1="130" y1="128" x2="276" y2="140"/>
+    <line x1="215" y1="92"  x2="284" y2="130"/>
+    <line x1="390" y1="98"  x2="318" y2="130"/>
+    <line x1="470" y1="140" x2="326" y2="144"/>
+    <line x1="380" y1="188" x2="318" y2="158"/>
+    <line x1="210" y1="192" x2="282" y2="158"/>
+  </g>
+  <text x="180" y="222" font-size="11" fill="#059669">所有射线一致 → 梯度方向一致 → 稳定收敛</text>
+
+  <line x1="470" y1="20" x2="470" y2="215" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3 3"/>
+
+  <!-- 右侧：对比说明 -->
+  <text x="500" y="26" font-size="15" font-weight="700" fill="#4f46e5">类比：戴错度数，但动作已协调</text>
+  <g font-size="13">
+    <rect x="500" y="48" width="390" height="62" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+    <text x="516" y="70" fill="#065f46" font-weight="700">COLMAP = 300 度近视没戴眼镜</text>
+    <text x="516" y="92" fill="#065f46">世界是模糊的，但走路、拿杯子都按</text>
+    <text x="516" y="104" fill="#065f46">模糊的世界协调好了 → 内部不矛盾</text>
+
+    <rect x="500" y="126" width="390" height="62" rx="8" fill="#fef2f2" stroke="#fecaca"/>
+    <text x="516" y="148" fill="#991b1b" font-weight="700">第一版 = 眼睛度数突然换了一档</text>
+    <text x="516" y="170" fill="#991b1b">肌肉记忆还是旧的 → 每个动作都失准</text>
+    <text x="516" y="182" fill="#991b1b">位姿（新）与内参（旧）互相打架</text>
+  </g>
+</svg>
+<figcaption>收敛不需要"绝对正确"，需要"内部一致"。</figcaption>
+</div>
+
+<h2>3 · 实测数据</h2>
+<table>
+  <thead>
+    <tr><th>项目</th><th>第一版（位姿真值）</th><th>COLMAP 版</th><th>真值完整版</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>可用图像</td><td class="num">36（单高度）</td><td class="num">50 / 99（注册率 50.5%）</td><td class="num">99 / 99</td></tr>
+    <tr><td>初始化点云</td><td style="color:#dc2626">无（随机撒点）</td><td class="num">2,191（SfM）</td><td class="num">150,000（真值深度）</td></tr>
+    <tr><td>焦距 fx / fy</td><td style="color:#dc2626">305.4（真值 342.07，差 12%）</td><td class="num">374.74 / 370.91</td><td class="num">342.07（各向同性）</td></tr>
+    <tr><td>位姿误差</td><td>0（真值），但与内参不自洽</td><td class="num">对齐后平均 19.91 cm</td><td class="num">0</td></tr>
+    <tr><td>尺度</td><td>真实米制</td><td style="color:#dc2626">任意（换算系数 0.0331）</td><td>真实米制</td></tr>
+    <tr><td>训练步数</td><td class="num">7,000</td><td class="num">30,000</td><td class="num">30,000</td></tr>
+    <tr><td><strong>结果</strong></td><td style="color:#dc2626">碎片环，完全不成形</td><td style="color:#d97706">盒子可见，半球覆盖，几何不可信</td><td style="color:#059669">完整重建</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · 收敛排位</h2>
+<div class="rank">
+  <div class="row"><div class="no r1">1</div><div>
+    真值位姿 + 真值内参 + 真值点云
+    <small>自洽且精确：能收敛，且结果可信（能做抓取）</small></div></div>
+  <div class="row"><div class="no r2">2</div><div>
+    COLMAP 位姿 + COLMAP 内参 + 2191 SfM 点
+    <small>自洽但不精确：能收敛，几何不可信（尺度错 30 倍）</small></div></div>
+  <div class="row"><div class="no r3">3</div><div>
+    真值位姿 + 错误内参 + 随机初始化
+    <small>不自洽且无起点：根本训不动</small></div></div>
+</div>
+
+<div class="callout">
+  <strong>一句话总结：</strong>初始化决定起点离答案多近，自洽性决定老师给的指令是否一致，
+  绝对精度决定训出来的东西能不能拿去用。<br>
+  第一版排最后不是因为"用了真值反而更差"，而是<strong>那一版根本没有点云、内参还是猜的</strong>。
+  这也印证 Lesson 01 的结论：加上真值点云后，画面立刻从"碎片环"变成"能认出 CHEEZ-IT"。
+</div>
+
+<h2>5 · 可复用的判断经验</h2>
+<div class="grid2">
+  <div class="card warn">
+    <h4>看到"高斯全飘在外面"</h4>
+    <p>先别怀疑位姿。查顺序：<strong>① transforms.json 里有没有 <code>ply_file_path</code></strong>
+    → ② 内参是不是和位姿同一套来源 → ③ 步数够不够（随机初始化要 30000 而非 7000）。</p>
+  </div>
+  <div class="card warn">
+    <h4>看到"训出来了但几何怪"</h4>
+    <p>那是精度问题（位姿误差、尺度漂移），不是收敛问题。
+    用已知尺寸做几何自检（本项目：饼干盒 0.164×0.213 m），能立刻暴露尺度是否可信。</p>
+  </div>
+</div>
+
+<footer>
+  相关脚本：<code>13_colmap_vs_gt.py</code>（位姿误差 Umeyama 对齐）、
+  <code>07_build_init.py</code>（生成初始化点云）、
+  <code>08_verify_cloud.py</code>（几何自检）、
+  <code>run_colmap_gs_official.bat</code>（COLMAP 流程）<br>
+  Lesson 系列：01 初始点云 · 02 gsplat 编译与 JIT 缓存 · 03 初始化与自洽性
+</footer>
+
+</div>
+</body>
+</html>

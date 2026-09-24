@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supplement · PatchEmbedDust3R 逐行精讲（切块 / 卷积 / pos / 无 CLS）</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  table.code td:nth-child(2){font-family:Consolas,"Courier New",monospace; font-size:.82rem; color:#0f172a; white-space:pre-wrap}
+  table.code td:nth-child(1){width:44px; color:#94a3b8; font-family:Consolas,monospace}
+  .mbox{font-family:"Cambria Math",Georgia,serif; font-size:1.05rem; text-align:center; margin:14px 0}
+  .mbox .hl{background:var(--indigo-soft); border:1.5px solid var(--indigo); border-radius:8px;
+            display:inline-block; padding:8px 22px}
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600}
+  details{background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 16px; margin:10px 0}
+  summary{cursor:pointer; font-weight:600; color:var(--indigo)}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+  .filetag{display:inline-block; background:#0f172a; color:#e2e8f0; font-family:Consolas,monospace;
+           font-size:.78rem; padding:3px 9px; border-radius:5px; margin-bottom:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Supplement · PatchEmbedDust3R 逐行精讲</h1>
+  <div class="sub">
+    EcoSplat 学习笔记 · Chapter 01「输入与预处理」§4 切块的完整展开<br>
+    内容：逐行代码 → 依赖代码（<code>self.proj</code> / <code>PositionGetter</code>）→ 卷积图解 → pos 图解 → <strong>没有 CLS token</strong>
+  </div>
+</header>
+
+<div class="callout red">
+  <strong>开宗明义：这个类里有三个「没有」</strong>（都是相对标准 ViT / CLIP 而言，容易踩坑）：
+  <ol style="margin:10px 0 0 18px">
+    <li><strong>没有 CLS token</strong> —— 它只输出 256 个 patch token，一个不多。你看到的 257 是后面拼的<strong>内参/位姿 token</strong>，不是 CLS（§7 专门讲）</li>
+    <li><strong>没有绝对位置编码</strong> —— 不往 x 上加 pos_embed，位置信息走 RoPE（<code>curope</code> CUDA kernel）</li>
+    <li><strong>没有 nn.Linear</strong> —— 投影是用 <code>Conv2d(kernel=stride=16)</code> 实现的，数学上等价于线性投影</li>
+  </ol>
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1. 这个类的职责</h2>
+
+<p>一句话：<strong>把一张图切成不重叠的小块，每块压成一个向量（token），同时算出每块的网格坐标。</strong></p>
+
+<pre>输入  x   : [B, 3, H, W]      # B = b × v（batch 与视角已展平），已归一化到 [-1,1]
+输出  x   : [B, N, C]         # N = (H/16)×(W/16) 个 token，每个 C=1024 维
+输出  pos : [B, N, 2]         # 每个 token 的网格坐标 (row, col)，int64</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 330" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- input image -->
+  <rect x="40" y="70" width="150" height="150" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <g stroke="#4f46e5" stroke-width="0.8" opacity="0.45">
+    <line x1="77.5" y1="70" x2="77.5" y2="220"/><line x1="115" y1="70" x2="115" y2="220"/><line x1="152.5" y1="70" x2="152.5" y2="220"/>
+    <line x1="40" y1="107.5" x2="190" y2="107.5"/><line x1="40" y1="145" x2="190" y2="145"/><line x1="40" y1="182.5" x2="190" y2="182.5"/>
+  </g>
+  <text x="115" y="246" fill="#1e293b" font-size="13" text-anchor="middle" font-weight="600">输入 x [B, 3, 256, 256]</text>
+  <text x="115" y="266" fill="#64748b" font-size="12" text-anchor="middle">网格示意 4×4（实际 16×16）</text>
+
+  <!-- arrow 1 -->
+  <line x1="196" y1="145" x2="250" y2="145" stroke="#64748b" stroke-width="2"/>
+  <polygon points="250,145 240,140 240,150" fill="#64748b"/>
+  <text x="223" y="128" fill="#d97706" font-size="11.5" text-anchor="middle" font-weight="600">self.proj</text>
+  <text x="223" y="168" fill="#64748b" font-size="11" text-anchor="middle">Conv k=s=16</text>
+
+  <!-- feature map -->
+  <rect x="260" y="70" width="150" height="150" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <g fill="#d97706" opacity="0.25">
+    <rect x="266" y="76" width="30" height="30"/><rect x="306" y="76" width="30" height="30"/>
+    <rect x="346" y="76" width="30" height="30"/><rect x="386" y="76" width="30" height="30"/>
+    <rect x="266" y="116" width="30" height="30"/><rect x="306" y="116" width="30" height="30"/>
+    <rect x="346" y="116" width="30" height="30"/><rect x="386" y="116" width="30" height="30"/>
+    <rect x="266" y="156" width="30" height="30"/><rect x="306" y="156" width="30" height="30"/>
+    <rect x="346" y="156" width="30" height="30"/><rect x="386" y="156" width="30" height="30"/>
+    <rect x="266" y="196" width="30" height="30"/><rect x="306" y="196" width="30" height="30"/>
+    <rect x="346" y="196" width="30" height="30"/><rect x="386" y="196" width="30" height="30"/>
+  </g>
+  <text x="335" y="246" fill="#1e293b" font-size="13" text-anchor="middle" font-weight="600">[B, 1024, 16, 16]</text>
+  <text x="335" y="266" fill="#64748b" font-size="12" text-anchor="middle">16×16 格，每格 1024 维通道</text>
+
+  <!-- arrow 2 -->
+  <line x1="416" y1="145" x2="466" y2="145" stroke="#64748b" stroke-width="2"/>
+  <polygon points="466,145 456,140 456,150" fill="#64748b"/>
+  <text x="441" y="128" fill="#059669" font-size="11.5" text-anchor="middle" font-weight="600">flatten+transpose</text>
+
+  <!-- token sequence -->
+  <g fill="#ecfdf5" stroke="#059669" stroke-width="1.6">
+    <rect x="476" y="80" width="30" height="40" rx="3"/>
+    <rect x="512" y="80" width="30" height="40" rx="3"/>
+    <rect x="548" y="80" width="30" height="40" rx="3"/>
+    <rect x="584" y="80" width="30" height="40" rx="3"/>
+    <rect x="620" y="80" width="30" height="40" rx="3"/>
+    <rect x="656" y="80" width="30" height="40" rx="3"/>
+    <rect x="692" y="80" width="30" height="40" rx="3"/>
+    <rect x="728" y="80" width="30" height="40" rx="3"/>
+  </g>
+  <text x="764" y="106" fill="#64748b" font-size="15">…</text>
+  <text x="600" y="140" fill="#059669" font-size="12.5" text-anchor="middle" font-weight="600">256 个 token（行优先）</text>
+
+  <!-- norm note -->
+  <text x="600" y="164" fill="#64748b" font-size="12" text-anchor="middle">↓ self.norm（LayerNorm 1024，逐 token）</text>
+  <text x="600" y="186" fill="#1e293b" font-size="13.5" text-anchor="middle" font-weight="600">输出 x　[B, 256, 1024]</text>
+
+  <!-- pos row -->
+  <g fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6">
+    <rect x="476" y="212" width="30" height="30" rx="3"/>
+    <rect x="512" y="212" width="30" height="30" rx="3"/>
+    <rect x="548" y="212" width="30" height="30" rx="3"/>
+    <rect x="584" y="212" width="30" height="30" rx="3"/>
+    <rect x="620" y="212" width="30" height="30" rx="3"/>
+    <rect x="656" y="212" width="30" height="30" rx="3"/>
+    <rect x="692" y="212" width="30" height="30" rx="3"/>
+    <rect x="728" y="212" width="30" height="30" rx="3"/>
+  </g>
+  <text x="491" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(0,0)</text>
+  <text x="527" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(0,1)</text>
+  <text x="563" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(0,2)</text>
+  <text x="599" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(0,3)</text>
+  <text x="635" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(1,0)</text>
+  <text x="671" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(1,1)</text>
+  <text x="707" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(1,2)</text>
+  <text x="743" y="232" fill="#4f46e5" font-size="9.5" text-anchor="middle">(1,3)</text>
+  <text x="764" y="232" fill="#64748b" font-size="14">…</text>
+  <text x="600" y="262" fill="#1e293b" font-size="13.5" text-anchor="middle" font-weight="600">输出 pos　[B, 256, 2]</text>
+  <text x="600" y="284" fill="#64748b" font-size="12" text-anchor="middle">每个 token 的 (row, col)，int64，值域 0..15</text>
+  <text x="600" y="306" fill="#dc2626" font-size="12.5" text-anchor="middle" font-weight="600">pos 不在这里加到 x 上！只是携带给 RoPE</text>
+</svg>
+<figcaption>图 1 · 全景形状追踪：图像 → 切块 → token 序列 + 网格坐标。</figcaption>
+</div>
+
+<!-- ================= 2 ================= -->
+<h2>2. 主类逐行精讲</h2>
+<span class="filetag">src/model/encoder/backbone/croco/patch_embed.py · 第 19–29 行</span>
+
+<pre>19  class PatchEmbedDust3R(PatchEmbed):
+20      def forward(self, x, **kw):
+21          B, C, H, W = x.shape
+22          assert H % self.patch_size[0] == 0, f"Input image height ({H}) is not a multiple of patch size ..."
+23          assert W % self.patch_size[1] == 0, f"Input image width ({W}) is not a multiple of patch size ..."
+24          x = self.proj(x)
+25          pos = self.position_getter(B, x.size(2), x.size(3), x.device)
+26          if self.flatten:
+27              x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+28          x = self.norm(x)
+29          return x, pos</pre>
+
+<table class="code">
+  <tr><th>行</th><th>代码</th><th>讲解</th></tr>
+  <tr><td>21</td><td>B, C, H, W = x.shape</td><td>解包输入。此时 <code>C=3</code>（RGB）。<strong>注意 B 不是 batch size</strong>——backbone 已经把 <code>[b, v, 3, H, W]</code> 展平成 <code>[b*v, 3, H, W]</code>，所以 B = b×v（第 233 行 <code>rearrange("b v c h w -&gt; (b v) c h w")</code>）。</td></tr>
+  <tr><td>22–23</td><td>assert H % patch_size == 0</td><td>要求高、宽能被 16 整除，否则无法整分。<br><strong>这正是子类存在的唯一理由</strong>：基类用的是硬断言 <code>H == self.img_size[0]</code>（必须等于预设分辨率），这里放宽成「只要整除」，从而支持 256 / 512 等多分辨率推理。</td></tr>
+  <tr><td>24</td><td>x = self.proj(x)</td><td>核心一步：<code>Conv2d(3 → 1024, kernel=16, stride=16)</code>。<br><code>[B, 3, 256, 256]</code> → <code>[B, 1024, 16, 16]</code>。<br>因为 <code>kernel == stride == 16</code>，窗口不重叠地滑动，等价于「切块 + 线性投影」（§4 图解）。</td></tr>
+  <tr><td>25</td><td>pos = self.position_getter(B, x.size(2), x.size(3), x.device)</td><td>⚠️ 传的是 <strong>proj 之后</strong>的尺寸（16, 16），不是原图 256。<br>返回每个 patch 的网格坐标 <code>[B, 256, 2]</code>，dtype int64。<br><strong>它不是位置编码，也不会加到 x 上</strong>（§5 详解）。</td></tr>
+  <tr><td>26–27</td><td>if self.flatten:<br>&nbsp;&nbsp;x = x.flatten(2).transpose(1, 2)</td><td><code>flatten(2)</code>：把最后两维 <code>(16,16)</code> 摊平 → <code>[B, 1024, 256]</code><br><code>transpose(1,2)</code>：换成 <code>[B, 256, 1024]</code>，标准 <strong>BNC</strong> 序列格式。<br>展平是<strong>行优先</strong>：第 0 行 16 个 → 第 1 行 16 个……空间邻域保留在序列顺序里。<br><code>self.flatten</code> 默认 True；若为 False 则保持 <code>[B,1024,16,16]</code> 给需要 2D 特征图的 head。</td></tr>
+  <tr><td>28</td><td>x = self.norm(x)</td><td><code>LayerNorm(1024)</code>，对<strong>每个 token 的 1024 维</strong>归一化（不是跨 token）。稳定数值。</td></tr>
+  <tr><td>29</td><td>return x, pos</td><td>返回 <strong>token 序列 + 网格坐标</strong>两个东西。坐标随后被送进 Transformer block，由 RoPE 使用。</td></tr>
+</table>
+
+<!-- ================= 3 ================= -->
+<h2>3. 依赖代码 ①：基类 <code>PatchEmbed</code>（<code>self.proj</code> 从哪来）</h2>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 221–252 行</span>
+
+<pre>221  class PatchEmbed(nn.Module):
+222      """ just adding _init_weights + position getter compared to timm.models.layers.patch_embed.PatchEmbed"""
+224      def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None, flatten=True):
+226          img_size = to_2tuple(img_size)
+227          patch_size = to_2tuple(patch_size)
+228          self.img_size = img_size
+229          self.patch_size = patch_size
+230          self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+231          self.num_patches = self.grid_size[0] * self.grid_size[1]
+232          self.flatten = flatten
+234          self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+235          self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+237          self.position_getter = PositionGetter()
+239      def forward(self, x):
+240          B, C, H, W = x.shape
+241          torch._assert(H == self.img_size[0], f"Input image height ({H}) doesn't match model ...")
+242          torch._assert(W == self.img_size[1], f"Input image width ({W}) doesn't match model ...")
+243          x = self.proj(x)
+244          pos = self.position_getter(B, x.size(2), x.size(3), x.device)
+245          if self.flatten:
+246              x = x.flatten(2).transpose(1, 2)
+247          x = self.norm(x)
+248          return x, pos
+250      def _init_weights(self):
+251          w = self.proj.weight.data
+252          torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))</pre>
+
+<table class="code">
+  <tr><th>行</th><th>代码 / 成员</th><th>讲解</th></tr>
+  <tr><td>230–231</td><td>grid_size / num_patches</td><td><code>grid_size = img_size // patch_size</code>。<br>若 img_size=(512,512)、patch=16 → grid 32×32 → num_patches=1024。<strong>注意</strong>：这些只是按<strong>预设</strong> img_size 算的常量；实际运行时 <code>PatchEmbedDust3R</code> 允许喂 256×256，此时真实 token 数是 256，<code>num_patches</code> 这个属性就<strong>不准了</strong>（它没被用到，所以无妨）。</td></tr>
+  <tr><td>234</td><td><code>self.proj = nn.Conv2d(...)</code></td><td><strong>全文核心。</strong><code>in_chans=3 → embed_dim=1024</code>，<code>kernel_size=patch_size=(16,16)</code>，<code>stride=patch_size=(16,16)</code>。<br>关键：<code>kernel == stride</code> ⇒ 窗口<strong>不重叠、无缝隙</strong>地滑过整张图，每个位置输出一个 1024 维向量。</td></tr>
+  <tr><td>235</td><td><code>self.norm</code></td><td><code>LayerNorm(embed_dim)</code>，即 LayerNorm(1024)。若没传 norm_layer 则是 <code>nn.Identity()</code>（恒等，不做归一化）。</td></tr>
+  <tr><td>237</td><td><code>self.position_getter = PositionGetter()</code></td><td>一个<strong>纯工具对象</strong>（不是 nn.Module，没有参数），负责生成网格坐标。见 §5。</td></tr>
+  <tr><td>241–242</td><td>基类的硬断言</td><td><code>H == self.img_size[0]</code>——要求分辨率<strong>必须等于</strong>预设值。这就是子类要覆盖它的原因。</td></tr>
+  <tr><td>250–252</td><td><code>_init_weights</code></td><td><code>w</code> 的形状是 <code>[1024, 3, 16, 16]</code>；<code>w.view([1024, -1])</code> 变成 <code>[1024, 768]</code> 再做 xavier 初始化。<br><strong>这一行是「卷积 == 线性投影」的铁证</strong>：<code>16×16×3 = 768</code> 正是每个 patch 拉平后的维度，<code>[1024, 768]</code> 正是「768 → 1024」的投影矩阵。</td></tr>
+</table>
+
+<!-- ================= 4 ================= -->
+<h2>4. 图解：为什么 <code>Conv2d</code> 就等于「切块 + 线性投影」</h2>
+
+<h3>4.1 非重叠滑动窗口</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- big image -->
+  <rect x="40" y="50" width="210" height="210" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="145" y="40" fill="#1e293b" font-size="13" font-weight="600" text-anchor="middle">输入 256 × 256</text>
+  <!-- adjacent windows -->
+  <rect x="60" y="70" width="52" height="52" fill="#dc2626" opacity="0.16" stroke="#dc2626" stroke-width="2.5"/>
+  <text x="86" y="102" fill="#dc2626" font-size="11" text-anchor="middle" font-weight="600">窗口1</text>
+  <rect x="112" y="70" width="52" height="52" fill="#2563eb" opacity="0.16" stroke="#2563eb" stroke-width="2.5"/>
+  <text x="138" y="102" fill="#2563eb" font-size="11" text-anchor="middle" font-weight="600">窗口2</text>
+  <rect x="164" y="70" width="52" height="52" fill="#059669" opacity="0.16" stroke="#059669" stroke-width="2.5"/>
+  <text x="190" y="102" fill="#059669" font-size="11" text-anchor="middle" font-weight="600">窗口3</text>
+  <!-- dimension markers -->
+  <line x1="60" y1="132" x2="112" y2="132" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="86" y="148" fill="#dc2626" font-size="11" text-anchor="middle">16</text>
+  <line x1="116" y1="60" x2="116" y2="132" stroke="#64748b" stroke-width="1.2" stroke-dasharray="3 2"/>
+  <text x="128" y="60" fill="#64748b" font-size="11">步长 stride = 16</text>
+  <text x="145" y="186" fill="#64748b" font-size="12" text-anchor="middle">kernel = 16，stride = 16</text>
+  <text x="145" y="206" fill="#dc2626" font-size="12.5" text-anchor="middle" font-weight="600">⇒ 窗口紧挨着、不重叠、不留缝</text>
+  <text x="145" y="230" fill="#64748b" font-size="12" text-anchor="middle">输出尺寸 = (256 − 16)/16 + 1 = 16</text>
+  <text x="145" y="250" fill="#64748b" font-size="12" text-anchor="middle">⇒ 得到 16 × 16 = 256 个格子</text>
+
+  <!-- arrow -->
+  <line x1="256" y1="155" x2="316" y2="155" stroke="#64748b" stroke-width="2"/>
+  <polygon points="316,155 306,150 306,160" fill="#64748b"/>
+
+  <!-- output grid 8x8 -->
+  <text x="500" y="40" fill="#1e293b" font-size="13" font-weight="600" text-anchor="middle">输出特征图（示意 8×8，实际 16×16）</text>
+  <g>
+    <rect x="340" y="60" width="320" height="200" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+    <g fill="#d97706" opacity="0.22">
+      <rect x="352" y="72" width="32" height="32"/><rect x="392" y="72" width="32" height="32"/>
+      <rect x="432" y="72" width="32" height="32"/><rect x="472" y="72" width="32" height="32"/>
+      <rect x="512" y="72" width="32" height="32"/><rect x="552" y="72" width="32" height="32"/>
+      <rect x="592" y="72" width="32" height="32"/><rect x="632" y="72" width="32" height="32"/>
+      <rect x="352" y="112" width="32" height="32"/><rect x="392" y="112" width="32" height="32"/>
+      <rect x="432" y="112" width="32" height="32"/><rect x="472" y="112" width="32" height="32"/>
+      <rect x="512" y="112" width="32" height="32"/><rect x="552" y="112" width="32" height="32"/>
+      <rect x="592" y="112" width="32" height="32"/><rect x="632" y="112" width="32" height="32"/>
+      <rect x="352" y="152" width="32" height="32"/><rect x="392" y="152" width="32" height="32"/>
+      <rect x="432" y="152" width="32" height="32"/><rect x="472" y="152" width="32" height="32"/>
+      <rect x="512" y="152" width="32" height="32"/><rect x="552" y="152" width="32" height="32"/>
+      <rect x="592" y="152" width="32" height="32"/><rect x="632" y="152" width="32" height="32"/>
+      <rect x="352" y="192" width="32" height="32"/><rect x="392" y="192" width="32" height="32"/>
+      <rect x="432" y="192" width="32" height="32"/><rect x="472" y="192" width="32" height="32"/>
+      <rect x="512" y="192" width="32" height="32"/><rect x="552" y="192" width="32" height="32"/>
+      <rect x="592" y="192" width="32" height="32"/><rect x="632" y="192" width="32" height="32"/>
+      <rect x="352" y="232" width="32" height="20"/><rect x="392" y="232" width="32" height="20"/>
+      <rect x="432" y="232" width="32" height="20"/><rect x="472" y="232" width="32" height="20"/>
+      <rect x="512" y="232" width="32" height="20"/><rect x="552" y="232" width="32" height="20"/>
+      <rect x="592" y="232" width="32" height="20"/><rect x="632" y="232" width="32" height="20"/>
+    </g>
+  </g>
+  <text x="500" y="278" fill="#1e293b" font-size="13" text-anchor="middle" font-weight="600">每格 = 1 个 1024 维向量（通道数 = embed_dim）</text>
+</svg>
+<figcaption>图 2 · <code>kernel == stride == 16</code> 时，卷积窗口不重叠地铺满图像，每个位置吐出一个 1024 维向量。</figcaption>
+</div>
+
+<h3>4.2 单个 patch 内部：768 → 1024</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- three channel planes -->
+  <rect x="40" y="60" width="70" height="70" fill="#dc2626" opacity="0.18" stroke="#dc2626" stroke-width="2"/>
+  <text x="75" y="100" fill="#dc2626" font-size="14" font-weight="600" text-anchor="middle">R</text>
+  <rect x="120" y="60" width="70" height="70" fill="#059669" opacity="0.18" stroke="#059669" stroke-width="2"/>
+  <text x="155" y="100" fill="#059669" font-size="14" font-weight="600" text-anchor="middle">G</text>
+  <rect x="200" y="60" width="70" height="70" fill="#4f46e5" opacity="0.18" stroke="#4f46e5" stroke-width="2"/>
+  <text x="235" y="100" fill="#4f46e5" font-size="14" font-weight="600" text-anchor="middle">B</text>
+  <text x="155" y="150" fill="#1e293b" font-size="12.5" text-anchor="middle">每个 patch：16 × 16 × 3</text>
+  <text x="155" y="170" fill="#d97706" font-size="13.5" text-anchor="middle" font-weight="700">= 768 个数字</text>
+
+  <!-- flatten arrow -->
+  <line x1="278" y1="95" x2="318" y2="95" stroke="#64748b" stroke-width="2"/>
+  <polygon points="318,95 308,90 308,100" fill="#64748b"/>
+  <text x="298" y="80" fill="#64748b" font-size="11" text-anchor="middle">拉平</text>
+
+  <!-- 768 vector -->
+  <rect x="326" y="40" width="26" height="110" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="339" y="168" fill="#4f46e5" font-size="12" text-anchor="middle" font-weight="600">768</text>
+
+  <!-- times -->
+  <text x="378" y="102" fill="#64748b" font-size="20">×</text>
+
+  <!-- weight matrix -->
+  <rect x="398" y="40" width="96" height="110" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="446" y="98" fill="#d97706" font-size="12.5" text-anchor="middle" font-weight="600">W</text>
+  <text x="446" y="118" fill="#64748b" font-size="11" text-anchor="middle">768 → 1024</text>
+  <text x="446" y="168" fill="#64748b" font-size="11" text-anchor="middle">卷积权重 view 后</text>
+
+  <!-- equals -->
+  <text x="516" y="102" fill="#64748b" font-size="20">=</text>
+
+  <!-- 1024 vector -->
+  <rect x="536" y="24" width="26" height="142" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="549" y="184" fill="#059669" font-size="12" text-anchor="middle" font-weight="600">1024</text>
+  <text x="549" y="204" fill="#64748b" font-size="11" text-anchor="middle">1 个 token</text>
+
+  <!-- right notes -->
+  <text x="600" y="60" fill="#1e293b" font-size="13" font-weight="600">等价关系</text>
+  <text x="600" y="86" fill="#64748b" font-size="12">Conv2d(3, 1024, k=16, s=16)</text>
+  <text x="600" y="106" fill="#64748b" font-size="12">　≡ 把每个 patch 拉平成 768 维</text>
+  <text x="600" y="126" fill="#64748b" font-size="12">　　→ 乘 [1024, 768] 矩阵</text>
+  <text x="600" y="146" fill="#64748b" font-size="12">　　→ 得到 1024 维</text>
+  <text x="600" y="176" fill="#059669" font-size="12.5" font-weight="600">256 个 patch 共享同一组</text>
+  <text x="600" y="196" fill="#059669" font-size="12.5" font-weight="600">卷积权重（权值共享）</text>
+  <text x="600" y="224" fill="#64748b" font-size="11.5">参数量 = 1024 × 768 ≈ 78.6 万</text>
+  <text x="600" y="244" fill="#64748b" font-size="11.5">（+ 1024 偏置）</text>
+</svg>
+<figcaption>图 3 · 单个 patch 的投影：<code>16×16×3 = 768</code> 维 → 乘权重矩阵 → <code>1024</code> 维 token。卷积的权值共享让 256 个 patch 共用同一组投影参数。</figcaption>
+</div>
+
+<!-- ================= 5 ================= -->
+<h2>5. 依赖代码 ②：<code>PositionGetter</code>（<code>pos</code> 从哪来、是什么）</h2>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 206–219 行</span>
+
+<pre>206  # patch embedding
+207  class PositionGetter(object):
+208      """ return positions of patches """
+210      def __init__(self):
+211          self.cache_positions = {}
+213      def __call__(self, b, h, w, device):
+214          if not (h,w) in self.cache_positions:
+215              x = torch.arange(w, device=device)
+216              y = torch.arange(h, device=device)
+217              self.cache_positions[h,w] = torch.cartesian_prod(y, x) # (h, w, 2)
+218          pos = self.cache_positions[h,w].view(1, h*w, 2).expand(b, -1, 2).clone()
+219          return pos</pre>
+
+<table class="code">
+  <tr><th>行</th><th>代码</th><th>讲解</th></tr>
+  <tr><td>207</td><td>class PositionGetter(object)</td><td>注意：继承 <code>object</code>，<strong>不是 nn.Module</strong>。它没有可学习参数，纯粹是按规则算出的一张坐标表。</td></tr>
+  <tr><td>211</td><td>self.cache_positions = {}</td><td>缓存字典：同一 <code>(h,w)</code> 只算一次，后续直接复用（省时间）。</td></tr>
+  <tr><td>215–216</td><td>x = arange(w); y = arange(h)</td><td>生成列索引 <code>[0..w-1]</code> 和行索引 <code>[0..h-1]</code>。默认 dtype 是 <strong>int64</strong>。</td></tr>
+  <tr><td>217</td><td>cartesian_prod(y, x)</td><td>笛卡尔积，得到 <code>(h, w, 2)</code>。<strong>顺序是 (y, x)</strong>：先遍历行 y，再遍历列 x。<br>所以 <code>pos[..., 0] = row（第几行）</code>，<code>pos[..., 1] = col（第几列）</code>。<br>对 16×16 → 256 个坐标对。</td></tr>
+  <tr><td>218</td><td>.view(1, h*w, 2).expand(b, -1, 2).clone()</td><td><code>view(1, h*w, 2)</code> → 摊平成 <code>(1, 256, 2)</code><br><code>expand(b, -1, 2)</code> → 沿 batch 复制成 <code>(B, 256, 2)</code>（<strong>expand 是零拷贝视图</strong>）<br><code>.clone()</code> → 真正分配连续内存，返回独立张量</td></tr>
+  <tr><td>219</td><td>return pos</td><td>返回 <code>[B, 256, 2]</code> 的<strong>整数网格坐标</strong>，值域 0..15。<br>⚠️ 它是坐标，<strong>不是位置编码向量</strong>，也<strong>不在这里加到 x 上</strong>。</td></tr>
+</table>
+
+<h3>5.1 pos 图解</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="130" y="26" fill="#1e293b" font-size="13" font-weight="600" text-anchor="middle">网格坐标（示意 4×4，实际 16×16）</text>
+  <!-- 4x4 grid -->
+  <g>
+    <rect x="40" y="44" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="62" y="68" fill="#4f46e5" font-size="11" text-anchor="middle">(0,0)</text>
+    <rect x="88" y="44" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="110" y="68" fill="#4f46e5" font-size="11" text-anchor="middle">(0,1)</text>
+    <rect x="136" y="44" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="158" y="68" fill="#4f46e5" font-size="11" text-anchor="middle">(0,2)</text>
+    <rect x="184" y="44" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="206" y="68" fill="#4f46e5" font-size="11" text-anchor="middle">(0,3)</text>
+
+    <rect x="40" y="86" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="62" y="110" fill="#4f46e5" font-size="11" text-anchor="middle">(1,0)</text>
+    <rect x="88" y="86" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="110" y="110" fill="#4f46e5" font-size="11" text-anchor="middle">(1,1)</text>
+    <rect x="136" y="86" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="158" y="110" fill="#4f46e5" font-size="11" text-anchor="middle">(1,2)</text>
+    <rect x="184" y="86" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="206" y="110" fill="#4f46e5" font-size="11" text-anchor="middle">(1,3)</text>
+
+    <rect x="40" y="128" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="62" y="152" fill="#4f46e5" font-size="11" text-anchor="middle">(2,0)</text>
+    <rect x="88" y="128" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="110" y="152" fill="#4f46e5" font-size="11" text-anchor="middle">(2,1)</text>
+    <rect x="136" y="128" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="158" y="152" fill="#4f46e5" font-size="11" text-anchor="middle">(2,2)</text>
+    <rect x="184" y="128" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="206" y="152" fill="#4f46e5" font-size="11" text-anchor="middle">(2,3)</text>
+
+    <rect x="40" y="170" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="62" y="194" fill="#4f46e5" font-size="11" text-anchor="middle">(3,0)</text>
+    <rect x="88" y="170" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="110" y="194" fill="#4f46e5" font-size="11" text-anchor="middle">(3,1)</text>
+    <rect x="136" y="170" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="158" y="194" fill="#4f46e5" font-size="11" text-anchor="middle">(3,2)</text>
+    <rect x="184" y="170" width="44" height="38" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="206" y="194" fill="#4f46e5" font-size="11" text-anchor="middle">(3,3)</text>
+  </g>
+  <text x="112" y="228" fill="#64748b" font-size="12" text-anchor="middle">cartesian_prod(y, x)：先 y 后 x</text>
+  <text x="112" y="248" fill="#4f46e5" font-size="12.5" text-anchor="middle" font-weight="600">pos[...,0]=row　pos[...,1]=col</text>
+
+  <!-- arrow flatten -->
+  <line x1="240" y1="126" x2="300" y2="126" stroke="#64748b" stroke-width="2"/>
+  <polygon points="300,126 290,121 290,131" fill="#64748b"/>
+  <text x="270" y="112" fill="#059669" font-size="11.5" text-anchor="middle" font-weight="600">行优先</text>
+  <text x="270" y="148" fill="#64748b" font-size="11" text-anchor="middle">展开</text>
+
+  <!-- flattened sequence -->
+  <g fill="#ecfdf5" stroke="#059669" stroke-width="1.6">
+    <rect x="312" y="104" width="46" height="36" rx="3"/>
+    <rect x="362" y="104" width="46" height="36" rx="3"/>
+    <rect x="412" y="104" width="46" height="36" rx="3"/>
+    <rect x="462" y="104" width="46" height="36" rx="3"/>
+    <rect x="512" y="104" width="46" height="36" rx="3"/>
+    <rect x="562" y="104" width="46" height="36" rx="3"/>
+    <rect x="612" y="104" width="46" height="36" rx="3"/>
+    <rect x="662" y="104" width="46" height="36" rx="3"/>
+  </g>
+  <text x="335" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(0,0)</text>
+  <text x="385" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(0,1)</text>
+  <text x="435" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(0,2)</text>
+  <text x="485" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(0,3)</text>
+  <text x="535" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(1,0)</text>
+  <text x="585" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(1,1)</text>
+  <text x="635" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(1,2)</text>
+  <text x="685" y="127" fill="#059669" font-size="10.5" text-anchor="middle">(1,3)</text>
+  <text x="726" y="127" fill="#64748b" font-size="14">…</text>
+  <text x="500" y="164" fill="#1e293b" font-size="13" text-anchor="middle" font-weight="600">token 序列顺序 = 行优先（第 0 行走完再走第 1 行）</text>
+  <text x="500" y="188" fill="#64748b" font-size="12" text-anchor="middle">与 x.flatten(2) 的展平顺序一致 → 第 i 个 token 对应第 i 个坐标</text>
+
+  <!-- bottom notes -->
+  <rect x="40" y="212" width="780" height="64" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="60" y="238" fill="#dc2626" font-size="13" font-weight="700">⚠ pos 的三个真相</text>
+  <text x="60" y="260" fill="#64748b" font-size="12">1. 它是整数网格索引（0..15），不是浮点位置编码　2. 它 dtype=int64，不是 float　3. 它<strong>不在这里加到 x 上</strong></text>
+</svg>
+<figcaption>图 4 · <code>pos</code> 是网格坐标表：<code>cartesian_prod(y, x)</code> 生成 (row, col)，行优先展开后与 token 序列一一对应。</figcaption>
+</div>
+
+<div class="callout amber">
+  <strong>那 pos 最终怎么变成位置信息的？</strong><br>
+  它被一路带到 Transformer block 里：block 调用 <code>self.attn(self.norm1(x), xpos)</code>，
+  由 <strong>RoPE2D</strong> 拿 <code>pos</code> 对 q/k 做旋转（<code>pos_embed.py:142-159</code>）。
+  RoPE2D 的 CUDA 实现就是 <code>curope/kernels.cu</code>（<code>RoPE2D = cuRoPE2D</code>）。
+  正因为用了 RoPE（相对位置），<code>croco.py:58</code> 里才是 <code>self.enc_pos_embed = None</code>——
+  <strong>不需要绝对位置编码</strong>，<code>_encode_image</code> 里甚至有 <code>assert self.enc_pos_embed is None</code>。
+</div>
+
+<!-- ================= 6 ================= -->
+<h2>6. 完整数值实例</h2>
+
+<pre>设定：b=1，v=4（4 张 context 图），图像 256×256，ViT-Large（embed_dim=1024），patch=16
+
+backbone 先把 [b, v, 3, 256, 256] 展平 → B = b*v = 4
+
+x   : [4, 3, 256, 256]          输入
+      ↓ self.proj  Conv2d(3→1024, k=s=16)
+      [4, 1024, 16, 16]         256 个格子，每格 1024 通道
+      ↓ flatten(2).transpose(1,2)
+      [4, 256, 1024]            256 个 token
+      ↓ self.norm (LayerNorm 1024)
+      [4, 256, 1024]            ← 返回 x
+
+pos : [4, 256, 2]               ← 返回 pos（int64，值域 0..15）
+
+回到 backbone 后再 rearrange 回 [b, v, 256, 1024]</pre>
+
+<!-- ================= 7 ================= -->
+<h2>7. 重点：这里<strong>没有 CLS token</strong></h2>
+
+<div class="fig">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- Row 1: standard ViT -->
+  <text x="20" y="30" fill="#d97706" font-size="13" font-weight="700">标准 ViT / CLIP（对照）</text>
+  <rect x="20" y="44" width="52" height="40" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="46" y="69" fill="#d97706" font-size="11" text-anchor="middle" font-weight="700">CLS</text>
+  <g fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.4">
+    <rect x="78" y="44" width="40" height="40" rx="3"/>
+    <rect x="122" y="44" width="40" height="40" rx="3"/>
+    <rect x="166" y="44" width="40" height="40" rx="3"/>
+    <rect x="210" y="44" width="40" height="40" rx="3"/>
+    <rect x="254" y="44" width="40" height="40" rx="3"/>
+  </g>
+  <text x="306" y="69" fill="#64748b" font-size="14">…</text>
+  <text x="340" y="69" fill="#d97706" font-size="13" font-weight="700">共 1 + 256 = 257</text>
+
+  <!-- Row 2: this class -->
+  <text x="20" y="118" fill="#4f46e5" font-size="13" font-weight="700">本类 PatchEmbedDust3R 的输出</text>
+  <g fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8">
+    <rect x="20" y="132" width="40" height="40" rx="3"/>
+    <rect x="64" y="132" width="40" height="40" rx="3"/>
+    <rect x="108" y="132" width="40" height="40" rx="3"/>
+    <rect x="152" y="132" width="40" height="40" rx="3"/>
+    <rect x="196" y="132" width="40" height="40" rx="3"/>
+    <rect x="240" y="132" width="40" height="40" rx="3"/>
+  </g>
+  <text x="292" y="157" fill="#64748b" font-size="14">…</text>
+  <text x="326" y="157" fill="#4f46e5" font-size="13" font-weight="700">共 256 —— 全是 patch token</text>
+  <rect x="560" y="132" width="230" height="40" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="675" y="157" fill="#dc2626" font-size="13" font-weight="700" text-anchor="middle">✗ 没有 CLS token</text>
+
+  <!-- Row 3: where 257 comes from -->
+  <text x="20" y="200" fill="#059669" font-size="13" font-weight="700">那 257 从哪来？→ 后面拼的「内参 / 位姿 token」，不是 CLS</text>
+  <rect x="20" y="212" width="52" height="34" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="46" y="233" fill="#059669" font-size="10.5" text-anchor="middle" font-weight="700">内参</text>
+  <g fill="#eef2ff" stroke="#4f46e5" stroke-width="1.4">
+    <rect x="78" y="212" width="40" height="34" rx="3"/>
+    <rect x="122" y="212" width="40" height="34" rx="3"/>
+    <rect x="166" y="212" width="40" height="34" rx="3"/>
+    <rect x="210" y="212" width="40" height="34" rx="3"/>
+  </g>
+  <text x="262" y="233" fill="#64748b" font-size="13">…</text>
+  <text x="296" y="233" fill="#059669" font-size="13" font-weight="700">256 + 1 = 257（这个 1 是内参 token）</text>
+</svg>
+<figcaption>图 5 · CLS token 对照。本类只产出 256 个 patch token；257 里的那个「1」是后面拼的内参/位姿 token，<strong>不是 CLS</strong>。</figcaption>
+</div>
+
+<p>拼 token 的代码在 <code>backbone_croco_multiview.py</code> 的 <code>_encode_image</code> 里：</p>
+
+<pre>146  if intrinsics_embed is not None:
+148      if self.intrinsics_embed_type == 'linear':
+149          x = x + intrinsics_embed                     # 广播加到每个 token 上（token 数不变）
+150      elif self.intrinsics_embed_type == 'token':
+151          x = torch.cat((x, intrinsics_embed), dim=1)  # ← 拼 1 个新 token → 257
+152          add_pose = pos[:, 0:1, :].clone()
+153          add_pose[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)
+154          pos = torch.cat((pos, add_pose), dim=1)      # ← pos 也跟着 +1，保持对齐</pre>
+
+<div class="callout green">
+  <strong>所以：</strong>
+  <ul style="margin:8px 0 0 18px">
+    <li><strong>PatchEmbedDust3R 本身永远输出 256 个 patch token，没有 CLS。</strong></li>
+    <li>Cross-attention 里看到的 <code>k/v = 514</code>，是<strong>两个视角</strong>的 token 拼起来：257 × 2 = 514。</li>
+    <li>而每个视角的 257 = <strong>256 个 patch + 1 个内参/位姿 token</strong>。若配置 <code>intrinsics_embed_loc='none'</code>（默认），就只有 256。</li>
+  </ul>
+</div>
+
+<!-- ================= 8 ================= -->
+<h2>8. 兄弟类：<code>ManyAR_PatchEmbed</code>（一句话）</h2>
+
+<p>同文件第 32–70 行还有个 <code>ManyAR_PatchEmbed</code>，专门处理<strong>非正方形 / 竖图</strong>：
+它接收 <code>true_shape</code>，把竖图转置成横图再切块，并单独处理 <code>pos</code> 的横竖顺序。
+默认配置用的是 <code>PatchEmbedDust3R</code>（<code>BackboneCrocoCfg.patch_embed_cls</code> 第 54 行），
+所以只有非正方形场景才会用到它。</p>
+
+<!-- ================= 9 ================= -->
+<h2>9. 自测</h2>
+
+<ol class="steps">
+  <li>输入 <code>[4, 3, 256, 256]</code>，经过 <code>self.proj</code> 后形状是什么？</li>
+  <li><code>pos</code> 的形状和 dtype？它的两个分量分别代表什么？</li>
+  <li>为什么 <code>kernel_size == stride == 16</code> 就能等价于「切块」？</li>
+  <li>本类输出多少个 token？有没有 CLS？</li>
+  <li>你在调试时看到 <code>q.shape = [..., 257, ...]</code>，这个 257 是怎么来的？</li>
+</ol>
+
+<details>
+  <summary>答案</summary>
+  <p><strong>1.</strong> <code>[4, 1024, 16, 16]</code>。输出空间尺寸 = (256 − 16)/16 + 1 = 16；通道数 = embed_dim = 1024。</p>
+  <p><strong>2.</strong> <code>[4, 256, 2]</code>，dtype <code>int64</code>。<code>pos[...,0]</code> 是 row（第几行，0..15），<code>pos[...,1]</code> 是 col（第几列）。</p>
+  <p><strong>3.</strong> 因为步长等于核大小，卷积窗口每次刚好跳过一个核的宽度，<strong>不重叠也无缝隙</strong>地铺满图像；每个窗口覆盖 <code>16×16×3=768</code> 个值，卷积核（view 成 <code>[1024, 768]</code> 后）就等价于把这 768 维线性投影到 1024 维。</p>
+  <p><strong>4.</strong> 256 个（= (256/16)²），<strong>没有 CLS token</strong>。</p>
+  <p><strong>5.</strong> 256 个 patch token + 1 个<strong>内参（或位姿）token</strong>，在 <code>_encode_image</code> 里用 <code>torch.cat(..., dim=1)</code> 拼上去的（<code>intrinsics_embed_type='token'</code> 分支）。不是 CLS。</p>
+</details>
+
+<div class="callout">
+  <strong>回到 Chapter 01</strong>：本篇是 §4「切块成 token」的完整展开。
+  下一步（Chapter 02）就是这些 token 进入 Transformer——cross-view attention 与极线机制，
+  而 <code>pos</code> 会在那里第一次真正派上用场（RoPE / <code>curope</code>）。
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,35 @@
+# ===== 上游仓库克隆：不入库，换电脑重新 clone =====
+# 它们自带 .git，放进仓库会被当成 submodule，文件根本传不上去；
+# 且 ecoSplat 含 845MB 权重，远超 GitHub 单文件 100MB 上限。
+ecoSplat/
+dust3r/
+
+# ===== 训练产物 / 大文件 =====
+results/
+outputs/
+wandb/
+lightning_logs/
+*.ckpt
+*.pth
+*.safetensors
+*.pt
+*.ply
+*.npy
+*.npz
+*.bin
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ===== 杂项 =====
+*.log
+*.err
+*.tmp
+.DS_Store
+Thumbs.db

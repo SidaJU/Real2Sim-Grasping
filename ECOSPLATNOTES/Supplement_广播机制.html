@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supplement · PyTorch 广播机制（Broadcasting）</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.92rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line)}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  .mbox{font-family:"Cambria Math",Georgia,serif; font-size:1.05rem; text-align:center; margin:14px 0}
+  .mbox .hl{background:var(--indigo-soft); border:1.5px solid var(--indigo); border-radius:8px;
+            display:inline-block; padding:8px 22px}
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600}
+  details{background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 16px; margin:10px 0}
+  summary{cursor:pointer; font-weight:600; color:var(--indigo)}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Supplement · PyTorch 广播机制（Broadcasting）</h1>
+  <div class="sub">
+    从「一个数字加到一个向量」讲到「5 维图像加一个通道常数」——为什么 <code>[3,1,1]</code> 是对的、<code>[3]</code> 会错<br>
+    配套阅读：EcoSplat 学习笔记 · Chapter 01「输入与预处理」§3 归一化
+  </div>
+</header>
+
+<h2>0. 引子：一行代码引发的问题</h2>
+
+<p>EcoSplat 的 <code>normalize_image</code> 里有这么两行：</p>
+
+<pre>mean = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
+std  = torch.as_tensor(std,  dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
+return (tensor - mean) / std        # tensor 形状 [b, v, 3, H, W]</pre>
+
+<p>问题是：<strong><code>mean</code> 只有 3 个数，凭什么能减掉一张 5 维的图像？</strong>
+答案就是「广播」。本笔记从最简单的例子开始，一级一级把维度加上去。</p>
+
+<div class="callout">
+  <strong>一句话先剧透</strong>：广播就是 <strong>「把小的那个张量，沿缺失/为 1 的维度自动复制放大，直到和大的那个形状一致，再逐元素运算」</strong>。
+  而且它<strong>不真的复制内存</strong>（后面 §8 讲）。
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1. 规则只有两条</h2>
+
+<p>PyTorch（和 NumPy）做逐元素运算时，按下面两条规则决定「能不能算、算完是什么形状」：</p>
+
+<h3>规则 A · 右对齐</h3>
+<p>把两个 shape <strong>从最右边开始，逐维向左对齐比较</strong>。
+维度少的那个，<strong>在左边补 1</strong> 补齐后再比。</p>
+
+<h3>规则 B · 兼容判定（每一维独立判断）</h3>
+<table>
+  <tr><th>两个维度的值</th><th>结果</th></tr>
+  <tr><td>相等（3 ↔ 3）</td><td class="ok">✓ 直接匹配</td></tr>
+  <tr><td>其中一个是 <strong>1</strong>（1 ↔ 256）</td><td class="ok">✓ 把 1 拉伸/复制到 256</td></tr>
+  <tr><td>都不等，且都不是 1（3 ↔ 256）</td><td class="bad">✗ 报错</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>关键澄清</strong>：<code>1</code> 不是「声明这一维就是 1」，而是<strong>「这一维我不指定，遇到多大就铺多大」</strong>的橡皮筋指令。
+  打个比方：<code>[3,1,1]</code> = 「3 个通道，每通道 1 个数，请把这 1 个数铺满整个 H×W 平面」。
+</div>
+
+<h3>结果形状</h3>
+<p>结果的每一维 = 两个输入在该维的<strong>最大值</strong>。所以 <code>(2,3)</code> + <code>(1,3)</code> → 结果是 <code>(2,3)</code>，不是 <code>(1,3)</code>。</p>
+
+<!-- ================= 2 ================= -->
+<h2>2. Level 0：标量（0 维）</h2>
+
+<p><code>()</code> 形状的标量，和任何张量运算时，会被复制到每一个位置——这是最平凡的情况，不需要额外规则。</p>
+
+<!-- ================= 3 ================= -->
+<h2>3. Level 1：标量 + 一维向量</h2>
+
+<p>一个数字加到向量上：数字被「复印」3 份，每个元素各加一次。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 240" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- scalar -->
+  <rect x="60" y="26" width="66" height="66" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="2.5"/>
+  <text x="93" y="66" fill="#d97706" font-size="22" font-weight="700" text-anchor="middle">2</text>
+  <text x="93" y="112" fill="#64748b" font-size="12" text-anchor="middle">标量 shape ()</text>
+
+  <!-- dashed arrows to each -->
+  <line x1="93" y1="92" x2="205" y2="150" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <line x1="93" y1="92" x2="295" y2="150" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <line x1="93" y1="92" x2="385" y2="150" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="150" y="132" fill="#d97706" font-size="12">每个都 +2</text>
+
+  <!-- input vector -->
+  <rect x="175" y="150" width="60" height="60" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="205" y="186" fill="#1e293b" font-size="18" text-anchor="middle">1</text>
+  <rect x="265" y="150" width="60" height="60" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="295" y="186" fill="#1e293b" font-size="18" text-anchor="middle">2</text>
+  <rect x="355" y="150" width="60" height="60" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="385" y="186" fill="#1e293b" font-size="18" text-anchor="middle">3</text>
+  <text x="295" y="228" fill="#64748b" font-size="12" text-anchor="middle">向量 shape (3,)</text>
+
+  <!-- equals -->
+  <text x="440" y="190" fill="#64748b" font-size="26" text-anchor="middle">=</text>
+
+  <!-- result -->
+  <rect x="480" y="150" width="60" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="510" y="186" fill="#059669" font-size="18" text-anchor="middle" font-weight="600">3</text>
+  <rect x="570" y="150" width="60" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="600" y="186" fill="#059669" font-size="18" text-anchor="middle" font-weight="600">4</text>
+  <rect x="660" y="150" width="60" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="690" y="186" fill="#059669" font-size="18" text-anchor="middle" font-weight="600">5</text>
+  <text x="600" y="228" fill="#64748b" font-size="12" text-anchor="middle">结果 shape (3,)</text>
+</svg>
+<figcaption>图 1 · 标量 2 被「复印」3 份，分别加到向量的每个元素上。虚线表示复制方向。</figcaption>
+</div>
+
+<!-- ================= 4 ================= -->
+<h2>4. Level 2：一维 + 一维</h2>
+
+<p>两个向量相加：<strong>形状完全相同</strong>才能逐元素算；长度不同（且都不是 1）就报错。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- ===== Case A: same length ===== -->
+  <text x="20" y="26" fill="#059669" font-size="14" font-weight="700">✓ 同长：(3,) + (3,)</text>
+
+  <rect x="30" y="48" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="58" y="80" fill="#1e293b" font-size="16" text-anchor="middle">1</text>
+  <rect x="94" y="48" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="122" y="80" fill="#1e293b" font-size="16" text-anchor="middle">2</text>
+  <rect x="158" y="48" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="186" y="80" fill="#1e293b" font-size="16" text-anchor="middle">3</text>
+
+  <text x="232" y="82" fill="#64748b" font-size="22">+</text>
+
+  <rect x="258" y="48" width="56" height="52" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="286" y="80" fill="#d97706" font-size="16" text-anchor="middle">10</text>
+  <rect x="322" y="48" width="56" height="52" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="350" y="80" fill="#d97706" font-size="16" text-anchor="middle">20</text>
+  <rect x="386" y="48" width="56" height="52" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="414" y="80" fill="#d97706" font-size="16" text-anchor="middle">30</text>
+
+  <text x="460" y="82" fill="#64748b" font-size="22">=</text>
+
+  <rect x="486" y="48" width="56" height="52" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="514" y="80" fill="#059669" font-size="16" text-anchor="middle" font-weight="600">11</text>
+  <rect x="550" y="48" width="56" height="52" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="578" y="80" fill="#059669" font-size="16" text-anchor="middle" font-weight="600">22</text>
+  <rect x="614" y="48" width="56" height="52" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="642" y="80" fill="#059669" font-size="16" text-anchor="middle" font-weight="600">33</text>
+
+  <text x="700" y="80" fill="#64748b" font-size="13">逐元素，一一对应</text>
+
+  <!-- ===== Case B: different length ===== -->
+  <text x="20" y="150" fill="#dc2626" font-size="14" font-weight="700">✗ 异长：(3,) + (2,)</text>
+
+  <rect x="30" y="172" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="58" y="204" fill="#1e293b" font-size="16" text-anchor="middle">1</text>
+  <rect x="94" y="172" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="122" y="204" fill="#1e293b" font-size="16" text-anchor="middle">2</text>
+  <rect x="158" y="172" width="56" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="186" y="204" fill="#1e293b" font-size="16" text-anchor="middle">3</text>
+
+  <text x="232" y="206" fill="#64748b" font-size="22">+</text>
+
+  <rect x="258" y="172" width="56" height="52" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="286" y="204" fill="#dc2626" font-size="16" text-anchor="middle">10</text>
+  <rect x="322" y="172" width="56" height="52" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="350" y="204" fill="#dc2626" font-size="16" text-anchor="middle">20</text>
+
+  <text x="400" y="206" fill="#dc2626" font-size="22" font-weight="700">✗</text>
+  <text x="440" y="200" fill="#dc2626" font-size="13">3 ↔ 2 不等，且都不是 1</text>
+  <text x="440" y="222" fill="#64748b" font-size="12.5">RuntimeError: The size of tensor a (3) must match...</text>
+
+  <!-- ===== Case C: length 1 broadcasts ===== -->
+  <text x="20" y="262" fill="#059669" font-size="14" font-weight="700">✓ 特例：(3,) + (1,) → (3,)　（长度 1 可以拉伸）</text>
+  <rect x="30" y="276" width="52" height="0" fill="none"/>
+  <text x="500" y="276" fill="#64748b" font-size="12.5">[1,2,3] + [5] → [6,7,8]　← 5 被复制到 3 份</text>
+</svg>
+<figcaption>图 2 · 一维 + 一维。上：同长逐元素；中：异长报错；下：长度为 1 时可以拉伸。</figcaption>
+</div>
+
+<!-- ================= 5 ================= -->
+<h2>5. Level 3：一维 + 二维 —— shape 决定「往哪个方向铺」</h2>
+
+<p>这是<strong>最关键的一级</strong>：同样是「3 个数」，写成 <code>(3,)</code> 和 <code>(2,1)</code>，广播的方向完全不同。</p>
+
+<h3>5.1 b 的形状是 <code>(3,)</code> → 沿「行」方向复制（每行都加同一行）</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="40" y="24" fill="#1e293b" font-size="13" font-weight="600">A　shape (2, 3)</text>
+  <!-- A grid -->
+  <rect x="40" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="68" y="69" fill="#1e293b" font-size="15" text-anchor="middle">1</text>
+  <rect x="100" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="128" y="69" fill="#1e293b" font-size="15" text-anchor="middle">2</text>
+  <rect x="160" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="188" y="69" fill="#1e293b" font-size="15" text-anchor="middle">3</text>
+  <rect x="40" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="68" y="119" fill="#1e293b" font-size="15" text-anchor="middle">4</text>
+  <rect x="100" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="128" y="119" fill="#1e293b" font-size="15" text-anchor="middle">5</text>
+  <rect x="160" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="188" y="119" fill="#1e293b" font-size="15" text-anchor="middle">6</text>
+
+  <text x="240" y="82" fill="#64748b" font-size="24">+</text>
+
+  <text x="272" y="24" fill="#d97706" font-size="13" font-weight="600">b　shape (3,)</text>
+  <!-- b row (real) -->
+  <rect x="272" y="40" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="300" y="69" fill="#d97706" font-size="15" text-anchor="middle">10</text>
+  <rect x="332" y="40" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="360" y="69" fill="#d97706" font-size="15" text-anchor="middle">20</text>
+  <rect x="392" y="40" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="420" y="69" fill="#d97706" font-size="15" text-anchor="middle">30</text>
+  <!-- b ghost copy (dashed) -->
+  <rect x="272" y="90" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="300" y="119" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">10</text>
+  <rect x="332" y="90" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="360" y="119" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">20</text>
+  <rect x="392" y="90" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="420" y="119" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">30</text>
+  <text x="460" y="120" fill="#d97706" font-size="12.5">虚线 = 自动复制出来的第 2 行</text>
+
+  <text x="470" y="82" fill="#64748b" font-size="24">=</text>
+
+  <!-- result -->
+  <rect x="500" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="528" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">11</text>
+  <rect x="560" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="588" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">22</text>
+  <rect x="620" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="648" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">33</text>
+  <rect x="500" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="528" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">14</text>
+  <rect x="560" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="588" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">25</text>
+  <rect x="620" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="648" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">36</text>
+
+  <text x="430" y="180" fill="#4f46e5" font-size="13.5" text-anchor="middle" font-weight="600">
+    右对齐：(3,) 的 3 匹配到 A 的「列」维 → b 被当成「一行」，复制成 2 行</text>
+  <text x="430" y="206" fill="#64748b" font-size="12.5" text-anchor="middle">
+    效果：第 1 行加 [10,20,30]，第 2 行也加 [10,20,30] ——「每行都加同一个行向量」</text>
+  <text x="430" y="232" fill="#64748b" font-size="12.5" text-anchor="middle">
+    结果 shape = (2, 3) ← 取各维最大值</text>
+</svg>
+<figcaption>图 3 · b 是 <code>(3,)</code>：沿行方向复制。虚线框 = 广播自动补出来的那一行。</figcaption>
+</div>
+
+<h3>5.2 b 的形状是 <code>(2,1)</code> → 沿「列」方向复制（每行加各自己的数）</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="40" y="24" fill="#1e293b" font-size="13" font-weight="600">A　shape (2, 3)</text>
+  <rect x="40" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="68" y="69" fill="#1e293b" font-size="15" text-anchor="middle">1</text>
+  <rect x="100" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="128" y="69" fill="#1e293b" font-size="15" text-anchor="middle">2</text>
+  <rect x="160" y="40" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="188" y="69" fill="#1e293b" font-size="15" text-anchor="middle">3</text>
+  <rect x="40" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="68" y="119" fill="#1e293b" font-size="15" text-anchor="middle">4</text>
+  <rect x="100" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="128" y="119" fill="#1e293b" font-size="15" text-anchor="middle">5</text>
+  <rect x="160" y="90" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="188" y="119" fill="#1e293b" font-size="15" text-anchor="middle">6</text>
+
+  <text x="240" y="82" fill="#64748b" font-size="24">+</text>
+
+  <text x="272" y="24" fill="#d97706" font-size="13" font-weight="600">b　shape (2, 1)</text>
+  <!-- b column (real) -->
+  <rect x="272" y="40" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="300" y="69" fill="#d97706" font-size="15" text-anchor="middle">10</text>
+  <rect x="272" y="90" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="300" y="119" fill="#d97706" font-size="15" text-anchor="middle">20</text>
+  <!-- ghosts to the right -->
+  <rect x="332" y="40" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="360" y="69" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">10</text>
+  <rect x="392" y="40" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="420" y="69" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">10</text>
+  <rect x="332" y="90" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="360" y="119" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">20</text>
+  <rect x="392" y="90" width="56" height="46" rx="5" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="420" y="119" fill="#d97706" font-size="15" text-anchor="middle" opacity="0.75">20</text>
+  <text x="460" y="120" fill="#d97706" font-size="12.5">虚线 = 向右复制出第 2、3 列</text>
+
+  <text x="470" y="82" fill="#64748b" font-size="24">=</text>
+
+  <!-- result: row1 all +10, row2 all +20 -->
+  <rect x="500" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="528" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">11</text>
+  <rect x="560" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="588" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">12</text>
+  <rect x="620" y="40" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="648" y="69" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">13</text>
+  <rect x="500" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="528" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">24</text>
+  <rect x="560" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="588" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">25</text>
+  <rect x="620" y="90" width="56" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="648" y="119" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">26</text>
+
+  <text x="430" y="180" fill="#4f46e5" font-size="13.5" text-anchor="middle" font-weight="600">
+    右对齐：(2,1) 的 1 匹配到「列」维（拉伸到 3），2 匹配到「行」维</text>
+  <text x="430" y="206" fill="#64748b" font-size="12.5" text-anchor="middle">
+    效果：第 1 行每个元素都 +10，第 2 行每个元素都 +20 ——「每行加自己的数」</text>
+  <text x="430" y="232" fill="#64748b" font-size="12.5" text-anchor="middle">
+    结果 shape = (2, 3)</text>
+</svg>
+<figcaption>图 4 · b 是 <code>(2,1)</code>：沿列方向复制。和多写两个 1 相比，区别只在「哪个维度是 1」。</figcaption>
+</div>
+
+<div class="callout green">
+  <strong>本级的要点</strong>：<code>(3,)</code> 和 <code>(2,1)</code> 里都各有一个「3」或「2」，但
+  <strong>它们落在哪个维度上，决定了复制方向</strong>。而「落在哪里」完全由<strong>右对齐</strong>决定——
+  这就是下一节陷阱的根源。
+</div>
+
+<!-- ================= 6 ================= -->
+<h2>6. Level 4：二维 + 二维 —— 外和</h2>
+
+<p>两个二维张量，一个只有一列 <code>(2,1)</code>，一个只有一行 <code>(1,3)</code>，
+它们相加会得到完整的 <code>(2,3)</code> —— 各自沿自己的「1」维拉伸，交叉铺满整个网格。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="60" y="20" fill="#d97706" font-size="13" font-weight="600">列向量 (2, 1)</text>
+  <rect x="60" y="34" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="88" y="63" fill="#d97706" font-size="15" text-anchor="middle">10</text>
+  <rect x="60" y="84" width="56" height="46" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="88" y="113" fill="#d97706" font-size="15" text-anchor="middle">20</text>
+
+  <text x="150" y="80" fill="#64748b" font-size="24">+</text>
+
+  <text x="200" y="20" fill="#4f46e5" font-size="13" font-weight="600">行向量 (1, 3)</text>
+  <rect x="196" y="34" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="224" y="63" fill="#1e293b" font-size="15" text-anchor="middle">100</text>
+  <rect x="256" y="34" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="284" y="63" fill="#1e293b" font-size="15" text-anchor="middle">200</text>
+  <rect x="316" y="34" width="56" height="46" rx="5" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="344" y="63" fill="#1e293b" font-size="15" text-anchor="middle">300</text>
+
+  <text x="400" y="80" fill="#64748b" font-size="24">=</text>
+
+  <!-- result 2x3 -->
+  <text x="560" y="20" fill="#059669" font-size="13" font-weight="600">结果 (2, 3)</text>
+  <rect x="450" y="34" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="483" y="63" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">110</text>
+  <rect x="520" y="34" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="553" y="63" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">210</text>
+  <rect x="590" y="34" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="623" y="63" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">310</text>
+  <rect x="450" y="84" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="483" y="113" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">120</text>
+  <rect x="520" y="84" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="553" y="113" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">220</text>
+  <rect x="590" y="84" width="66" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="623" y="113" fill="#059669" font-size="15" text-anchor="middle" font-weight="600">320</text>
+
+  <!-- annotations -->
+  <text x="720" y="70" fill="#d97706" font-size="12.5">10 沿行拉伸 → 占满第 1 行</text>
+  <text x="720" y="92" fill="#d97706" font-size="12.5">20 沿行拉伸 → 占满第 2 行</text>
+  <text x="720" y="122" fill="#4f46e5" font-size="12.5">100/200/300 沿列拉伸 ↓</text>
+
+  <text x="430" y="180" fill="#4f46e5" font-size="13.5" text-anchor="middle" font-weight="600">
+    右对齐比较：(2,1) 与 (1,3)　→　行维：2 ↔ 1 ✓（1 拉伸到 2）　列维：1 ↔ 3 ✓（1 拉伸到 3）</text>
+  <text x="430" y="208" fill="#64748b" font-size="12.5" text-anchor="middle">
+    两个「1」各自沿自己的方向铺开，交叉得到完整的 2×3 网格 —— 这就是「外和 / outer sum」</text>
+  <text x="430" y="234" fill="#64748b" font-size="12.5" text-anchor="middle">
+    口诀：<strong>结果取各维最大值</strong>　max(2,1)=2，max(1,3)=3 → (2,3)</text>
+</svg>
+<figcaption>图 5 · 二维 + 二维的外和。两个「1」各铺各的方向，交叉填满网格。</figcaption>
+</div>
+
+<!-- ================= 7 ================= -->
+<h2>7. Level 5：三维 —— 图像 + 通道常数（EcoSplat 的归一化就在这里）</h2>
+
+<p>现在看真正的图像。PyTorch 图像是 <strong>channel-first</strong>：<code>[3, H, W]</code>，通道在<strong>倒数第 3 维</strong>。
+我们想把「每个通道一个常数」减上去：</p>
+
+<pre>image           shape [3, H, W]        # 例如 [3, 256, 256]
+mean            shape [3, 1, 1]        # 3 个通道，每通道 1 个数
+image - mean →  shape [3, H, W]        # 每个通道的那个数，铺满该通道的 H×W 平面</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="80" y="24" fill="#d97706" font-size="13" font-weight="600">mean　[3, 1, 1]</text>
+  <!-- three small squares -->
+  <rect x="40" y="44" width="56" height="56" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="68" y="78" fill="#dc2626" font-size="16" text-anchor="middle" font-weight="600">0.1</text>
+  <text x="112" y="78" fill="#64748b" font-size="12">R</text>
+
+  <rect x="40" y="112" width="56" height="56" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="68" y="146" fill="#059669" font-size="16" text-anchor="middle" font-weight="600">0.2</text>
+  <text x="112" y="146" fill="#64748b" font-size="12">G</text>
+
+  <rect x="40" y="180" width="56" height="56" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="68" y="214" fill="#4f46e5" font-size="16" text-anchor="middle" font-weight="600">0.3</text>
+  <text x="112" y="214" fill="#64748b" font-size="12">B</text>
+
+  <text x="68" y="256" fill="#64748b" font-size="12" text-anchor="middle">每通道 1×1</text>
+
+  <!-- stretch arrows -->
+  <text x="160" y="80" fill="#d97706" font-size="20">→</text>
+  <text x="160" y="148" fill="#059669" font-size="20">→</text>
+  <text x="160" y="216" fill="#4f46e5" font-size="20">→</text>
+  <text x="196" y="112" fill="#64748b" font-size="12.5">拉伸到</text>
+  <text x="196" y="130" fill="#64748b" font-size="12.5">H × W</text>
+
+  <!-- three planes -->
+  <rect x="260" y="44" width="300" height="56" rx="6" fill="#dc2626" opacity="0.14" stroke="#dc2626" stroke-width="2"/>
+  <text x="410" y="78" fill="#dc2626" font-size="14" text-anchor="middle" font-weight="600">R 平面：0.1 铺满 H×W</text>
+
+  <rect x="260" y="112" width="300" height="56" rx="6" fill="#059669" opacity="0.14" stroke="#059669" stroke-width="2"/>
+  <text x="410" y="146" fill="#059669" font-size="14" text-anchor="middle" font-weight="600">G 平面：0.2 铺满 H×W</text>
+
+  <rect x="260" y="180" width="300" height="56" rx="6" fill="#4f46e5" opacity="0.14" stroke="#4f46e5" stroke-width="2"/>
+  <text x="410" y="214" fill="#4f46e5" font-size="14" text-anchor="middle" font-weight="600">B 平面：0.3 铺满 H×W</text>
+
+  <text x="410" y="256" fill="#64748b" font-size="12" text-anchor="middle">image　[3, H, W]</text>
+
+  <!-- right side: alignment -->
+  <text x="600" y="60" fill="#1e293b" font-size="13" font-weight="600">右对齐核对</text>
+  <text x="600" y="88" fill="#64748b" font-size="12.5">image : [ 3, H, W ]</text>
+  <text x="600" y="110" fill="#64748b" font-size="12.5">mean  : [ 3, 1, 1 ]</text>
+  <text x="600" y="138" fill="#64748b" font-size="12.5">         ↑   ↑   ↑</text>
+  <text x="600" y="160" fill="#059669" font-size="12.5">        相等 拉伸 拉伸</text>
+  <text x="600" y="188" fill="#64748b" font-size="12.5">3 落在<strong>通道维</strong> ✓ 正确</text>
+  <text x="600" y="216" fill="#64748b" font-size="12.5">两个 1 分别被拉到 H 和 W</text>
+  <text x="600" y="244" fill="#64748b" font-size="12.5">结果 shape = [3, H, W]</text>
+</svg>
+<figcaption>图 6 · 三维的通道拉伸：<code>[3,1,1]</code> 里的每个数，沿自己的 H×W 平面铺满。这就是「逐通道归一化」。</figcaption>
+</div>
+
+<!-- ================= 8 ================= -->
+<h2>8. 陷阱：同样 3 个数，写 <code>[3]</code> 就错了</h2>
+
+<p>如果把 <code>mean</code> 写成 1 维的 <code>[3]</code>（不 reshape），右对齐会把它放到<strong>最后一维 W</strong> 上：</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- ===== WRONG ===== -->
+  <rect x="20" y="20" width="400" height="140" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="40" y="46" fill="#dc2626" font-size="14" font-weight="700">✗ 错：mean 写成 [3]</text>
+
+  <text x="40" y="74" fill="#64748b" font-size="12.5">image [b, v, 3, H, W]：</text>
+  <rect x="40" y="84" width="58" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="69" y="109" fill="#64748b" font-size="12" text-anchor="middle">b</text>
+  <rect x="104" y="84" width="58" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="133" y="109" fill="#64748b" font-size="12" text-anchor="middle">v</text>
+  <rect x="168" y="84" width="58" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="197" y="109" fill="#64748b" font-size="12" text-anchor="middle">3</text>
+  <rect x="232" y="84" width="58" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="261" y="109" fill="#64748b" font-size="12" text-anchor="middle">H</text>
+  <rect x="296" y="84" width="58" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="325" y="109" fill="#64748b" font-size="12" text-anchor="middle">W</text>
+
+  <text x="40" y="146" fill="#64748b" font-size="12.5">mean [3] 右对齐后：</text>
+  <rect x="296" y="128" width="58" height="28" rx="4" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="325" y="147" fill="#dc2626" font-size="12" text-anchor="middle" font-weight="600">3</text>
+  <line x1="325" y1="124" x2="325" y2="128" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="368" y="147" fill="#dc2626" font-size="12">← 3 掉到 W 上</text>
+  <text x="40" y="168" fill="#dc2626" font-size="12.5">W=256 ≠ 3，且都不是 1 → 直接崩溃</text>
+
+  <!-- ===== RIGHT ===== -->
+  <rect x="440" y="20" width="400" height="140" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="460" y="46" fill="#059669" font-size="14" font-weight="700">✓ 对：mean 写成 [3, 1, 1]</text>
+
+  <text x="460" y="74" fill="#64748b" font-size="12.5">image [b, v, 3, H, W]：</text>
+  <rect x="460" y="84" width="52" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="486" y="109" fill="#64748b" font-size="12" text-anchor="middle">b</text>
+  <rect x="518" y="84" width="52" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="544" y="109" fill="#64748b" font-size="12" text-anchor="middle">v</text>
+  <rect x="576" y="84" width="52" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="602" y="109" fill="#64748b" font-size="12" text-anchor="middle">3</text>
+  <rect x="634" y="84" width="52" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="660" y="109" fill="#64748b" font-size="12" text-anchor="middle">H</text>
+  <rect x="692" y="84" width="52" height="40" rx="4" fill="#fff" stroke="#94a3b8"/>
+  <text x="718" y="109" fill="#64748b" font-size="12" text-anchor="middle">W</text>
+
+  <text x="460" y="146" fill="#64748b" font-size="12.5">mean 左补 1 → [1, 1, 3, 1, 1]：</text>
+  <rect x="460" y="128" width="52" height="28" rx="4" fill="none" stroke="#059669" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="486" y="147" fill="#059669" font-size="11.5" text-anchor="middle">1</text>
+  <rect x="518" y="128" width="52" height="28" rx="4" fill="none" stroke="#059669" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="544" y="147" fill="#059669" font-size="11.5" text-anchor="middle">1</text>
+  <rect x="576" y="128" width="52" height="28" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="602" y="147" fill="#059669" font-size="12" text-anchor="middle" font-weight="600">3</text>
+  <rect x="634" y="128" width="52" height="28" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="660" y="147" fill="#059669" font-size="12" text-anchor="middle" font-weight="600">1</text>
+  <rect x="692" y="128" width="52" height="28" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="718" y="147" fill="#059669" font-size="12" text-anchor="middle" font-weight="600">1</text>
+  <text x="460" y="168" fill="#059669" font-size="12.5">3 落在通道维 ✓　两个 1 被拉到 H、W ✓</text>
+
+  <!-- bottom note -->
+  <text x="430" y="196" fill="#1e293b" font-size="13.5" text-anchor="middle" font-weight="600">
+    结论：shape 里「1 的个数和位置」决定了数字落在哪一维 —— 写错就南辕北辙</text>
+  <text x="430" y="226" fill="#64748b" font-size="12.5" text-anchor="middle">
+    前导缺失的维度（b、v）会自动在<strong>左边补 1</strong>，再参与广播（图中虚线框）</text>
+  <text x="430" y="252" fill="#64748b" font-size="12.5" text-anchor="middle">
+    所以 [3,1,1] 实际等价于 [1, 1, 3, 1, 1]，正好对齐 [b, v, 3, H, W]</text>
+  <text x="430" y="286" fill="#059669" font-size="13" text-anchor="middle" font-weight="600">
+    结果 shape = [b, v, 3, H, W]　（取各维最大值）</text>
+</svg>
+<figcaption>图 7 · 五维实战的对齐阶梯。左：写 <code>[3]</code> → 3 掉到宽度维，崩溃；右：写 <code>[3,1,1]</code>（左补 1）→ 3 落在通道维，正确。</figcaption>
+</div>
+
+<div class="callout red">
+  <strong>为什么 EcoSplat 现在「看着没出错」？</strong><br>
+  因为它用的 <code>mean = (0.5, 0.5, 0.5)</code> —— <strong>三个数完全相等</strong>。
+  即使错按「列/W」去减，减出来的数值和按「通道」减<strong>一模一样</strong>。
+  但真实图像 W=256，写 <code>[3]</code> 会<strong>直接崩溃</strong>；
+  而一旦换成 ImageNet 那套 <code>mean=(0.485, 0.456, 0.406)</code>（三个数不同），
+  写 <code>[3]</code> 就会<strong>静默算错</strong>——比崩溃更危险。
+  所以 <code>view(-1, 1, 1)</code> 是正确性保险，不是可选项。
+</div>
+
+<!-- ================= 9 ================= -->
+<h2>9. 广播不占内存：stride = 0 的把戏</h2>
+
+<p>你可能会想：把 <code>[3,1,1]</code> 铺成 <code>[2,4,3,256,256]</code>，那不是要复制出 150 万份吗？
+<strong>不会</strong>——PyTorch 只存那 3 个数，用 <code>stride=0</code> 让「访问第 i 个位置」时始终跳回同一个地址：</p>
+
+<pre>a = torch.tensor([0.1, 0.2, 0.3]).view(3, 1, 1)
+b = a.expand(3, 256, 256)     # 逻辑上变大，但…
+b.storage().size()            # → 3      ← 内存里依然只有 3 个数！
+b.stride()                    # → (1, 0, 0)  ← 后两维步长是 0 = 永远读同一个数</pre>
+
+<p>所以广播是<strong>零额外内存、零拷贝</strong>的——它只是改变了「怎么读」，没有改变「存了什么」。</p>
+
+<!-- ================= 10 ================= -->
+<h2>10. 结果形状速查 + 常见报错</h2>
+
+<h3>结果形状口诀</h3>
+<div class="mbox">
+  <span class="hl">结果[i] = max(A.shape[i], B.shape[i])　　（右对齐后逐维取最大）</span>
+</div>
+
+<h3>常见报错</h3>
+<table>
+  <tr><th>报错</th><th>含义</th><th>排查</th></tr>
+  <tr><td><code>The size of tensor a (256) must match the size of tensor b (3) at non-singleton dimension 4</code></td>
+      <td>第 4 维（从 0 数，即最后一维）上 256 和 3 不匹配</td>
+      <td>你的常数张量少写了 <code>.view(-1,1,1)</code>，导致维度掉到 W 上</td></tr>
+  <tr><td><code>operands could not be broadcast together with shapes (2,3) (4,)</code></td>
+      <td>一维的 4 对不上二维的列 3</td>
+      <td>确认这个向量到底是「行」还是「列」，必要时 <code>unsqueeze</code></td></tr>
+</table>
+
+<h3>实用技巧</h3>
+<ul>
+  <li>不确定时，先 <code>print(a.shape, b.shape)</code>，然后<strong>手动右对齐画一遍</strong></li>
+  <li>想主动控制方向：用 <code>unsqueeze(-1)</code> 加一个尾维（变成列），
+      <code>unsqueeze(0)</code> 加一个首维（变成行）</li>
+  <li>调试神器：<code>torch.broadcast_shapes(a.shape, b.shape)</code> 直接告诉你结果形状，或抛错告诉你哪一维不匹配</li>
+</ul>
+
+<!-- ================= 11 ================= -->
+<h2>11. 自测</h2>
+
+<ol class="steps">
+  <li><code>torch.ones(2,3,4) + torch.ones(4)</code> 的结果形状是？</li>
+  <li><code>torch.ones(2,3,4) + torch.ones(3,1)</code> 的结果形状是？</li>
+  <li>要把 shape <code>(3,)</code> 的向量加到 <code>(2,3,4)</code> 的<strong>第 1 维（长度 3）</strong>上，该怎么写？</li>
+  <li>为什么 <code>image - mean</code> 里 <code>mean</code> 用 <code>[3,1,1]</code> 而不是 <code>[3,H,W]</code>？</li>
+</ol>
+
+<details>
+  <summary>答案</summary>
+  <p><strong>1.</strong> <code>(2, 3, 4)</code>。右对齐：<code>(4)</code> 匹配最后一维 4，前两维视为 1 拉伸。</p>
+  <p><strong>2.</strong> <code>(2, 3, 4)</code>。右对齐：<code>(3,1)</code> 的 1 匹配最后一维 4（拉伸到 4），3 匹配中间维 3（相等），首维 2 补 1 拉伸。
+     注意：这里的 3 必须恰好等于中间维的 3，否则报错。</p>
+  <p><strong>3.</strong> 需要把 <code>(3,)</code> 变成 <code>(1, 3, 1)</code>，即 <code>mean.view(1, 3, 1)</code>（或 <code>mean[None, :, None]</code>）。
+     这样右对齐后 3 落在中间维，首尾两个 1 分别拉伸到 2 和 4。</p>
+  <p><strong>4.</strong> 因为归一化是「每通道一个<strong>全局常数</strong>」——同一通道的所有像素减同一个数。
+     用 <code>[3,H,W]</code> 会变成「每个像素一个不同的数」，那不是归一化，而且要多存 19 万个值。
+     <code>[3,1,1]</code> 既语义正确，又只用 3 个数的内存。</p>
+</details>
+
+<div class="callout green">
+  <strong>回到开头那行代码</strong>：
+  <code>mean.view(-1, 1, 1)</code> 做的不是数学，而是<strong>「对齐说明书」</strong>——
+  告诉 PyTorch「这个 3 是通道维的，别去匹配宽度」。<br>
+  右对齐规则决定了：不写它，3 就会掉到最后一维（宽度）上去。
+</div>
+
+</div>
+</body>
+</html>
