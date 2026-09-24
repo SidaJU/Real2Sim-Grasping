@@ -235,7 +235,7 @@ UsdPhysics.MassAPI.Apply(obj).GetMassAttr().Set(0.5)
 
 ## 版本库说明（换一台电脑继续做）
 
-本仓库只存放**个人产出**，方便在任意电脑上 clone 后继续学、继续做。
+本仓库存放**个人产出 + 一份上游源码快照**，方便在任意电脑上 clone 后继续学、继续做。
 
 | 入库内容 | 说明 |
 |---|---|
@@ -248,9 +248,15 @@ UsdPhysics.MassAPI.Apply(obj).GetMassAttr().Set(0.5)
 
 | 排除项 | 原因 |
 |---|---|
-| `ecoSplat/`、`dust3r/` | 上游仓库克隆，自带 `.git`（放进仓库会被当成 submodule，文件传不上去）；且 `ecoSplat` 含 845MB 权重，远超 GitHub 单文件 100MB 上限 |
+| `ecoSplat/` | **本地运行用的克隆**，自带 `.git`（放进仓库会被当成 submodule，文件传不上去）；且含 845MB 权重 |
+| `dust3r/` | 上游仓库克隆，自带 `.git` |
 | `results/` | 训练产物（183MB ckpt + 60MB ply） |
 | `*.log`、`*.err` | 过程日志 |
+
+> **源码怎么看**：仓库里有 `ecoSplat-src/` —— 它是 `ecoSplat/` 的**源码快照**
+> （剥掉 `.git`、排除 845MB 权重与生成的 datasets，约 11 MB）。
+> 笔记里引用的行号、路径都对应这份快照，所以在 GitHub 网页上直接读 `ecoSplat-src/` 即可，
+> 不必自己 clone 上游。本地要跑代码则继续用被 gitignore 的 `ecoSplat/` 克隆。
 
 ### 换电脑后复原环境
 
