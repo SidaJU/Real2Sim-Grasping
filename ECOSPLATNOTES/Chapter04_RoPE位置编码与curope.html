@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 04 · RoPE 位置编码与 curope 算子</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.84rem; line-height:1.62; font-family:Consolas,"Courier New",monospace}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:14px 0}
+  th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  table.code td:nth-child(2){font-family:Consolas,"Courier New",monospace; font-size:.82rem; white-space:pre-wrap}
+  table.code td:nth-child(1){width:44px; color:#94a3b8; font-family:Consolas,monospace}
+  details{background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 16px; margin:10px 0}
+  summary{cursor:pointer; font-weight:600; color:var(--indigo)}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+  .filetag{display:inline-block; background:#0f172a; color:#e2e8f0; font-family:Consolas,monospace;
+           font-size:.78rem; padding:3px 9px; border-radius:5px; margin-bottom:6px}
+  .mbox{font-family:"Cambria Math",Georgia,serif; font-size:1.05rem; text-align:center; margin:16px 0}
+  .mbox .hl{background:var(--indigo-soft); border:1.5px solid var(--indigo); border-radius:8px;
+            display:inline-block; padding:8px 22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Chapter 04 · RoPE 位置编码与 curope 算子</h1>
+  <div class="sub">
+    承接 Ch.01（patchify 出 pos）与 Ch.02 / Ch.03（attention 怎么算）。<br>
+    本章 <strong>不复述</strong> self-attention 的流程 —— 只回答一个 Ch.02/03 一直悬着的问题：
+    <strong>那个 <code>[B, N, 2]</code> 的整数坐标，到底在哪一步、怎么被用掉的？</strong>
+  </div>
+</header>
+
+<!-- ================= 0 ================= -->
+<h2>0. 承接：从 patch_embed 出来的数据怎么流动</h2>
+
+<p>先把全景路线摆出来（这张表就是本章的地图）：</p>
+
+<pre>输入图像 (b·v, 3, 256, 256)
+   │
+   │  ① patch_embed（Ch.01 已讲）
+   ▼
+x: (b·v, 256, 1024)      pos: (b·v, 256, 2)         ← 256 个 patch，每个 1024 维
+   │
+   │  ② 拼上「内参 token」（本节细讲）
+   ▼
+x: (b·v, 257, 1024)      pos: (b·v, 257, 2)         ← 257 = 256 + 1
+   │
+   │  ③ for blk in self.enc_blocks × 24   ← Ch.02 讲过的 Block（self-attention）
+   │     每次都把 pos 一起传进去：blk(x, pos)
+   ▼
+x: (b·v, 257, 1024)
+   │
+   │  ④ enc_norm（LayerNorm 收尾）
+   ▼
+Encoder 输出 → reshape 成 (b, v, 257, 1024)
+   │
+   │  ⑤ decoder_embed: Linear(1024 → 768)
+   │  ⑥ for blk in dec_blocks / dec_blocks2 × 12   ← Ch.03 讲的 DecoderBlock（self + cross）
+   ▼
+Decoder 输出 (b, v, 257, 768)
+   │
+   │  ⑦ 裁掉那个内参 token：dec_feat[i][:, :, :P]
+   ▼
+送进 DPT / pose 等输出头</pre>
+
+<h3>0.1 256 → 257：多出来的那一维是什么</h3>
+
+<p>它是一个<strong>代表相机内参的额外 token</strong>（“内参 token”）。相机内参矩阵 K 是 3×3：</p>
+
+<pre>                    [ fx   0   cx ]
+K (每个视角一个) =  [  0  fy   cy ]        形状 (b, v, 3, 3)
+                    [  0   0    1 ]
+
+      ↓ context["intrinsics"].flatten(2)         把最后两维摊平
+   (b, v, 9)                                     ← 9 个数字
+
+      ↓ self.intrinsic_encoder = nn.Linear(9, 1024)
+   (b, v, 1024)                                  ← 升到和 token 一样的 1024 维
+
+      ↓ rearrange("b v c -> (b v) c").unsqueeze(1)
+   (b·v, 1, 1024)                                ← 变成【1 个】token
+
+      ↓ torch.cat((x, intrinsics_embed), dim=1)
+   (b·v, 257, 1024)                              ← 256 个图像 patch + 1 个内参 token</pre>
+
+<span class="filetag">src/model/encoder/backbone/backbone_croco_multiview.py · 第 226–228、146–155 行</span>
+
+<pre>226  if self.intrinsics_embed_loc == 'encoder' and (self.intrinsics_embed_type == 'token' or ...):
+227      intrinsic_embedding = self.intrinsic_encoder(context["intrinsics"].flatten(2))
+228      intrinsic_embedding_all = rearrange(intrinsic_embedding, "b v c -> (b v) c").unsqueeze(1)
+
+150  elif self.intrinsics_embed_type == 'token':
+151      x = torch.cat((x, intrinsics_embed), dim=1)          # 256 → 257
+152      add_pose = pos[:, 0:1, :].clone()                    # 抄第 0 个 token 的坐标
+153      add_pose[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)   # 行号 = 最后一行 + 1
+154      pos = torch.cat((pos, add_pose), dim=1)              # 256 → 257</pre>
+
+<p>它也要有个网格坐标才能参与 RoPE，所以第 152–154 行给它造了一个：
+<strong>行号 = 网格最后一行 + 1，列号 = 0</strong>（比如 16×16 网格，它就坐在 <code>(16, 0)</code>，
+相当于在图像下方新开了一行挂上去）。</p>
+
+<div class="callout amber">
+  <strong>它的命运：只看不输出</strong>
+  <p style="margin:6px 0 0">这个 token 会跟着走完 24 层 Encoder 和 12 层 Decoder，
+  让每层都知道"这张图是用什么相机拍的"；但最后会被裁掉：</p>
+  <pre style="margin:8px 0 0">248  dec_feat[i] = dec_feat[i][:, :, :P]     # P 就是 patch_embed 出来的原始 token 数（256）</pre>
+  <p style="margin:6px 0 0">因为 DPT head 要把它还原成<strong>逐像素</strong>的特征图，多一个"不是像素"的 token 会破坏形状。</p>
+</div>
+
+<h3>0.2 24 层 vs 12 层：self-attn 和 cross-attn 分别在哪</h3>
+
+<table>
+  <tr><th></th><th>Encoder</th><th>Decoder</th></tr>
+  <tr><td>层数</td><td><strong>24</strong>（enc_depth）</td><td><strong>12</strong>（dec_depth）</td></tr>
+  <tr><td>用的类</td><td><code>Block</code>（blocks.py:115）</td><td><code>DecoderBlock</code>（blocks.py:181）</td></tr>
+  <tr><td>有什么注意力</td><td><strong>只有 self-attn</strong></td><td>self-attn <strong>+ cross-attn</strong></td></tr>
+  <tr><td>子层个数</td><td>2（attn、MLP）</td><td>3（attn、cross-attn、MLP）</td></tr>
+  <tr><td>视角之间交流</td><td class="bad">完全没有</td><td class="ok">在这里发生</td></tr>
+  <tr><td>维度</td><td>1024，16 头 × 64</td><td>768，12 头 × 64</td></tr>
+</table>
+
+<p>所以：<strong>前 24 层每个视角各自闷头算，第 25 层起才开始互相看</strong>。
+（两种 attention 内部的 Q/K/V、多头、softmax 流程完全一致，见 Ch.02；cross-attn 的差别只是 Q 和 K/V 来自不同序列，见 Ch.03。本章不再重复。）</p>
+
+<h3>0.3 于是本章的问题来了</h3>
+
+<div class="callout red">
+  <strong>pos 从头到尾都没有被「加」到 x 上</strong>
+  <p style="margin:8px 0 0">注意这句断言：</p>
+  <pre style="margin:8px 0 0">157  assert self.enc_pos_embed is None     # 没有可加性的位置编码！</pre>
+  <p style="margin:8px 0 0">它只是每层作为一个参数被传进去：<code>for blk in self.enc_blocks: x = blk(x, pos)</code>。
+  <strong>那 pos 在 Attention 里被拿去做了什么？—— 这就是本章的全部内容。</strong></p>
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1. 位置编码的两种思路：加上去 vs 转一下</h2>
+
+<table>
+  <tr><th></th><th>方案 A：加性位置编码</th><th>方案 B：RoPE（EcoSplat 用的）</th></tr>
+  <tr><td>做法</td><td>造一个和 token 同维的向量，<code>x = x + pos_emb</code></td>
+      <td>不改 x，而是<strong>把 q、k 向量旋转一个角度</strong></td></tr>
+  <tr><td>时机</td><td>进网络前加一次，之后就融进内容里了</td>
+      <td><strong>每次算 attention 前</strong>，在 Attention 内部临时转一下</td></tr>
+  <tr><td>参数</td><td>有（可学习）或固定（sin/cos）</td><td><strong>零参数</strong>，纯公式算 cos/sin</td></tr>
+  <tr><td>编码的是</td><td>绝对位置</td><td><strong>相对位置</strong>（见 §4 的验证）</td></tr>
+  <tr><td>对分辨率</td><td>训练时的长度固定，换分辨率要插值</td><td>任意长度都能算，<strong>天然支持变分辨率</strong></td></tr>
+</table>
+
+<p>EcoSplat 用 RoPE 的理由很实际：多视角输入分辨率经常变（256 / 512 / 非方形），
+而且希望注意力能表达"相对位置"—— 跨视角匹配时，"你在我左边 3 格"比"我在第 5 列"更有用。</p>
+
+<p>配置里 <code>pos_embed='RoPE100'</code> 的 100 就是频率基数：</p>
+
+<pre>61  freq = float(pos_embed[len('RoPE'):])    # 'RoPE100' → 100.0
+62  self.rope = RoPE2D(freq=freq)</pre>
+
+<h3>1.1 用 256×256 与 64×64 讲透：为什么换分辨率会让「加性」崩掉</h3>
+
+<h4>① 先确认一件事：图像的形状在进 transformer 前就被抹平了</h4>
+
+<pre>256×256 的图：
+    (b·v, 3, 256, 256)
+    → patchify（每格 16×16）→ 16×16 = 256 个格子
+    → 每格 768 个数 → Linear → 1024 维
+    → (b·v, 256, 1024)  → 拼内参 token → (b·v, 257, 1024)
+
+64×64 的图：
+    (b·v, 3, 64, 64)
+    → 4×4 = 16 个格子
+    → (b·v, 16, 1024)  → 拼内参 token → (b·v, 17, 1024)
+
+【关键】不管多少格，最后都排成【一队】进 transformer。
+      网络看到的只是一排 1024 维的向量 —— 只要最后一维是 1024，就能输入。</pre>
+
+<h4>② 输入形状里的三个维度各管什么</h4>
+
+<table>
+  <tr><th>维度</th><th>含义</th><th>由什么决定</th><th>和分辨率有关吗</th></tr>
+  <tr><td><strong>B</strong></td><td>一次处理多少条<strong>独立序列</strong>（EcoSplat 里是 b×v，视角也被塞进这一维）</td>
+      <td>你一次喂几张图</td><td class="ok">无关</td></tr>
+  <tr><td><strong>N</strong></td><td>每条序列里有多少个 token</td><td>每张图多大</td><td class="bad">有关</td></tr>
+  <tr><td><strong>C = 1024</strong></td><td>每个 token 的特征维度</td><td>网络结构定死</td><td class="ok">无关（永远不变）</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>"B 和分辨率无关"要分两层说</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>计算上确实无关</strong>：<strong>不同 batch 样本之间零交互</strong> ——
+        第 0 个样本永远看不到第 1 个样本的图。B=1 和 B=32 算出来的单样本结果一模一样，
+        B 只影响"一次算几条"和显存。<br>
+        （这也正是 Ch.03 那句"Encoder 阶段视角之间不说话"的原因 —— 那时视角被塞进了 B 这一维。）</li>
+    <li><strong>但有个工程约束</strong>：同一个 batch 内所有序列的 <strong>N 必须相同</strong>，
+        否则没法 stack 成一个稠密张量。所以"分辨率无关"是说<strong>换个 batch 可以换分辨率</strong>，
+        不是同一批里能混着放 256×256 和 64×64。</li>
+  </ol>
+</div>
+
+<div class="callout red">
+  <strong>⚠️ 别误会"零交互"：跨视角是要跨的，只是不跨 batch 样本</strong>
+  <table style="margin:10px 0 0">
+    <tr><th>跨什么</th><th>发生吗</th><th>在哪发生</th></tr>
+    <tr><td>跨 <strong>batch 样本</strong>（第 0 个样本 ↔ 第 1 个样本）</td>
+        <td class="bad">从不</td><td>—</td></tr>
+    <tr><td>跨 <strong>视角</strong>（同一个场景的不同图）</td>
+        <td class="ok">发生</td><td>Decoder 的 cross-attention</td></tr>
+    <tr><td>跨 <strong>token</strong>（同一条序列内）</td>
+        <td class="ok">发生</td><td>self-attention（Encoder + Decoder）</td></tr>
+  </table>
+  <p style="margin:10px 0 0"><strong>"跨视角"是怎么做到的？</strong>靠 <code>generate_ctx_views</code> 把其他视角的 token
+  <strong>拼进 N 这一维</strong>（<code>(b, v, L, C) → (b, v, (v-1)*L, C)</code>）：</p>
+  <pre style="margin:8px 0 0">  q   : (b,     L, C)     ← 第 i 个视角自己的 257 个 token
+  k/v : (b, (v-1)L, C)    ← 其他视角拼起来的 514 个 token
+
+  scores : (b, 12, 257, 514)
+            ↑            ↑    ↑
+            │            │    └ context 长度 = (v-1) × L
+            │            └ query 长度 = L
+            └ 同一个 batch 下标 —— 第 0 个样本只用自己的其他视角，
+              绝不会看到第 1 个样本的图</pre>
+  <p style="margin:8px 0 0">所以 Ch.03 那句"Encoder 阶段视角之间不说话"依然成立 —— 那时 v 被塞在 batch 维
+  （<code>(b*v, L, C)</code>）；<strong>是 Decoder 把它拆回 <code>(b, v, L, C)</code>，才让视角之间开始对话。</strong></p>
+</div>
+
+<h4>③ 加性位置编码：错在「座位牌对应的空间位置会变」</h4>
+
+<p>它是一套按<strong>展平后的序号</strong>发的座位牌 <code>PE[0] … PE[255]</code>，
+每张图进来都从头领一遍。问题在于 —— <strong>第 k 张牌代表哪个空间位置，取决于网格有多宽</strong>：</p>
+
+<pre>16×16 网格（256 个 patch），按行展平：
+   第 0 个 → (行0, 列0)
+   第 5 个 → (行0, 列5)      ← 还在第 0 行
+   第 15 个 → (行0, 列15)     ← 第 0 行最后一个
+   第 16 个 → (行1, 列0)      ← 这里才换行
+
+4×4 网格（16 个 patch），同样按行展平：
+   第 0 个 → (行0, 列0)
+   第 5 个 → (行1, 列1)      ← 已经换到第二行了！
+   第 15 个 → (行3, 列3)
+
+同一个 PE[5]：
+   在 16×16 网格里 = 第 0 行第 5 列（上排偏右）
+   在  4×4  网格里 = 第 1 行第 1 列（正中间）
+   → 同一张牌，两个完全不同的空间位置 ❌</pre>
+
+<div class="callout red">
+  <strong>两个方向都会出问题</strong>
+  <ul style="margin:8px 0 0 18px">
+    <li><strong>变短（256 → 16）</strong>：能跑，但只有前 4 个位置（<code>PE[0..3]</code>，都还在第 0 行）碰巧是对的，
+        <strong>从第 4 个开始全部串位</strong> —— 网络拿到的是错乱的地址。</li>
+    <li><strong>变长（16 → 256）</strong>：需要 <code>PE[16] … PE[255]</code>，表里<strong>根本没有</strong>，
+        直接越界报错（权重形状也加载不进去）。</li>
+  </ul>
+  <p style="margin:6px 0 0">sin/cos 那种固定公式的加性编码虽然"能算"，但同样有语义错位，
+  所以换分辨率必须靠<strong>插值</strong>把表拉伸 —— 是近似，会掉点。</p>
+</div>
+
+<h4>④ RoPE 为什么躲开了这个坑（两个理由）</h4>
+
+<p><strong>理由一：它用「二维坐标」，不用「展平序号」</strong></p>
+
+<pre>RoPE 拿到的 pos 是 (row, col)，不是"第几个"。
+
+   16×16 网格里第 5 个 token → pos = (0, 5)
+    4×4  网格里第 5 个 token → pos = (1, 1)
+
+   → 坐标本身就不同，所以不会串位。
+     加性编码把这两者都当成"第 5 号"，才出的事。</pre>
+
+<p><strong>理由二（更根本）：它编码的是「相对位移」</strong></p>
+
+<pre>16×16 网格：token A 在 (5,5)，token B 在 (6,6)  → 位移 = (1,1)
+ 4×4  网格：token A 在 (1,1)，token B 在 (2,2)  → 位移 = (1,1)
+
+→ §4.8 的验证表已经算过：位移相同 → 点积完全相同
+  （位移 1 格 → 54.175050，不管绝对位置在哪）
+
+   所以网络学到的是「位移 1 格是什么感觉」—— 这个知识在 4×4 和 16×16 里完全通用。
+   加性编码学到的是「第 5 号座位是什么感觉」—— 换个网格大小就作废。</pre>
+
+<h4>⑤ 对照表</h4>
+
+<table>
+  <tr><th></th><th>加性位置编码</th><th>RoPE</th></tr>
+  <tr><td>依据</td><td>展平序号「我是第几个」</td><td>二维坐标 + <strong>相对位移</strong></td></tr>
+  <tr><td>16×16 → 4×4（变短）</td><td class="bad">从第 4 个起串位</td><td class="ok">坐标照算，没问题</td></tr>
+  <tr><td>4×4 → 16×16（变长）</td><td class="bad">越界，表里没有那些行</td><td class="ok">坐标照算（外推，能跑但会掉点）</td></tr>
+  <tr><td>换分辨率要做什么</td><td>插值拉伸表（近似、掉点）</td><td class="ok"><strong>什么都不用做</strong>，多算/少算几行</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>一句话</strong>
+  <p style="margin:6px 0 0">加性位置编码发的是「<strong>我是第几号</strong>」的座位牌 ——
+  号牌的含义取决于一共多少个位置，换分辨率就串位；<br>
+  RoPE 发的是「<strong>你离我多远</strong>」的尺子 ——
+  距离这个量在任何大小的图里都是同一个意思，所以换个分辨率照用。</p>
+</div>
+
+<!-- ================= 2 ================= -->
+<h2>2. 最简例子：一个 2 维向量怎么被"转"</h2>
+
+<p>先忘掉 Transformer。就一个 2 维向量 <code>[a, b]</code>，把它当成平面上的一个点，
+按角度 θ 转一下：</p>
+
+<div class="mbox"><span class="hl">旋转后 = [a·cosθ − b·sinθ ,&nbsp; a·sinθ + b·cosθ]</span></div>
+
+<pre>例：[a, b] = [1, 0]，θ = 90°
+    → [1·0 − 0·1, 1·1 + 0·0] = [0, 1]        ← 确实转了 90°
+
+角度从哪来？θ = 位置 × 频率
+    位置 0 → θ = 0
+    位置 1 → θ = ω
+    位置 2 → θ = 2ω       ← 位置越远，转得越多</pre>
+
+<p>关键性质（也是 RoPE 的全部意义）：</p>
+
+<div class="callout green">
+  <strong>两个向量各自转过之后再做点积，结果只跟它们的【位置差】有关</strong>
+  <p style="margin:8px 0 0">设 q 在位置 p₁、k 在位置 p₂，各自转了 p₁ω 和 p₂ω。
+  点积展开后，所有含"绝对位置"的项会抵消，只剩下 <code>(p₁ − p₂)ω</code> 这一项。<br>
+  → 网络从点积里<strong>只能读出相对距离</strong>，这正是我们想要的。</p>
+</div>
+
+<!-- ================= 3 ================= -->
+<h2>3. 2D RoPE：行、列各占一半维度</h2>
+
+<p>图像是二维的，所以要同时编码行和列。做法很朴素：<strong>把 head_dim 劈成两半</strong>。</p>
+
+<pre>head_dim = 64 为例：
+
+  ┌─────────────── 前 32 维 ───────────────┬──────────── 后 32 维 ────────────┐
+  │        用【行号 row】去转                │        用【列号 col】去转          │
+  └────────────────────────────────────────┴──────────────────────────────────┘
+
+  每一半内部再分成若干「频率组」，每组 2 个维度配成一对，各转不同的角度：
+      第 1 对：ω 最大（转得快，管近距离）
+      第 2 对：ω 小一些
+      …
+      最后一对：ω 最小（转得慢，管远距离）
+  → 不同频率合起来，就能表达各种距离，和 sin/cos 位置编码的多尺度是一个思路</pre>
+
+<h3>3.1 rotate_half：怎么"转"半个向量</h3>
+
+<span class="filetag">src/model/encoder/backbone/croco/pos_embed.py · 第 131–134 行</span>
+
+<pre>131  @staticmethod
+132  def rotate_half(x):
+133      x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+134      return torch.cat((-x2, x1), dim=-1)</pre>
+
+<p>就是：把后半段搬前面、取负，前半段搬后面。相当于把所有"对子"同时转 90°。</p>
+
+<pre>例：x = [1, 2, 3, 4]
+    前半 = [1, 2]，后半 = [3, 4]
+    rotate_half(x) = [-3, -4, 1, 2]</pre>
+
+<!-- ================= 4 ================= -->
+<h2>4. 用「我 / 爱 / 中国」走一遍：RoPE 加在哪一步</h2>
+
+<p>直接沿用 Ch.02 的那个例子：3 个 token、4 维、单头（head_dim = 4）、
+<code>W_k = I</code>、<code>W_v = 2I</code>、除以 √4 = 2。</p>
+
+<p>RoPE 是 <strong>2D</strong> 的，而句子是 1D 的 —— 所以把这三个词当成「<strong>1 行 3 列</strong>」的网格：</p>
+
+<pre>pos(我)   = (row=0, col=0)
+pos(爱)   = (row=0, col=1)
+pos(中国) = (row=0, col=2)
+
+→ 前 2 维（用 row）全都不转（row 都是 0）
+→ 后 2 维（用 col）分别按 0 / 1 / 2 转   ← 效果看得最清楚
+
+沿用 Ch.02 的三个权重：
+
+      [ 10   2   3   0 ]                          [ 2  0  0  0 ]
+W_q = [  1  15   4   0 ]     W_k = I（单位阵）     W_v = [ 0  2  0  0 ] = 2I
+      [  2   3  12   0 ]                          [ 0  0  2  0 ]
+      [  0   0   0   1 ]                          [ 0  0  0  2 ]</pre>
+
+<h3>4.1 第 1 步：照常算 Q / K / V（完全不涉及位置）</h3>
+
+<pre>这一步和 Ch.02 一字不差 —— RoPE 是【之后】才介入的。
+
+  X = [ 1  0  0  0 ]     ← 我
+      [ 0  1  0  0 ]     ← 爱
+      [ 0  0  1  0 ]     ← 中国
+
+  Q = X · W_q = [ 10   2   3   0 ]
+                [  1  15   4   0 ]
+                [  2   3  12   0 ]
+
+  K = X · W_k = X = [ 1  0  0  0 ]
+                    [ 0  1  0  0 ]
+                    [ 0  0  1  0 ]
+
+  V = X · W_v = 2X = [ 2  0  0  0 ]
+                     [ 0  2  0  0 ]
+                     [ 0  0  2  0 ]</pre>
+
+<h3>4.2 第 2 步：算出 cos / sin 表（只算一次，之后查表）</h3>
+
+<div class="callout red">
+  <strong>先解开最大的困惑：Q 是 (3,4)，为什么表只有 (3,2)？</strong>
+  <p style="margin:8px 0 0"><strong>因为表不是给整个 Q 用的，是给「半个 Q」用的。</strong><br>
+  RoPE 要把 4 个维度<strong>劈成两半</strong>：前 2 维编码「行」、后 2 维编码「列」。
+  每一半都是 (3, 2)，而表就是 (3, 2) —— <strong>行数跟着位置数、列数跟着半个向量的维度</strong>。</p>
+</div>
+
+<div class="fig">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="26" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">图 A · Q 是 (3,4)，按【维度】竖切成两半 → 各变成 (3,2)</text>
+
+  <text x="184" y="52" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">Q（3 行 = 3 个 token，4 列 = 4 个维度）</text>
+  <text x="108" y="64" fill="#64748b" font-size="10.5" text-anchor="middle">dim0</text>
+  <text x="184" y="64" fill="#64748b" font-size="10.5" text-anchor="middle">dim1</text>
+  <text x="260" y="64" fill="#64748b" font-size="10.5" text-anchor="middle">dim2</text>
+  <text x="336" y="64" fill="#64748b" font-size="10.5" text-anchor="middle">dim3</text>
+
+  <rect x="70" y="72" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="146" y="72" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="222" y="72" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="298" y="72" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="108" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">10</text>
+  <text x="184" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">2</text>
+  <text x="260" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">3</text>
+  <text x="336" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+
+  <rect x="70" y="114" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="146" y="114" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="222" y="114" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="298" y="114" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="108" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">1</text>
+  <text x="184" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">15</text>
+  <text x="260" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">4</text>
+  <text x="336" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+
+  <rect x="70" y="156" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="146" y="156" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="222" y="156" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="298" y="156" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="108" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">2</text>
+  <text x="184" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">3</text>
+  <text x="260" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">12</text>
+  <text x="336" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+
+  <line x1="222" y1="64" x2="222" y2="204" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6 4"/>
+  <text x="222" y="218" fill="#dc2626" font-size="11.5" font-weight="700" text-anchor="middle">从这里劈开</text>
+
+  <text x="146" y="240" fill="#2563eb" font-size="12" font-weight="700" text-anchor="middle">前 2 维 → 用【行号 row】转</text>
+  <text x="298" y="240" fill="#16a34a" font-size="12" font-weight="700" text-anchor="middle">后 2 维 → 用【列号 col】转</text>
+
+  <line x1="382" y1="118" x2="424" y2="118" stroke="#64748b" stroke-width="2"/>
+  <polygon points="426,118 416,113 416,123" fill="#64748b"/>
+  <line x1="596" y1="118" x2="638" y2="118" stroke="#64748b" stroke-width="2"/>
+  <polygon points="640,118 630,113 630,123" fill="#64748b"/>
+
+  <rect x="430" y="72" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="506" y="72" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="468" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">10</text>
+  <text x="544" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">2</text>
+  <rect x="430" y="114" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="506" y="114" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="468" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">1</text>
+  <text x="544" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">15</text>
+  <rect x="430" y="156" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="506" y="156" width="76" height="42" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="468" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">2</text>
+  <text x="544" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">3</text>
+  <text x="506" y="224" fill="#2563eb" font-size="12" font-weight="700" text-anchor="middle">Q 的前半 (3,2)</text>
+  <text x="506" y="240" fill="#64748b" font-size="10.5" text-anchor="middle">配「行号」，查表用 row</text>
+
+  <rect x="644" y="72" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="720" y="72" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="682" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">3</text>
+  <text x="758" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+  <rect x="644" y="114" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="720" y="114" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="682" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">4</text>
+  <text x="758" y="140" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+  <rect x="644" y="156" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <rect x="720" y="156" width="76" height="42" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="682" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">12</text>
+  <text x="758" y="182" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">0</text>
+  <text x="720" y="224" fill="#16a34a" font-size="12" font-weight="700" text-anchor="middle">Q 的后半 (3,2)</text>
+  <text x="720" y="240" fill="#64748b" font-size="10.5" text-anchor="middle">配「列号」，查表用 col</text>
+</svg>
+<figcaption>图 A · 4 个维度一分为二：一半负责「行」，一半负责「列」。表只要覆盖其中一半，所以是 (3,2) 而不是 (3,4)。</figcaption>
+</div>
+
+<h4>① 三个公式（源码 pos_embed.py:120-127）</h4>
+
+<pre>记号：head_dim = 每个头的维度（本例 4，真实 64）
+      base     = 频率基数（配置 RoPE100 → 100.0）
+      D        = head_dim // 2          ← 【半长】= 图 A 里每一半的维度数
+      seq_len  = int(positions.max()) + 1
+
+公式 1（频率，第 122 行）：inv_freq[j] = 1 / base^(j/D)      j = 0, 2, 4, …, D-2
+                            一共 D/2 个（步长是 2）
+
+公式 2（角度，第 123-125 行）：freqs[t][j] = t × inv_freq[j]
+                              再 cat 一份 → 凑满 D 列
+
+公式 3（表，第 126-127 行）：cos = freqs.cos()、sin = freqs.sin()</pre>
+
+<h4>② 形状怎么长出来的（一步一图）</h4>
+
+<pre>D = 4 // 2 = 2  →  每一半是 2 维  →  表就是 (行数 = 位置数, 列数 = 2)
+
+  arange(0, D, 2) = [0]                    形状 (D/2,)          = (1,)
+  inv_freq        = [1.0]                  形状 (1,)
+  t               = [0, 1, 2]              形状 (seq_len,)      = (3,)      ← 3 个位置
+  freqs = t ⊗ inv_freq                     形状 (seq_len, D/2)  = (3, 1)
+  cat(freqs, freqs)                        形状 (seq_len, D)    = (3, 2)
+  cos / sin                                形状 (3, 2)          ← 表的最终形状
+
+  seq_len = max(坐标) + 1 = 2 + 1 = 3</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="24" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">图 B · 表长什么样：行 = 位置，列 = 半个向量的维度</text>
+
+  <text x="295" y="44" fill="#d97706" font-size="11" text-anchor="middle" font-weight="700">列方向 = 半个向量的 2 个维度（D=2）</text>
+  <line x1="195" y1="52" x2="391" y2="52" stroke="#d97706" stroke-width="2"/>
+  <polygon points="395,52 385,47 385,57" fill="#d97706"/>
+
+  <text x="295" y="74" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">cos 表　(3, 2)</text>
+  <text x="245" y="94" fill="#64748b" font-size="10.5" text-anchor="middle">dim0</text>
+  <text x="345" y="94" fill="#64748b" font-size="10.5" text-anchor="middle">dim1</text>
+
+  <text x="183" y="122" fill="#64748b" font-size="10.5" text-anchor="end">t=0</text>
+  <rect x="195" y="106" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <rect x="295" y="106" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <text x="245" y="128" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">1.0000</text>
+  <text x="345" y="128" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">1.0000</text>
+
+  <text x="183" y="160" fill="#64748b" font-size="10.5" text-anchor="end">t=1</text>
+  <rect x="195" y="144" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <rect x="295" y="144" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <text x="245" y="166" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.5403</text>
+  <text x="345" y="166" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.5403</text>
+
+  <text x="183" y="198" fill="#64748b" font-size="10.5" text-anchor="end">t=2</text>
+  <rect x="195" y="182" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <rect x="295" y="182" width="100" height="34" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.3"/>
+  <text x="245" y="204" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">-0.4161</text>
+  <text x="345" y="204" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">-0.4161</text>
+
+  <line x1="120" y1="106" x2="120" y2="212" stroke="#4f46e5" stroke-width="2"/>
+  <polygon points="120,216 115,206 125,206" fill="#4f46e5"/>
+  <text x="110" y="140" fill="#4f46e5" font-size="11" text-anchor="end" font-weight="700">行方向</text>
+  <text x="110" y="156" fill="#4f46e5" font-size="10.5" text-anchor="end">= 位置 t</text>
+  <text x="110" y="172" fill="#4f46e5" font-size="10.5" text-anchor="end">共 3 行</text>
+  <text x="120" y="234" fill="#4f46e5" font-size="10.5" text-anchor="middle">( seq_len = 3 )</text>
+
+  <text x="655" y="74" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">sin 表　(3, 2)</text>
+  <text x="605" y="94" fill="#64748b" font-size="10.5" text-anchor="middle">dim0</text>
+  <text x="705" y="94" fill="#64748b" font-size="10.5" text-anchor="middle">dim1</text>
+
+  <text x="543" y="122" fill="#64748b" font-size="10.5" text-anchor="end">t=0</text>
+  <rect x="555" y="106" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <rect x="655" y="106" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <text x="605" y="128" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.0000</text>
+  <text x="705" y="128" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.0000</text>
+
+  <text x="543" y="160" fill="#64748b" font-size="10.5" text-anchor="end">t=1</text>
+  <rect x="555" y="144" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <rect x="655" y="144" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <text x="605" y="166" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.8415</text>
+  <text x="705" y="166" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.8415</text>
+
+  <text x="543" y="198" fill="#64748b" font-size="10.5" text-anchor="end">t=2</text>
+  <rect x="555" y="182" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <rect x="655" y="182" width="100" height="34" fill="#fffbeb" stroke="#d97706" stroke-width="1.3"/>
+  <text x="605" y="204" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.9093</text>
+  <text x="705" y="204" fill="#1e293b" font-size="11.5" text-anchor="middle" font-family="Consolas,monospace">0.9093</text>
+
+  <line x1="195" y1="226" x2="395" y2="226" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="295" y="244" fill="#dc2626" font-size="11" text-anchor="middle" font-weight="700">两列数值相同！</text>
+  <text x="560" y="244" fill="#64748b" font-size="11">← 因为 cat(freqs, freqs) 复制了一份（原因见下面 ③）</text>
+
+  <text x="430" y="272" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">一张表，两处用：Q 的前半用【行号】查它，Q 的后半用【列号】查它</text>
+  <text x="430" y="292" fill="#64748b" font-size="11" text-anchor="middle">查法完全一样，只是拿去查的「坐标」不同 —— 所以只需要一张 (3,2) 的表，不需要两张</text>
+</svg>
+<figcaption>图 B · 表就是一张「位置 → 该转多少」的查询表：每行对应一个位置，每列对应半个向量的一个维度。</figcaption>
+</div>
+
+<h4>③ 为什么两列数值相同（cat 复制一份的理由）</h4>
+
+<div class="callout amber">
+  <strong>因为旋转是「两个维度一对」地进行，一对必须共用同一个频率</strong>
+  <p style="margin:8px 0 0">回忆 <code>rotate_half([4, 0]) = [0, 4]</code>：
+  它把<strong>后半段</strong>搬到前面取负、<strong>前半段</strong>搬到后面。在半个向量内部，
+  <strong>第 i 维与第 i + D/2 维配成一对</strong>（本例 D=2 → dim0 ↔ dim1；真实 D=32 → dim_i ↔ dim_{i+16}）。</p>
+  <p style="margin:6px 0 0">两个维度要一起转，频率就必须一样，否则旋转矩阵不成立，
+  也就失去「点积只依赖位置差」的性质。所以要把 <code>freqs</code> 复制一份凑成 D 列 —— 这就是那行
+  <code>cat((freqs, freqs), dim=-1)</code>。</p>
+</div>
+
+<div class="fig">
+<svg viewBox="0 0 860 330" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="24" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">图 C · 查表全过程：以 token「爱」（第 2 行）为例</text>
+
+  <text x="105" y="62" fill="#2563eb" font-size="12" font-weight="700" text-anchor="middle">前半（用 row）</text>
+  <rect x="30" y="70" width="150" height="46" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8"/>
+  <text x="105" y="98" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">[ 1 , 15 ]</text>
+
+  <line x1="186" y1="93" x2="226" y2="93" stroke="#64748b" stroke-width="2"/>
+  <polygon points="228,93 218,88 218,98" fill="#64748b"/>
+
+  <rect x="232" y="70" width="130" height="46" rx="6" fill="#fff" stroke="#64748b" stroke-width="1.8"/>
+  <text x="297" y="89" fill="#64748b" font-size="10.5" text-anchor="middle">它的坐标</text>
+  <text x="297" y="107" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">row = 0</text>
+
+  <line x1="368" y1="93" x2="408" y2="93" stroke="#64748b" stroke-width="2"/>
+  <polygon points="410,93 400,88 400,98" fill="#64748b"/>
+
+  <rect x="414" y="62" width="196" height="62" rx="6" fill="#f8fafc" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="512" y="80" fill="#4f46e5" font-size="10.5" text-anchor="middle">查表第 0 行</text>
+  <text x="512" y="100" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">cos=[1, 1]</text>
+  <text x="512" y="117" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">sin=[0, 0]</text>
+
+  <line x1="616" y1="93" x2="656" y2="93" stroke="#64748b" stroke-width="2"/>
+  <polygon points="658,93 648,88 648,98" fill="#64748b"/>
+
+  <rect x="662" y="70" width="170" height="46" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="747" y="90" fill="#059669" font-size="10.5" text-anchor="middle">转完（没动）</text>
+  <text x="747" y="108" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">[ 1 , 15 ]</text>
+
+  <text x="105" y="178" fill="#16a34a" font-size="12" font-weight="700" text-anchor="middle">后半（用 col）</text>
+  <rect x="30" y="186" width="150" height="46" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.8"/>
+  <text x="105" y="214" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">[ 4 , 0 ]</text>
+
+  <line x1="186" y1="209" x2="226" y2="209" stroke="#64748b" stroke-width="2"/>
+  <polygon points="228,209 218,204 218,214" fill="#64748b"/>
+
+  <rect x="232" y="186" width="130" height="46" rx="6" fill="#fff" stroke="#64748b" stroke-width="1.8"/>
+  <text x="297" y="205" fill="#64748b" font-size="10.5" text-anchor="middle">它的坐标</text>
+  <text x="297" y="223" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">col = 1</text>
+
+  <line x1="368" y1="209" x2="408" y2="209" stroke="#64748b" stroke-width="2"/>
+  <polygon points="410,209 400,204 400,214" fill="#64748b"/>
+
+  <rect x="414" y="178" width="196" height="62" rx="6" fill="#f8fafc" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="512" y="196" fill="#4f46e5" font-size="10.5" text-anchor="middle">查表第 1 行</text>
+  <text x="512" y="216" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">cos=[0.5403, 0.5403]</text>
+  <text x="512" y="233" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">sin=[0.8415, 0.8415]</text>
+
+  <line x1="616" y1="209" x2="656" y2="209" stroke="#64748b" stroke-width="2"/>
+  <polygon points="658,209 648,204 648,214" fill="#64748b"/>
+
+  <rect x="662" y="186" width="170" height="46" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.8"/>
+  <text x="747" y="206" fill="#059669" font-size="10.5" text-anchor="middle">转完</text>
+  <text x="747" y="224" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">[ 2.1612 , 3.3660 ]</text>
+
+  <rect x="30" y="268" width="800" height="50" rx="6" fill="#0f172a"/>
+  <text x="430" y="290" fill="#e2e8f0" font-size="12" text-anchor="middle" font-family="Consolas,monospace">转完 = 原向量 × cos  +  rotate_half(原向量) × sin</text>
+  <text x="430" y="309" fill="#94a3b8" font-size="10.5" text-anchor="middle" font-family="Consolas,monospace">[2.1612, 3.3660] = [4, 0]×0.5403 + [0, 4]×0.8415</text>
+</svg>
+<figcaption>图 C · 同一个 token 的两半，查的是<b>同一张表</b>，只是拿去查的坐标不同（一个用 row、一个用 col）。</figcaption>
+</div>
+
+<h4>④ 表里的每个数字是怎么算出来的（逐格手算）</h4>
+
+<p>整张表<strong>没有任何可学习参数</strong>，就是三步纯算术：算频率 → 乘位置得角度 → 取 cos/sin。
+唯一的人为设定是 <code>base = 100</code>（来自配置 <code>RoPE100</code>）。</p>
+
+<pre>【第 1 步】算频率（本例只有 1 个）
+
+    D = 2
+    j 取 0（arange(0, 2, 2) = [0]）
+
+    inv_freq[0] = 1 / base^(j/D) = 1 / 100^(0/2) = 1 / 100^0 = 1 / 1 = 【1.0】
+
+    ⚠️ 真实（D = 32）时 j = 0,2,4,…,30，共 16 个：
+        1/100^0 = 1.0        1/100^(2/32)  = 0.749894
+        1/100^(4/32) = 0.562341    …    1/100^(30/32) = 0.013335
+        → 越往后频率越低（转得越慢）
+
+【第 2 步】位置 × 频率 = 角度（单位：弧度）
+
+    t = 0：  0 × 1.0 = 0.0      →  拼一份 → [0.0, 0.0]
+    t = 1：  1 × 1.0 = 1.0      →  拼一份 → [1.0, 1.0]
+    t = 2：  2 × 1.0 = 2.0      →  拼一份 → [2.0, 2.0]
+
+    1 弧度 ≈ 57.3°，2 弧度 ≈ 114.6°
+
+【第 3 步】取 cos / sin —— 一格一格填表
+
+    ── t = 0，角度 = 0.0 ──
+        cos(0.0) =  1.0000          sin(0.0) =  0.0000
+        → cos 第 0 行 = [ 1.0000,  1.0000 ]
+        → sin 第 0 行 = [ 0.0000,  0.0000 ]
+
+    ── t = 1，角度 = 1.0 ──
+        cos(1.0) =  0.5403          sin(1.0) =  0.8415
+        → cos 第 1 行 = [ 0.5403,  0.5403 ]
+        → sin 第 1 行 = [ 0.8415,  0.8415 ]
+
+    ── t = 2，角度 = 2.0 ──
+        cos(2.0) = -0.4161          sin(2.0) =  0.9093
+        → cos 第 2 行 = [-0.4161, -0.4161 ]
+        → sin 第 2 行 = [ 0.9093,  0.9093 ]
+
+【填完的表】—— 和图 B 完全一致
+
+        cos 表 (3,2)                    sin 表 (3,2)
+    t=0  [ 1.0000   1.0000 ]        [ 0.0000   0.0000 ]
+    t=1  [ 0.5403   0.5403 ]        [ 0.8415   0.8415 ]
+    t=2  [-0.4161  -0.4161 ]        [ 0.9093   0.9093 ]
+
+【验一遍】拿 t = 1 这行回代到图 C：
+
+    [4, 0] × 0.5403  +  rotate_half([4,0]) × 0.8415
+    = [4, 0] × 0.5403 + [0, 4] × 0.8415
+    = [2.1612, 0] + [0, 3.3660]
+    = [2.1612, 3.3660]      ✓ 与图 C 的输出一致</pre>
+
+<div class="callout green">
+  <strong>三个值得记住的点</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>零参数</strong>：表里没有一个是学出来的，全是 <code>base</code>、位置、维度三个数算出来的。
+        所以换分辨率时只要按新坐标再算一遍就行 —— 这就是 RoPE 支持多分辨率的根本原因。</li>
+    <li><strong>位置是整数，角度是连续量</strong>：坐标必须是整数（用来当行号），
+        但算出来的角度可以是任意实数。</li>
+    <li><strong>同一行的两列永远相同</strong>（本例）：因为只有 1 个频率、cat 复制了一份。
+        真实 D=32 时一行 32 个数，是 16 个频率复制一遍 —— 图 B 里标红的那句就是这个意思。</li>
+  </ol>
+</div>
+
+<h3>4.3 第 3 步：旋转 Q（每个 token 用自己的坐标）</h3>
+
+<div class="callout red">
+  <strong>先澄清一个误会：「col = 1」跟数值 4 在第几列毫无关系</strong>
+  <p style="margin:8px 0 0">这里有两个完全不同的「列」，千万别混：</p>
+  <table style="margin:10px 0 0">
+    <tr><th></th><th>是什么</th><th>本例</th></tr>
+    <tr><td><strong>网格坐标 col</strong></td>
+        <td>这个 token 坐在图像的第几列（从 0 数），来自 pos 的<strong>第 2 个数</strong></td>
+        <td>「爱」坐在第 1 列 → <code>col = 1</code></td></tr>
+    <tr><td><strong>向量的维度 dim</strong></td>
+        <td>q 向量里的第几个分量，是<strong>被旋转的那个数值</strong></td>
+        <td>数值 <code>4</code> 是 q2 的 dim2 分量</td></tr>
+  </table>
+  <p style="margin:8px 0 0">所以：<strong>4 是「要被转的数」，col = 1 是「转多少」的查表依据。</strong><br>
+  「爱」是第 2 个 token，它坐在网格的 <code>(row=0, col=1)</code>，因此它的后半要查表的<strong>第 1 行</strong> ——
+  跟 4 这个数值本身所在的位置没有半点关系。</p>
+</div>
+
+<h4>① 规则：对每个 token 独立执行这四小步</h4>
+
+<pre>对第 i 个 token，手上有三样东西：
+   a. q_i             ← Q 的第 i 行（4 维）
+   b. (r_i, c_i)      ← pos 的第 i 个坐标（2 个整数）
+   c. cos 表 / sin 表 ← §4.2 算好的 (3, 2)
+
+────────────────────────────────────────────
+第 1 小步：把 q_i 竖切成两半（按【维度】切，不是按 token 切）
+      前半 y = q_i 的 dim0、dim1      → 2 个数
+      后半 x = q_i 的 dim2、dim3      → 2 个数
+
+第 2 小步：各查各的表（前半用行号、后半用列号）
+      前半 → 拿 r_i 去查表第 r_i 行 → cos_y（2 个）、sin_y（2 个）
+      后半 → 拿 c_i 去查表第 c_i 行 → cos_x（2 个）、sin_x（2 个）
+
+第 3 小步：各算各的（两条形式完全相同的公式）
+      y' = y × cos_y  +  rotate_half(y) × sin_y
+      x' = x × cos_x  +  rotate_half(x) × sin_x
+
+      其中 rotate_half([a, b]) = [-b, a]
+      （把后半段搬到前面取负，前半段搬到后面 —— 相当于转 90° 的准备工作）
+
+第 4 小步：左右拼回去
+      q_i' = [ y' , x' ]        ← 还是 4 维
+────────────────────────────────────────────</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="22" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">图 D · 「爱」的后半转一下，到底从哪取数、怎么算</text>
+
+  <rect x="30" y="44" width="200" height="60" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.8"/>
+  <text x="130" y="64" fill="#16a34a" font-size="10.5" text-anchor="middle">① 被转的数：Q 第 2 行的后半</text>
+  <text x="130" y="86" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">x = [ 4 , 0 ]</text>
+
+  <rect x="290" y="44" width="170" height="60" rx="6" fill="#fff" stroke="#64748b" stroke-width="1.8"/>
+  <text x="375" y="64" fill="#64748b" font-size="10.5" text-anchor="middle">② 查表用的行号</text>
+  <text x="375" y="86" fill="#1e293b" font-size="12" text-anchor="middle" font-family="Consolas,monospace">pos = (row=0, col=1)</text>
+
+  <rect x="520" y="36" width="290" height="76" rx="6" fill="#f8fafc" stroke="#4f46e5" stroke-width="1.8"/>
+  <text x="665" y="56" fill="#4f46e5" font-size="10.5" text-anchor="middle">③ 取表第 1 行（因为 col = 1）</text>
+  <text x="665" y="78" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">cos_x = [ 0.5403 , 0.5403 ]</text>
+  <text x="665" y="98" fill="#1e293b" font-size="11" text-anchor="middle" font-family="Consolas,monospace">sin_x = [ 0.8415 , 0.8415 ]</text>
+
+  <line x1="236" y1="134" x2="236" y2="158" stroke="#64748b" stroke-width="2"/>
+  <line x1="375" y1="110" x2="375" y2="158" stroke="#64748b" stroke-width="2"/>
+  <line x1="665" y1="118" x2="665" y2="158" stroke="#64748b" stroke-width="2"/>
+  <polygon points="236,160 231,150 241,150" fill="#64748b"/>
+  <polygon points="375,160 370,150 380,150" fill="#64748b"/>
+  <polygon points="665,160 660,150 670,150" fill="#64748b"/>
+
+  <rect x="120" y="164" width="620" height="64" rx="6" fill="#0f172a"/>
+  <text x="430" y="186" fill="#e2e8f0" font-size="12" text-anchor="middle" font-family="Consolas,monospace">x' = x × cos_x  +  rotate_half(x) × sin_x</text>
+  <text x="430" y="206" fill="#e2e8f0" font-size="12" text-anchor="middle" font-family="Consolas,monospace">   = [4, 0]×0.5403  +  [0, 4]×0.8415</text>
+  <text x="430" y="222" fill="#94a3b8" font-size="10.5" text-anchor="middle" font-family="Consolas,monospace">     ↑ rotate_half([4,0]) = [0, 4]，后半搬前面取负</text>
+
+  <rect x="330" y="238" width="200" height="0" fill="none"/>
+  <text x="430" y="242" fill="#059669" font-size="12" font-weight="700" text-anchor="middle" font-family="Consolas,monospace">= [ 2.1612 , 3.3660 ]</text>
+</svg>
+<figcaption>图 D · 三个数据来源：Q 的行（被转的数）、pos（查表行号）、表（cos/sin）。三者凑齐才能算。</figcaption>
+</div>
+
+<h4>② 三个 token 逐个手算（每行都写出取数来源）</h4>
+
+<pre>━━━━━━ token1「我」   pos = (row=0, col=0)    q1 = [10, 2, 3, 0] ━━━━━━
+
+  前半 y = [10, 2]      ← 用 row = 0 查表第 0 行
+      cos_y = [1.0000, 1.0000]        sin_y = [0.0000, 0.0000]
+      rotate_half([10, 2]) = [-2, 10]
+      y' = [ 10×1.0000 + (-2)×0.0000 ,  2×1.0000 + 10×0.0000 ]
+         = [ 10.0000 , 2.0000 ]        ← 没动（转 0 弧度）
+
+  后半 x = [3, 0]       ← 用 col = 0 查表第 0 行
+      cos_x = [1.0000, 1.0000]        sin_x = [0.0000, 0.0000]
+      rotate_half([3, 0]) = [0, 3]
+      x' = [ 3×1.0000 + 0×0.0000 ,  0×1.0000 + 3×0.0000 ]
+         = [ 3.0000 , 0.0000 ]        ← 没动
+
+  拼回 →  q1' = [ 10.0000 , 2.0000 , 3.0000 , 0.0000 ]
+
+━━━━━━ token2「爱」   pos = (row=0, col=1)    q2 = [1, 15, 4, 0] ━━━━━━
+
+  前半 y = [1, 15]      ← 用 row = 0 查表第 0 行
+      cos_y = [1.0000, 1.0000]        sin_y = [0.0000, 0.0000]
+      rotate_half([1, 15]) = [-15, 1]
+      y' = [ 1×1.0000 + (-15)×0.0000 ,  15×1.0000 + 1×0.0000 ]
+         = [ 1.0000 , 15.0000 ]       ← 没动（row 仍是 0）
+
+  后半 x = [4, 0]       ← 用 col = 1 查表第 1 行
+      cos_x = [0.5403, 0.5403]        sin_x = [0.8415, 0.8415]
+      rotate_half([4, 0]) = [0, 4]
+      dim2 = 4 × 0.5403 + 0 × 0.8415 = 2.1612 + 0      = 2.1612
+      dim3 = 0 × 0.5403 + 4 × 0.8415 = 0 + 3.3660      = 3.3660
+      x'   = [ 2.1612 , 3.3660 ]      ← 动了（转 1 弧度）
+
+  拼回 →  q2' = [ 1.0000 , 15.0000 , 2.1612 , 3.3660 ]
+
+━━━━━━ token3「中国」  pos = (row=0, col=2)    q3 = [2, 3, 12, 0] ━━━━━━
+
+  前半 y = [2, 3]       ← 用 row = 0 查表第 0 行
+      cos_y = [1.0000, 1.0000]        sin_y = [0.0000, 0.0000]
+      rotate_half([2, 3]) = [-3, 2]
+      y' = [ 2×1.0000 + (-3)×0.0000 ,  3×1.0000 + 2×0.0000 ]
+         = [ 2.0000 , 3.0000 ]        ← 没动
+
+  后半 x = [12, 0]      ← 用 col = 2 查表第 2 行
+      cos_x = [-0.4161, -0.4161]      sin_x = [0.9093, 0.9093]
+      rotate_half([12, 0]) = [0, 12]
+      dim2 = 12 × (-0.4161) +  0 × 0.9093 = -4.9932 + 0      = -4.9932
+      dim3 =  0 × (-0.4161) + 12 × 0.9093 = 0 + 10.9116      = 10.9116
+      x'   = [ -4.9932 , 10.9116 ]    ← 转得最多（转 2 弧度）
+
+  拼回 →  q3' = [ 2.0000 , 3.0000 , -4.9932 , 10.9116 ]</pre>
+
+<h4>③ 汇总与规律</h4>
+
+<pre>  token    pos        旋转前               旋转后
+  我      (0,0)   [10,  2,  3, 0]  →  [10.0000, 2.0000,  3.0000,  0.0000]
+  爱      (0,1)   [ 1, 15,  4, 0]  →  [ 1.0000, 15.0000, 2.1612,  3.3660]
+  中国    (0,2)   [ 2,  3, 12, 0]  →  [ 2.0000, 3.0000, -4.9932, 10.9116]
+
+  旋转后的 Q：
+      [ 10.0000   2.0000    3.0000    0.0000 ]
+      [  1.0000  15.0000    2.1612    3.3660 ]
+      [  2.0000   3.0000   -4.9932   10.9116 ]
+
+  规律一眼可见：
+    · 三个 token 的 row 都是 0 → 【前半全部没动】
+    · col 分别是 0 / 1 / 2    → 后半分别转 0 / 1 / 2 弧度，动得越来越多
+    · 位置越靠后，转的角度越大 —— 这就是「用旋转编码位置」的字面意思</pre>
+
+<h3>4.4 第 4 步：旋转 K（<strong>只转 q 和 k，v 不动</strong>）</h3>
+
+<pre>  k1 = [1, 0, 0, 0] → 后 2 维是 [0, 0]，转了还是 [0, 0] → k1' = [1, 0, 0, 0]
+  k2 = [0, 1, 0, 0] → 同理                                → k2' = [0, 1, 0, 0]
+
+  k3 = [0, 0, 1, 0] → 后 2 维 [1, 0] 按 col = 2 转：
+          rotate_half([1,0]) = [0, 1]
+          dim2 = 1 × (-0.4161) + 0 × 0.9093 = -0.4161
+          dim3 = 0 × (-0.4161) + 1 × 0.9093 =  0.9093
+      k3' = [0, 0, -0.4161, 0.9093]
+
+  旋转后的 K：
+      [ 1  0   0.0000   0.0000 ]
+      [ 0  1   0.0000   0.0000 ]
+      [ 0  0  -0.4161   0.9093 ]
+
+  V 完全没有被转过：
+      [ 2  0  0  0 ]
+      [ 0  2  0  0 ]
+      [ 0  0  2  0 ]        ← 位置只影响【看谁】，不影响【看到什么】</pre>
+
+<h3>4.5 第 5 步：算 scores（除以 √4 = 2，和 Ch.02 完全一样）</h3>
+
+<pre>  scores[0][0] = [10,2,3,0] · [1,0,0,0] / 2              = 10 / 2 = 5.0000
+  scores[0][1] = [10,2,3,0] · [0,1,0,0] / 2              =  2 / 2 = 1.0000
+  scores[0][2] = [10,2,3,0] · [0,0,-0.4161,0.9093] / 2
+               = 3 × (-0.4161) / 2                              = -0.6242
+
+  scores[1][0] = [1,15,2.1612,3.366] · [1,0,0,0] / 2     =  1 / 2 = 0.5000
+  scores[1][1] = 15 / 2                                          = 7.5000
+  scores[1][2] = (2.1612×(-0.4161) + 3.366×0.9093) / 2
+               = (-0.8993 + 3.0607) / 2                          = 1.0807
+
+  scores[2][0] = 2 / 2                                           = 1.0000
+  scores[2][1] = 3 / 2                                           = 1.5000
+  scores[2][2] = ((-4.9932)×(-0.4161) + 10.9116×0.9093) / 2
+               = (2.0777 + 9.9219) / 2                           = 6.0000
+
+  scores = [ 5.0000  1.0000  -0.6242 ]
+           [ 0.5000  7.5000   1.0807 ]
+           [ 1.0000  1.5000   6.0000 ]</pre>
+
+<h3>4.6 第 6 步：softmax → 加权 V（和 Ch.02 一字不差）</h3>
+
+<pre>  softmax（逐行）= [ 0.9785  0.0179  0.0035 ]
+                  [ 0.0009  0.9975  0.0016 ]
+                  [ 0.0066  0.0109  0.9825 ]
+
+  attn_output = softmax · V
+              = [ 1.9571  0.0358  0.0071  0 ]
+                [ 0.0018  1.9949  0.0033  0 ]
+                [ 0.0132  0.0218  1.9649  0 ]</pre>
+
+<h3>4.7 对照：不做 RoPE 会怎样</h3>
+
+<table>
+  <tr><th>scores</th><th>不做 RoPE（Ch.02 原例）</th><th>做了 RoPE</th><th>变了没</th></tr>
+  <tr><td>[0][0]（我→我，位移 0）</td><td>5.0000</td><td>5.0000</td><td class="ok">没变</td></tr>
+  <tr><td>[1][1]（爱→爱，位移 0）</td><td>7.5000</td><td>7.5000</td><td class="ok">没变</td></tr>
+  <tr><td>[2][2]（中国→中国，位移 0）</td><td>6.0000</td><td>6.0000</td><td class="ok">没变</td></tr>
+  <tr><td>[0][1]（我→爱，位移 1）</td><td>1.0000</td><td>1.0000</td><td>—</td></tr>
+  <tr><td>[0][2]（我→中国，位移 2）</td><td>1.5000</td><td><strong>-0.6242</strong></td><td class="bad">变了</td></tr>
+  <tr><td>[1][2]（爱→中国，位移 1）</td><td>2.0000</td><td><strong>1.0807</strong></td><td class="bad">变了</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>两个关键观察</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>对角线（位移 = 0）一分没变</strong>：q 和 k 在同一个位置，转了<strong>同一个角度</strong>，
+        点积天然不变（旋转保持夹角和长度）。这正好是 RoPE 的核心性质 ——
+        <strong>它只改"相对位移不为 0"的那些分数</strong>。</li>
+    <li><strong>V 从头到尾没被转过</strong>：位置信息只通过 scores 影响「权重」，
+        不会污染被聚合的「内容」。所以 <code>attn_output</code> 里承载的语义还是干净的。</li>
+  </ol>
+</div>
+
+<div class="callout amber">
+  <strong>顺带看清 RoPE 的插入点</strong>
+  <p style="margin:6px 0 0">整个流程只多了「第 2~4 步」，插在<strong>算出 Q/K/V 之后、算 scores 之前</strong>：</p>
+  <pre style="margin:8px 0 0">X → (W_q, W_k, W_v) → Q, K, V → ★RoPE 转 q 和 k★ → scores → softmax → 加权 V</pre>
+  <p style="margin:6px 0 0">对比加性位置编码是加在最前面的 X 上（只加一次），
+  RoPE 是<strong>每一层、每一次 attention 都要转一遍</strong>。</p>
+</div>
+
+<h3>4.8 补充验证：点积只跟位置差有关</h3>
+
+<p>取两个向量，把它们放在同一位置 p（row = col = p），然后整体挪动，看点积：</p>
+
+<table>
+  <tr><th>q 的位置</th><th>k 的位置</th><th>位置差</th><th>点积</th></tr>
+  <tr><td>0</td><td>2</td><td>+2</td><td>36.085584</td></tr>
+  <tr><td>5</td><td>7</td><td>+2</td><td>36.085584</td></tr>
+  <tr><td>10</td><td>12</td><td>+2</td><td>36.085584</td></tr>
+  <tr><td>15</td><td>17</td><td>+2</td><td>36.085584</td></tr>
+</table>
+
+<p>句子从 3 个词变成 20 个词，"你在我后面 2 格"这件事的数值<strong>完全不变</strong> —— 这就是它支持变分辨率的原因。</p>
+
+<h3>4.9「相对位移」到底在哪个环节产生</h3>
+
+<div class="callout green">
+  <strong>结论：产生在 scores = Q · Kᵀ 这一步 —— 注意不是 Q·K·V</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>旋转</strong>：q 和 k 各自按【自己的坐标】独立转 —— 这一步里没有任何"别人"。</li>
+    <li><strong>点积</strong>：两个转过的向量相乘，两个旋转角自动合并成【角度差】。</li>
+    <li><strong>V 从不旋转</strong>：<code>attn_output = softmax · V</code> 那一步<strong>不含任何位置信息</strong>
+        —— 这就是"位置只影响看谁、不影响看到什么"。</li>
+  </ol>
+</div>
+
+<h4>① 公式：点积里只剩角度差</h4>
+
+<pre>两个转过的向量做点积：
+
+    q' · k' = |q| × |k| × cos( 角度_q − 角度_k )
+
+而 角度 = 坐标 × ω，代入得：
+
+    q' · k' = |q| × |k| × cos( (坐标_q − 坐标_k) × ω )
+                                └────── 这就是【相对位移】──────┘
+
+⚠️ 源码里没有任何一行写这个减法。
+   它只是"两个旋转过的向量做点积"这个运算的必然结果。</pre>
+
+<h4>② 在本例里逐个验证（只看后半 / col 方向）</h4>
+
+<pre>先列三个 token 后半的情况（前半 row 全是 0，都不转，所以对结果没有贡献）：
+
+      token    坐标 col   旋转前     长度    转过之后的角度
+      我        0        [3, 0]      3       0 弧度
+      爱        1        [4, 0]      4       1 弧度
+      中国      2        [1, 0]      1       2 弧度
+                                    ↑ K = X 是 one-hot，只有「中国」的后半不是 0
+
+──── 例 1：爱 查询 中国 ──────────────────────────────
+      爱  ：长度 4，角度 1   → [ 2.1612 ,  3.3660 ]
+      中国：长度 1，角度 2   → [-0.4161 ,  0.9093 ]
+      位移 Δcol = 1 − 2 = −1   →   cos(1) = 0.5403
+
+      预测 = 4 × 1 × cos(1) = 2.1612
+      实测 = 2.1612×(−0.4161) + 3.3660×0.9093
+           = −0.8993 + 3.0607 = 2.1612        ✓
+
+      → §4.5 里 scores[1][2] = 2.1612 / 2 = 1.0806
+
+──── 例 2：我 查询 中国 ──────────────────────────────
+      我  ：长度 3，角度 0   → [ 3.0000 ,  0.0000 ]   （col=0，没转）
+      中国：长度 1，角度 2   → [-0.4161 ,  0.9093 ]
+      位移 Δcol = 0 − 2 = −2   →   cos(2) = −0.4161
+
+      预测 = 3 × 1 × cos(2) = −1.2484
+      实测 = 3×(−0.4161) + 0×0.9093 = −1.2484        ✓
+
+      → §4.5 里 scores[0][2] = −1.2484 / 2 = −0.6242
+
+──── 例 3：中国 查询 中国（自己看自己）──────────────
+      中国（作为 q）：长度 12，角度 2  → [ −4.9932 , 10.9116 ]
+      中国（作为 k）：长度  1，角度 2  → [ −0.4161 ,  0.9093 ]
+      位移 Δcol = 2 − 2 = 0    →   cos(0) = 1
+
+      预测 = 12 × 1 × cos(0) = 12
+      实测 = (−4.9932)(−0.4161) + (10.9116)(0.9093)
+           = 2.0777 + 9.9219 = 12.0000             ✓
+
+      → §4.5 里 scores[2][2] = 12 / 2 = 6.0000
+      ← 和不做 RoPE 时完全一样（这就是 §4.7 对角线不变的原因）</pre>
+
+<h4>③ 三个例子放一起看</h4>
+
+<table>
+  <tr><th>查询方 → 被查方</th><th>位移 Δcol</th><th>cos(位移 × ω)</th><th>后半的点积</th><th>除以 2 后的 scores</th></tr>
+  <tr><td>中国 → 中国</td><td>0</td><td>cos(0) = 1.0000</td><td>12.0000</td><td><strong>6.0000</strong></td></tr>
+  <tr><td>爱 → 中国</td><td>−1</td><td>cos(1) = 0.5403</td><td>2.1612</td><td><strong>1.0806</strong></td></tr>
+  <tr><td>我 → 中国</td><td>−2</td><td>cos(2) = −0.4161</td><td>−1.2484</td><td><strong>−0.6242</strong></td></tr>
+</table>
+
+<div class="callout">
+  <strong>一句话串起来</strong>
+  <p style="margin:8px 0 0">旋转的参照物是<strong>「位置 0」（不转的基准）</strong>，每个 token 各转各的；
+  当两个 token 在 <code>Q·Kᵀ</code> 里相遇时，两者的角度自动相减，
+  分数里只剩下 <code>长度积 × cos(位移 × ω)</code>。<br>
+  <strong>「绝对偏转」是手段，「相对位移」是点积运算自动读出来的结果。</strong></p>
+</div>
+<!-- ================= 5 ================= -->
+<h2>5. 源码：RoPE2D（PyTorch 慢速版）逐行</h2>
+
+<span class="filetag">src/model/encoder/backbone/croco/pos_embed.py · 第 112–159 行</span>
+
+<pre>112  class RoPE2D(torch.nn.Module):
+114      def __init__(self, freq=100.0, F0=1.0):
+116          self.base = freq            # 频率基数，配置里是 100
+118          self.cache = {}             # 算过的 cos/sin 缓存起来，别每层重算
+
+120      def get_cos_sin(self, D, seq_len, device, dtype):
+122          inv_freq = 1.0 / (self.base ** (torch.arange(0, D, 2).float().to(device) / D))
+123          t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+124          freqs = torch.einsum("i,j->ij", t, inv_freq).to(dtype)   # 位置 × 频率
+125          freqs = torch.cat((freqs, freqs), dim=-1)                # 拼成 D 维
+126          cos = freqs.cos()                                        # (Seq, Dim)
+127          sin = freqs.sin()
+
+131      @staticmethod
+132      def rotate_half(x):                                          # 见 §3.1
+134          return torch.cat((-x2, x1), dim=-1)
+
+136      def apply_rope1d(self, tokens, pos1d, cos, sin):
+138          cos = torch.nn.functional.embedding(pos1d, cos)[:, None, :, :]   # 按坐标查表
+139          sin = torch.nn.functional.embedding(pos1d, sin)[:, None, :, :]   # ← 关键：是【查表】不是算
+140          return (tokens * cos) + (self.rotate_half(tokens) * sin)
+
+142      def forward(self, tokens, positions):
+            # tokens:    (B, nheads, ntokens, dim)    ← 已经是分头之后的形状！
+            # positions: (B, ntokens, 2)              ← 就是 patch_embed 出来的那个整数坐标
+150          assert tokens.size(3) % 2 == 0
+151          D = tokens.size(3) // 2                   # 半长
+153          cos, sin = self.get_cos_sin(D, int(positions.max()) + 1, tokens.device, tokens.dtype)
+155          y, x = tokens.chunk(2, dim=-1)            # 劈成两半
+156          y = self.apply_rope1d(y, positions[:, :, 0], cos, sin)   # 前一半用【行号】
+157          x = self.apply_rope1d(x, positions[:, :, 1], cos, sin)   # 后一半用【列号】
+158          tokens = torch.cat((y, x), dim=-1)
+159          return tokens</pre>
+
+<table class="code">
+  <tr><th>行</th><th>要点</th></tr>
+  <tr><td>138–139</td><td><code>F.embedding(pos1d, cos)</code> 是<strong>查表</strong>：把整数坐标当索引，直接取对应行。
+      所以那个 <code>[B, N, 2]</code> 的整数坐标，本质上是<strong>一张 cos/sin 表的行号</strong>。这也解释了为什么它必须是整数。</td></tr>
+  <tr><td>142–146</td><td>输入是<strong>分头之后</strong>的 <code>(B, nheads, ntokens, dim)</code> ——
+      说明 RoPE 是在reshape分头<strong>之后</strong>、算 scores<strong>之前</strong>调用的（对应 blocks.py:102-104）。</td></tr>
+  <tr><td>155–157</td><td>行、列各转一半，这就是"2D"。</td></tr>
+  <tr><td>118 / 121</td><td>用字典缓存，同一 (D, 长度, 设备, 类型) 只算一次。</td></tr>
+</table>
+
+<h3>5.1 它在 Attention 里的确切位置</h3>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 97–107 行（Encoder self-attn）</span>
+
+<pre>97   qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
+98   q, k, v = [qkv[:, :, i] for i in range(3)]        # 分头后的 q/k/v
+102  if self.rope is not None:
+103      q = self.rope(q, xpos)                        # ← 只转 q
+104      k = self.rope(k, xpos)                        # ← 只转 k
+106  attn = (q @ k.transpose(-2, -1)) * self.scale     # ← 转完才算 scores</pre>
+
+<div class="callout amber">
+  <strong>三个必须记住的细节</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>只转 q 和 k，不转 v</strong>：位置要影响"谁看谁"（scores），但不该污染"看到的内容"（v）。</li>
+    <li><strong>在乘 W 之后、算 scores 之前</strong>：先投影成 q/k，再旋转，然后点积。</li>
+    <li><strong>v 不带位置</strong>：这也是为什么加权求和出来的结果，位置信息只体现在"权重"里。</li>
+  </ol>
+</div>
+
+<p>在 Ch.03 的 cross-attention 里也一样，只是转的时候用两套坐标（blocks.py:161-163）：
+<code>q = self.rope(q, qpos)</code>（自己视角）、<code>k = self.rope(k, kpos)</code>（context 视角）。</p>
+
+<!-- ================= 6 ================= -->
+<h2>6. curope：为什么要为它写一个 CUDA 算子</h2>
+
+<h3>6.1 慢在哪</h3>
+
+<p>看 §5 那几行：每个 token、每个频率都要算一次 cos 和 sin，还要做查表和两次逐元素乘加。
+EcoSplat 里这个操作被调用的次数是：</p>
+
+<pre>每个 attention 调用一次（q、k 各一次）
+  × Encoder 24 层
+  × Decoder 12 层 × 2（self + cross）× 视角数
+  × 每个 batch、每张图、每个头、每个 token
+
+粗算：24 + 12×2 = 48 次/视角/层，乘上 257×1024 个元素量级 → 这是纯粹的逐元素运算，
+没有矩阵乘可以发挥 Tensor Core 的优势，用 PyTorch 算子逐个 kernel 跑会很碎、很慢。</pre>
+
+<h3>6.2 它在仓库里的位置</h3>
+
+<pre>src/model/encoder/backbone/croco/curope/
+   ├── curope2d.py      ← Python 层封装（cuRoPE2D、cuRoPE2D_func）
+   ├── curope.cpp       ← pybind11 绑定，把 C++ 函数暴露给 Python
+   ├── kernels.cu       ← ★ CUDA 核函数本体（你要看的手写算子就在这）
+   └── setup.py         ← CUDAExtension 编译配置（name='curope'）</pre>
+
+<h3>6.3 怎么接进来的：编译得就用，编译不了就退回</h3>
+
+<span class="filetag">src/model/encoder/backbone/croco/pos_embed.py · 第 106–110 行</span>
+
+<pre>106  try:
+107      from .curope import cuRoPE2D
+108      RoPE2D = cuRoPE2D                 # ← 编译过：用 CUDA 快版
+109  except ImportError:
+110      print('Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead')
+111      # 退回上面的 PyTorch 版（数学完全等价）</pre>
+
+<p>也就是说：<strong>两条路数学结果一样</strong>，只是一个快一个慢。
+学习时建议的顺序 —— 先读 <code>pos_embed.py:112</code> 的 PyTorch 版（§5 已逐行讲过），
+完全懂了再去看 <code>kernels.cu</code> 怎么把同样的公式搬到 GPU 上并行。</p>
+
+<h3>6.4 一处小提醒</h3>
+
+<pre>curope2d.py 第 7–9 行：
+    try:
+        import curope as _kernels          # 方式一：已 pip 安装成独立包
+    except ModuleNotFoundError:
+        from . import curope as _kernels   # 方式二：就地编译出的扩展模块
+
+安装/编译方式见 curope/setup.py（CUDAExtension，源文件 curope.cpp + kernels.cu）。</pre>
+
+<!-- ================= 7 ================= -->
+<h2>7. 小结</h2>
+
+<div class="callout">
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>数据流向</strong>：patch_embed → 拼内参 token（256→257）→ 24 层 Encoder（只有 self-attn）
+        → 降维 768 → 12 层 Decoder（self + cross）→ 裁掉内参 token → 输出头。</li>
+    <li><strong>257 的那一维</strong>：相机内参 K（3×3）摊平成 9 个数 → <code>Linear(9, 1024)</code> → 1 个额外 token；
+        它的坐标 = (最后一行+1, 0)，最后被 <code>[:, :, :P]</code> 裁掉。</li>
+    <li><strong>pos 从来不加到 x 上</strong>（<code>assert enc_pos_embed is None</code>），
+        它每层被传进 attention，在<strong>分头之后、算 scores 之前</strong>把 q、k 旋转一下。</li>
+    <li><strong>RoPE 只转 q 和 k，不转 v</strong>；行、列各占一半维度。</li>
+    <li><strong>它编码的是相对位置</strong>：位置差相同 → 点积相同（§4.1 的表就是证据），所以天然支持变分辨率。</li>
+    <li><strong>curope 是可选的加速实现</strong>：<code>kernels.cu</code> 是手写 CUDA 算子，
+        编译失败就退回 PyTorch 慢速版，数学等价。</li>
+  </ol>
+</div>
+
+<h3>自测</h3>
+<details>
+  <summary>① 257 = 256 + 1，多出来的那一个是什么？最后怎么处理？</summary>
+  <p style="margin:8px 0 0">相机内参 token：K(3×3) → flatten 成 9 维 → <code>Linear(9, 1024)</code> → 拼到 patch 序列末尾。
+  Decoder 结束后用 <code>dec_feat[i][:, :, :P]</code> 裁掉，因为它不是像素、不能进 DPT head 还原特征图。</p>
+</details>
+<details>
+  <summary>② RoPE 转的是 q、k、v 里的哪几个？在哪个时机转？</summary>
+  <p style="margin:8px 0 0">只转 <strong>q 和 k</strong>，<strong>不转 v</strong>。时机是：投影出 q/k → 分头 →
+  <strong>旋转</strong> → 才算 scores（blocks.py:102-106）。</p>
+</details>
+<details>
+  <summary>③ 为什么 RoPE 能天然支持换分辨率？</summary>
+  <p style="margin:8px 0 0">因为角度是「位置 × 频率」当场算（或查表）出来的，没有跟训练长度绑定的可学习参数；
+  而且它编码的是相对位置，token 数变了照样成立。</p>
+</details>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 03 · Cross-Attention（跨视角聚合）</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.84rem; line-height:1.62; font-family:Consolas,"Courier New",monospace}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:14px 0}
+  th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  table.code td:nth-child(2){font-family:Consolas,"Courier New",monospace; font-size:.82rem; white-space:pre-wrap}
+  table.code td:nth-child(1){width:44px; color:#94a3b8; font-family:Consolas,monospace}
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600}
+  details{background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 16px; margin:10px 0}
+  summary{cursor:pointer; font-weight:600; color:var(--indigo)}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+  .filetag{display:inline-block; background:#0f172a; color:#e2e8f0; font-family:Consolas,monospace;
+           font-size:.78rem; padding:3px 9px; border-radius:5px; margin-bottom:6px}
+  .mbox{font-family:"Cambria Math",Georgia,serif; font-size:1.05rem; text-align:center; margin:16px 0}
+  .mbox .hl{background:var(--indigo-soft); border:1.5px solid var(--indigo); border-radius:8px;
+            display:inline-block; padding:8px 22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Chapter 03 · Cross-Attention（跨视角聚合）</h1>
+  <div class="sub">
+    承接 Chapter 02：Encoder 里每个视角<strong>各自独立</strong>做 Self-Attention，视角之间还没说话。<br>
+    本章讲它们怎么开始说话 —— 全程<strong>先用简化例子</strong>讲清原理，最后才回到 EcoSplat 的真实维度。<br>
+    真实目标：<code>q</code> 长 257、<code>k/v</code> 长 514、12 头 × 64 维、Decoder 12 层。
+  </div>
+</header>
+
+<div class="callout">
+  <strong>一句话</strong>
+  <p style="margin:8px 0 0">
+    <strong>Self-Attention</strong>：Q、K、V 全都来自<strong>同一个序列</strong>（自己跟自己比）。<br>
+    <strong>Cross-Attention</strong>：<strong>Q 来自序列 A，K 和 V 来自序列 B</strong>（拿 A 的问题，去 B 的信息里查）。<br>
+    公式一模一样，只是「喂进去的东西」不一样。
+  </p>
+</div>
+
+<div class="callout green">
+  <strong>先对齐术语：A、B 到底是什么？（它们都是你熟悉的 X）</strong>
+  <p style="margin:8px 0 0">你在 Ch.02 已经掌握的 self-attention：</p>
+  <pre style="margin:8px 0 0">Q = X · W_q
+K = X · W_k      ← 三行里的 X 是【同一个】序列
+V = X · W_v</pre>
+  <p style="margin:8px 0 0">cross-attention <strong>只改了一件事</strong>：把 K、V 公式里的 X 换成另一个序列。</p>
+  <pre style="margin:8px 0 0">Q = A · W_q      ← A 扮演的就是上面那个 X 的角色
+K = B · W_k      ← 这里不再是 A，换成 B 了
+V = B · W_v      ← 同上</pre>
+  <p style="margin:8px 0 0">所以 <strong>A 和 B 都是 token 序列，和 X 是同一种东西</strong>（都是「一堆 4 维向量」），
+  区别仅在于被放进哪条公式。</p>
+  <table style="margin:10px 0 0">
+    <tr><th>本书/论文里的叫法</th><th>它实际是什么</th><th>在公式里的位置</th><th>EcoSplat 里对应</th></tr>
+    <tr><td>query / query 侧 / Q 的输入</td><td>序列 <strong>A</strong></td><td><code>Q = A·W_q</code></td><td>本视角的 token</td></tr>
+    <tr><td>context / memory / K,V 的输入</td><td>序列 <strong>B</strong></td><td><code>K = B·W_k</code>、<code>V = B·W_v</code></td><td>其他视角拼起来的 token</td></tr>
+  </table>
+  <p style="margin:8px 0 0">叫它 <em>context</em> 是因为它扮演「供你查询的资料库」这个角色（中文就是上下文/记忆）——
+  <strong>本质上它就是另一个 X，没有别的玄机。</strong></p>
+  <p style="margin:8px 0 0">同理，源码 <code>DecoderBlock.forward(self, x, y, ...)</code> 里：
+  <code>x</code> = 本视角序列 = 本例的 <strong>A</strong>；<code>y</code> = 其他视角拼起来的序列 = 本例的 <strong>B</strong>。</p>
+</div>
+
+<div class="callout red">
+  <strong>【勘误 ①】层级搞错了：一个 token ≠ 一个视角</strong>
+  <p style="margin:8px 0 0">这是最容易混淆的一点，先说清楚：</p>
+  <pre style="margin:8px 0 0">❌ 错：   我 = 视角 A      爱 = 视角 B      中国 = 视角 C
+         （把「token」和「视角」当成了同一层的东西）
+
+✅ 对：   视角 A（第 1 张图） = [我, 爱, 中国]          一整串 token
+         视角 B（第 2 张图） = [我, 爱, 中国, 的]      另一整串 token</pre>
+  <p style="margin:8px 0 0">「我 / 爱 / 中国」是<strong>同一张图内部</strong>的三个 patch，它们合起来<strong>才构成一个 X</strong>。
+  <strong>视角比 X 高一层</strong>：一个视角 → 一张完整图 → patchify 出一整串 token。</p>
+  <table style="margin:10px 0 0">
+    <tr><th>层级</th><th>句子类比</th><th>EcoSplat 里对应</th></tr>
+    <tr><td>一个序列</td><td>一「句话」</td><td>一个视角的全部 patch</td></tr>
+    <tr><td>序列里的元素</td><td>一个「词」</td><td>一个 patch（token）</td></tr>
+    <tr><td>Self-Attention</td><td><strong>句内</strong>：这个词跟句里其他词的关系</td><td>每个视角自己内部，patch 之间互相看</td></tr>
+    <tr><td>Cross-Attention</td><td><strong>句间</strong>：翻译时这个词该对齐源句哪个词</td><td>本视角的 patch 去别的视角里找对应</td></tr>
+  </table>
+  <p style="margin:8px 0 0">重说一遍 §1 那个例子：<br>
+  A = 「我 爱 中国」这<strong>一整句</strong>（3 个 token），B = 换个角度拍的同一场景（4 个 token，多出一块背景）。<br>
+  所以 §1 里标的「左耳 / 鼻子 / 尾巴」表示的是<strong>同一个物体在两张图里互相对应的 patch</strong>，
+  不是两种不相干的东西 —— 这个标注容易误导，已在此勘误。</p>
+</div>
+
+<div class="callout amber">
+  <strong>顺带回答：为什么不干脆把 A、B 拼成一个大 X 做 self-attention？</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>输出形状不对</strong>：拼成 v×N 的大序列，出来还是 v×N 混在一起；下游 DPT head 需要
+        <strong>每个视角各自</strong>的 <code>(b, v, l, c)</code> 特征图来还原每个视角的输出。</li>
+    <li><strong>角色要分清</strong>：cross-attention 明确区分「我是谁（Q）」和「我查到了什么（K/V）」；拼起来就分不清了。</li>
+    <li><strong>计算量</strong>：self-attention 是 <code>O((vN)²)</code>，cross-attention 是 <code>O(N × (v−1)N)</code>。
+        v=3 时前者 9N²，后者 2N²。</li>
+  </ol>
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1. 先用最简例子：两个视角，故意不等长</h2>
+
+<p>为了让「两个序列」这件事一眼看出来，故意让它们<strong>长度不同</strong>：</p>
+
+<pre>【序列 A】—— 用来算 Q 的那个输入（3 个 token，每个 4 维）
+            它扮演的角色，就是 self-attention 里 "Q = X · W_q" 的那个 X
+
+  a1 = [1, 0, 0, 0]     ← 猫的左耳
+  a2 = [0, 1, 0, 0]     ← 猫的鼻子
+  a3 = [0, 0, 1, 0]     ← 猫的尾巴
+                                    A 形状 (3, 4)
+
+【序列 B】—— 用来算 K 和 V 的那个输入（4 个 token，每个 4 维）
+            它扮演的角色，就是 "K = X · W_k"、"V = X · W_v" 里的那个 X，只是换成了 B
+            同一个物体，另一个角度拍的
+
+  b1 = [1, 0, 0, 0]
+  b2 = [0, 1, 0, 0]
+  b3 = [0, 0, 1, 0]
+  b4 = [0, 0, 0, 1]     ← B 多出来的一块背景
+                                    B 形状 (4, 4)
+
+【三套权重】注意：cross-attention 里 Q、K、V 各有【自己】的投影矩阵
+
+      [ 4  1  0  0 ]          [ 1  0  0  0 ]          [ 2  0  0  0 ]
+W_q = [ 1  4  0  0 ]    W_k = [ 0  1  0  0 ] = I      W_v = [ 0  2  0  0 ] = 2·I
+      [ 0  1  4  2 ]          [ 0  0  1  0 ]          [ 0  0  2  0 ]
+      [ 0  0  0  1 ]          [ 0  0  0  1 ]          [ 0  0  0  2 ]
+
+  缩放：除以 √4 = 2，即 scores = Q·Kᵀ × 0.5   （和 Ch.02 完全一样的规则）</pre>
+
+<h3>1.1 五步手算</h3>
+
+<pre>【第 1 步】Q 只从 A 来      Q = A·W_q  （3×4）
+
+      [ 4  1  0  0 ]     ← q1（左耳在问：谁跟我像？）
+  Q = [ 1  4  0  0 ]     ← q2（鼻子）
+      [ 0  1  4  2 ]     ← q3（尾巴）
+
+【第 2 步】K、V 只从 B 来   K = B·W_k = B（4×4）    V = B·W_v = 2B（4×4）
+
+      [ 1  0  0  0 ]          [ 2  0  0  0 ]
+      [ 0  1  0  0 ]          [ 0  2  0  0 ]
+  K = [ 0  0  1  0 ]      V = [ 0  0  2  0 ]
+      [ 0  0  0  1 ]          [ 0  0  0  2 ]
+
+【第 3 步】scores = Q·Kᵀ × 0.5    形状 (3, 4) —— 注意【不是方阵】
+
+          [ 2.000  0.500  0.000  0.000 ]    ← a1 对 b1/b2/b3/b4 的分数
+  scores = [ 0.500  2.000  0.000  0.000 ]    ← a2
+          [ 0.000  0.500  2.000  1.000 ]    ← a3
+
+  逐项验一下第一格：scores[0][0] = [4,1,0,0]·[1,0,0,0] × 0.5 = 4 × 0.5 = 2.0 ✓
+  ⚠️ 这里是 3 行 4 列：行数跟着 A（query），列数跟着 B（context）。
+
+【第 4 步】softmax（逐行归一，每行加起来 = 1）
+
+          [ 0.6694  0.1494  0.0906  0.0906 ]    a1：66.9% 看 b1
+  attn =  [ 0.1494  0.6694  0.0906  0.0906 ]    a2：66.9% 看 b2
+          [ 0.0784  0.1293  0.5793  0.2131 ]    a3：57.9% 看 b3、21.3% 看 b4
+
+【第 5 步】out = attn · V    形状 (3, 4)
+
+  out[0] = 0.6694·[2,0,0,0] + 0.1494·[0,2,0,0] + 0.0906·[0,0,2,0] + 0.0906·[0,0,0,2]
+         = [1.339, 0.299, 0.181, 0.181]
+  out[1] = 0.1494·[2,0,0,0] + 0.6694·[0,2,0,0] + 0.0906·[0,0,2,0] + 0.0906·[0,0,0,2]
+         = [0.299, 1.339, 0.181, 0.181]
+  out[2] = 0.0784·[2,0,0,0] + 0.1293·[0,2,0,0] + 0.5793·[0,0,2,0] + 0.2131·[0,0,0,2]
+         = [0.157, 0.259, 1.159, 0.426]
+
+                    [ 1.339  0.299  0.181  0.181 ]
+  out (最终输出) =  [ 0.299  1.339  0.181  0.181 ]      形状 (3, 4)
+                    [ 0.157  0.259  1.159  0.426 ]</pre>
+
+<div class="callout green">
+  <strong>三件立刻能看出来的事</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>输出的行数 = query 的长度（3）</strong>，不是 context 的长度（4）。
+        「查完就走」，拿回来的信息被压缩进 A 自己的 3 个 token 里。</li>
+    <li><strong>scores 不是方阵</strong>（3×4）。Self-Attention 里 scores 一定是 N×N 方阵，
+        因为自己和自己比；cross-attention 没有这个约束 —— <strong>这是两者最直观的形状区别</strong>。</li>
+    <li><strong>Q、K、V 用的是三套不同的权重</strong>（W_q / W_k / W_v）。
+        Self-Attention 里三者也各有一套，但因为输入相同，实现上常常合成一个大矩阵；
+        cross-attention 输入不同，必须分开写（见 §4 源码）。</li>
+    <li><strong>⚠️ 这个手算例子是「单头」的</strong>：4 维 = 1 个头 × 4，所以除以 √4。
+        真实的 cross-attention 是 <strong>12 头 × 64 维 = 768</strong>，
+        分头方式和 Ch.02 §4 讲的完全一样 —— 把输出维度切成 12 段，每段 64 维各自算 scores、各自 softmax，
+        最后 concat + proj。这里只是为了能手算，把分头那一步省掉了。</li>
+  </ol>
+</div>
+
+<!-- ================= 2 ================= -->
+<h2>2. 和 Self-Attention 摆在一起看</h2>
+
+<table>
+  <tr><th>对比项</th><th>Self-Attention（Ch.02）</th><th>Cross-Attention（本章）</th></tr>
+  <tr><td>Q 来自</td><td>序列 X</td><td>序列 <strong>A</strong>（就是 <code>Q = X·W_q</code> 里那个 X 的位置；EcoSplat 里是本视角）</td></tr>
+  <tr><td>K 来自</td><td>序列 X</td><td>序列 <strong>B</strong>（同一条公式里的 X 被换成它；EcoSplat 里是其他视角拼起来）</td></tr>
+  <tr><td>V 来自</td><td>序列 X</td><td>序列 <strong>B</strong>（和 K 是同一个序列）</td></tr>
+  <tr><td>scores 形状</td><td>N × N（<strong>方阵</strong>）</td><td>Nq × Nk（<strong>可以是长方形</strong>）</td></tr>
+  <tr><td>输出形状</td><td>N × C</td><td><strong>Nq</strong> × C（跟着 query 走）</td></tr>
+  <tr><td>scores[i][j] 的含义</td><td>第 i 个 token 对<strong>第 j 个 token</strong> 的关注</td><td>A 的第 i 个 token 对 <strong>B 的第 j 个 token</strong> 的关注</td></tr>
+  <tr><td>softmax 方向</td><td>逐行</td><td>逐行（完全一样）</td></tr>
+  <tr><td>缩放 /√d</td><td>有</td><td>有（一样）</td></tr>
+  <tr><td>实现</td><td>一个 <code>nn.Linear(dim, 3*dim)</code> 生成 qkv</td><td><strong>三个独立 Linear</strong>：projq / projk / projv</td></tr>
+</table>
+
+<!-- ================= 3 ================= -->
+<h2>3. 为什么这就叫「跨视角聚合」</h2>
+
+<p>回头读第 4 步那张注意力表：</p>
+
+<pre>a1（左耳）→ 66.9% 看 b1
+a2（鼻子）→ 66.9% 看 b2
+a3（尾巴）→ 57.9% 看 b3、21.3% 看 b4（B 里那块背景）</pre>
+
+<p>每个 token 都<strong>在 B 里找到了跟自己最像的那个位置</strong>。如果 B 是同一物体从另一个角度拍的照片，
+那么「谁跟谁分数高」就隐式地表达了<strong>两个视角之间的对应关系</strong> ——
+传统方法里要靠极线几何 + 特征匹配去算的东西，这里由网络自己在数据里学出来。</p>
+
+<p>聚合的结果（第 5 步）：A 的每个 token 都<strong>掺进了 B 的信息</strong>。
+A 的 token 从此不再是「只看过自己这张图」，而是「看过别人之后更新过的自己」。</p>
+
+<div class="callout amber">
+  <strong>一个容易搞混的点</strong>
+  <p style="margin:6px 0 0">Cross-attention <strong>不改变序列长度</strong>：进来 3 个 token，出去还是 3 个 token。
+  变的是<strong>每个 token 里装的东西</strong>（从「只有自己的信息」变成「融合了 B 的信息」）。
+  长度要变，得靠别的操作（比如拼接，见下一节）。</p>
+</div>
+
+<!-- ================= 4 ================= -->
+<h2>4. 多个「提供 K/V 的视角」怎么喂进去：拼接</h2>
+
+<p>上面只有一个 B。真实情况里，A 要同时参考<strong>好几个其他视角</strong>。做法很朴素：<strong>把它们首尾接成一条长序列</strong>，
+拼出来的那条长序列就是源码里叫 <code>context</code>（变量名 <code>y</code>）的东西 —— 它仍然是「用来算 K/V 的那个 X」，只是变长了。</p>
+
+<pre>简化例子：3 个视角，每个 4 个 token
+
+  视角 0 的 context = [视角1 的 4 个 token | 视角2 的 4 个 token]  → 8 个 token
+  视角 1 的 context = [视角0 的 4 个 token | 视角2 的 4 个 token]  → 8 个 token
+  视角 2 的 context = [视角0 的 4 个 token | 视角1 的 4 个 token]  → 8 个 token
+
+  → 每个视角的 Q 还是 4 个 token，K/V 变成 8 个 token
+  → scores 形状 (4, 8)，而不是 (4, 4)
+
+  关键规则：<strong>永远不把自己算进自己的 context</strong>（去掉对角线）</pre>
+
+<h3>4.1 源码：怎么拼出来的</h3>
+<span class="filetag">src/model/encoder/backbone/backbone_croco_multiview.py · 第 178–184 行</span>
+
+<pre>178  def generate_ctx_views(x):                       # x 形状 (b, v, l, c)
+179      b, v, l, c = x.shape
+180      ctx_views = x.unsqueeze(1).expand(b, v, v, l, c)          # (b, v, v, l, c)
+181      mask = torch.arange(v).unsqueeze(0) != torch.arange(v).unsqueeze(1)
+182      ctx_views = ctx_views[:, mask].reshape(b, v, v - 1, l, c)  # (b, v, v-1, l, c)
+183      ctx_views = ctx_views.flatten(2, 3)                        # (b, v, (v-1)*l, c)
+184      return ctx_views.contiguous()</pre>
+
+<table class="code">
+  <tr><th>行</th><th>代码</th><th>讲解</th></tr>
+  <tr><td>180</td><td><code>unsqueeze(1).expand(...)</code></td>
+      <td>先把每个视角复制 v 份 → 形状 <code>(b, v, v, l, c)</code>：第 2 个 v 是「给谁当 context」，第 3 个 v 是「谁的内容」。</td></tr>
+  <tr><td>181</td><td><code>mask = arange(v) != arange(v)</code></td>
+      <td>造一个 <code>v × v</code> 的布尔表，<strong>对角线是 False</strong>（不相等才为 True）→ 去掉「自己当自己的 context」。</td></tr>
+  <tr><td>182</td><td><code>ctx_views[:, mask].reshape(...)</code></td>
+      <td>按 mask 挑出非对角元素 → <code>(b, v, v-1, l, c)</code>：每个视角拿到 v−1 份别人的内容。</td></tr>
+  <tr><td>183</td><td><code>flatten(2, 3)</code></td>
+      <td>把「v−1 个视角」和「每个视角 l 个 token」<strong>并成一维</strong> → <code>(b, v, (v-1)*l, c)</code>。这就是拼接那一步。</td></tr>
+</table>
+
+<h3>4.2 于是 514 就来了</h3>
+
+<pre>真实数字（v = 3 个视角）：
+
+  每个视角的 token 数 l = 257 = 256 个 patch + 1 个相机内参 token
+                              （512×512 输入时 patch 数是 1024，则 l = 1025；
+                                代码注释里的 257 来自 256×256 的运行）
+
+  每个视角的 context 长度 = (v − 1) × l = 2 × 257 = <strong>514</strong>
+
+  → Q 长度 257，K/V 长度 514，scores 形状 (257, 514)
+  → 再分头：12 头 × 64 维 → attn 形状 [b, 12, 257, 514]   ← 源码注释里写的就是这个</pre>
+
+<!-- ================= 5 ================= -->
+<h2>5. 源码：CrossAttention 逐行</h2>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 133–179 行</span>
+
+<pre>133  class CrossAttention(nn.Module):
+135      def __init__(self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+137          self.num_heads = num_heads
+138          head_dim = dim // num_heads
+139          self.scale = head_dim ** -0.5
+141          self.projq = nn.Linear(dim, dim, bias=qkv_bias)     # ← Q 自己的投影
+142          self.projk = nn.Linear(dim, dim, bias=qkv_bias)     # ← K 自己的投影
+143          self.projv = nn.Linear(dim, dim, bias=qkv_bias)     # ← V 自己的投影
+145          self.proj  = nn.Linear(dim, dim)                    # 和 self-attention 一样的输出投影
+148          self.rope = rope
+
+150      def forward(self, query, key, value, qpos, kpos, mask=None):
+151          B, Nq, C = query.shape          # ← query 的长度
+152          Nk = key.shape[1]               # ← key 的长度（可以和 Nq 不同）
+153          Nv = value.shape[1]             # ← value 的长度
+155          q = self.projq(query).reshape(B,Nq,self.num_heads, C//self.num_heads).permute(0, 2, 1, 3)
+156          k = self.projk(key).reshape(B,Nk,self.num_heads, C//self.num_heads).permute(0, 2, 1, 3)
+157          v = self.projv(value).reshape(B,Nv,self.num_heads, C//self.num_heads).permute(0, 2, 1, 3)
+              # 源码注释实测：q [1,12,257,64]   k [1,12,514,64]   v [1,12,514,64]
+161          if self.rope is not None:
+162              q = self.rope(q, qpos)      # ← Q 用【自己视角】的坐标
+163              k = self.rope(k, kpos)      # ← K 用【context 视角】的坐标
+165          attn = (q @ k.transpose(-2, -1)) * self.scale     # (b, 12, 257, 514)
+168          if mask is not None:
+171              attn = attn + mask.unsqueeze(1)               # EcoSplat 这条路径传的是 None
+173          attn = attn.softmax(dim=-1)
+176          x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)  # ← 输出长度回到 Nq！
+177          x = self.proj(x)
+179          return x</pre>
+
+<table class="code">
+  <tr><th>行</th><th>要点</th></tr>
+  <tr><td>141–143</td><td><strong>三个独立的 Linear</strong>。这是它和 <code>Attention</code>（第 88 行一个 <code>qkv = Linear(dim, 3*dim)</code>）最大的实现差别 ——
+      因为两个输入序列不同，没法合成一次矩阵乘。</td></tr>
+  <tr><td>151–153</td><td>三个长度变量 <code>Nq / Nk / Nv</code> 分别取。self-attention 里三者必然相等，这里可以不等。</td></tr>
+  <tr><td>162–163</td><td>RoPE 用了<strong>两套坐标</strong>：<code>qpos</code> 是本视角的网格坐标，<code>kpos</code> 是 context 的坐标。
+      这样网络知道「你在自己图的哪个位置、你在对方图的哪个位置」（Ch.04 详讲）。</td></tr>
+  <tr><td>176</td><td><code>reshape(B, Nq, C)</code> —— 输出的行数硬绑定 <strong>Nq</strong>。这就是 §1 里「输出跟着 query 走」的代码证据。</td></tr>
+</table>
+
+<!-- ================= 6 ================= -->
+<h2>6. DecoderBlock：一个 Block 里多了一路</h2>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 181–203 行</span>
+
+<p>先对上号：这里的 <code>x</code> 就是本例的<strong>序列 A</strong>（用来算 Q 的），<code>y</code> 就是<strong>序列 B</strong>（用来算 K/V 的，
+在 EcoSplat 里是其他视角拼起来的那条长序列）。</p>
+
+<pre>181  class DecoderBlock(nn.Module):
+186      self.norm1 = norm_layer(dim)
+187      self.attn  = Attention(dim, ...)          # ① 自己视角内部的 self-attention
+188      self.cross_attn = CrossAttention(dim, ...)# ② 跨视角的 cross-attention
+190      self.norm2 = norm_layer(dim)
+191      self.norm3 = norm_layer(dim)
+193      self.mlp   = Mlp(...)                    # ③ MLP
+194      self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()   # 给 context 用的 norm
+
+196      def forward(self, x, y, xpos, ypos, mask=None):
+            # x: (b, 257, 768)   y: (b, 514, 768)   xpos: (b, 257, 2)   ypos: (b, 514, 2)
+199          x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+200          y_ = self.norm_y(y)
+201          x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, mask))
+202          x = x + self.drop_path(self.mlp(self.norm3(x)))
+203          return x, y</pre>
+
+<p>和 Encoder 的 <code>Block</code>（Ch.02 §5）对照：</p>
+
+<table>
+  <tr><th></th><th>Encoder Block</th><th>Decoder Block</th></tr>
+  <tr><td>子层</td><td>2 个：Self-Attn、MLP</td><td><strong>3 个</strong>：Self-Attn、<strong>Cross-Attn</strong>、MLP</td></tr>
+  <tr><td>LayerNorm</td><td>2 个（norm1、norm2）</td><td><strong>3 个 + 1 个 norm_y</strong>（norm1 / norm2 / norm3，外加给 context 的 norm_y）</td></tr>
+  <tr><td>输入</td><td>只有 x</td><td>x（本视角）+ y（context 视角）</td></tr>
+  <tr><td>残差</td><td>2 次</td><td>3 次</td></tr>
+</table>
+
+<div class="callout">
+  <strong>顺序为什么是这样</strong>
+  <p style="margin:6px 0 0">先 <strong>self-attn</strong>：在自己这张图内部理一遍（哪些 patch 属于同一物体）。<br>
+  再 <strong>cross-attn</strong>：带着整理好的信息去别的视角查（我这块在别人那儿对应哪）。<br>
+  最后 <strong>MLP</strong>：把查回来的信息消化进自己的特征里。</p>
+  <p style="margin:6px 0 0"><code>norm_y</code> 是对「别人的信息」单独做归一化（<code>norm_mem=True</code> 时），
+  它<strong>不会</strong>更新 y —— <code>return x, y</code> 里 y 原样返回，整个 Decoder 里 context 的表示只在各处被读取、不被改写。</p>
+</div>
+
+<!-- ================= 7 ================= -->
+<h2>7. 真实全流程：从 Encoder 出来到 Decoder 走完</h2>
+<span class="filetag">src/model/encoder/backbone/backbone_croco_multiview.py · 第 166–207 行</span>
+
+<pre>【第 1 站】Encoder（Ch.02 已学）
+  每张图独立 → patchify → 24 层 Block
+  feat: (b, v, l, 1024)      pos: (b, v, l, 2)        每个视角各说各话
+
+【第 2 站】降维进 Decoder
+  self.decoder_embed = nn.Linear(1024, 768)     ← 编码器 1024 → 解码器 768
+  feat: (b, v, l, 768)
+
+【第 3 站】12 层 DecoderBlock（dec_depth = 12）
+  每层对每个视角 i：
+      Q = 视角 i 的 l 个 token
+      K/V = 除 i 之外所有视角拼起来，(v-1)*l 个 token
+  循环代码（第 187–200 行）：
+
+      for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
+          feat_current     = final_output[-1]
+          feat_current_ctx = generate_ctx_views(feat_current)
+          # 视角 0 走 blk1（dec_blocks）
+          f1, _ = blk1(feat_current[:, 0], feat_current_ctx[:, 0], pose[:, 0], pos_ctx[:, 0])
+          # 视角 1..v-1 走 blk2（dec_blocks2），并且被展平成 batch
+          f2, _ = blk2(rearrange(feat_current[:, 1:], "b v l c -> (b v) l c"), ...)
+          final_output.append(torch.cat((f1, f2), dim=1))
+
+【第 4 站】收尾
+  self.dec_norm = LayerNorm(768)     最后再归一化一次
+  输出：所有视角的特征 (b, v, l, 768)</pre>
+
+<h3>7.1 用一句话说清整个过程（以 A / B / C 三个视角为例）</h3>
+
+<p>三张图各自变成一串 token，<strong>共用同一套 W_q、W_k、W_v</strong>。以 A 当查询方为例：</p>
+
+<ul style="margin:8px 0 0 20px">
+  <li>A 的 token 串 × W_q → <strong>Q</strong></li>
+  <li>把 B、C 的 token 串拼起来 → × W_k → <strong>K</strong></li>
+  <li><strong>同一份</strong>拼接串 × W_v → <strong>V</strong>
+      <br>（V <strong>不是</strong>由 Q、K 算出来的 —— 它和 K 用的是同一份输入，只是换了个权重，三者并列算出）</li>
+  <li>scores = Q·Kᵀ / √64 → 每行 softmax → 加权 V → 得到<strong>A 视角的输出特征</strong>（不是"V 本身"，V 只是中间量）</li>
+</ul>
+
+<p><strong>然后每个视角轮流当查询方</strong>，同样的事再做两遍：</p>
+
+<table style="margin:10px 0 0">
+  <tr><th>轮次</th><th>Q 来自</th><th>K / V 来自</th><th>输出</th></tr>
+  <tr><td>1</td><td>A</td><td>B + C 拼接（514）</td><td>A 的输出（257）</td></tr>
+  <tr><td>2</td><td>B</td><td>A + C 拼接（514）</td><td>B 的输出（257）</td></tr>
+  <tr><td>3</td><td>C</td><td>A + B 拼接（514）</td><td>C 的输出（257）</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>三句补充</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>不是只做这三轮</strong>：每一层都做一遍，共 <strong>12 层</strong>（dec_depth = 12）→ 36 次 cross-attention。
+        而且每层在 cross-attention <strong>之前</strong>，每个视角还要先做一次自己内部的 self-attention。</li>
+    <li><strong>权重共享，但张量各算各的</strong>：W 是同一套，每个视角产生自己那份 Q/K/V。
+        唯一例外：视角 0 走 <code>dec_blocks</code>、视角 1+ 走 <code>dec_blocks2</code>，那一份权重不共享。</li>
+    <li><strong>context 每层重新拼</strong>：第 5 轮里 B 查到的，是已经被前 4 层更新过的 A —— 信息就这样逐层双向流动起来。</li>
+  </ol>
+</div>
+
+<div class="callout amber">
+  <strong>为什么有 dec_blocks 和 dec_blocks2 两份？</strong>
+  <p style="margin:6px 0 0"><code>dec_blocks2 = deepcopy(dec_blocks)</code>（第 85 行），两套<strong>独立权重</strong>。<br>
+  因为输出是<strong>不对称</strong>的：视角 0 是<strong>参考帧</strong>，所有结果都要表达在它的坐标系里；
+  视角 1+ 是「被对齐到视角 0」的那一侧。两侧任务不同，所以用两套参数。<br>
+  这也是这个类叫 <code>AsymmetricCroCoMulti</code> 的原因。</p>
+</div>
+
+<h3>7.2 一张形状追踪表（v = 3，256×256 输入）</h3>
+
+<table>
+  <tr><th>量</th><th>形状</th><th>说明</th></tr>
+  <tr><td>Encoder 输出 feat</td><td>(b, 3, 257, 1024)</td><td>每视角 257 token、1024 维</td></tr>
+  <tr><td>decoder_embed 之后</td><td>(b, 3, 257, 768)</td><td>Linear(1024 → 768)</td></tr>
+  <tr><td>Q</td><td>(b, 12, 257, 64)</td><td>12 头 × 64 维 = 768</td></tr>
+  <tr><td>K / V</td><td>(b, 12, 514, 64)</td><td>514 = (3−1) × 257</td></tr>
+  <tr><td>attn（scores 后）</td><td>(b, 12, 257, 514)</td><td>非方阵，每行 softmax</td></tr>
+  <tr><td>cross-attn 输出</td><td>(b, 257, 768)</td><td>行数回到 257</td></tr>
+  <tr><td>dec_norm 之后</td><td>(b, 3, 257, 768)</td><td>送进下游 head</td></tr>
+</table>
+
+<!-- ================= 8 ================= -->
+<h2>8. 【勘误 ②】是「两套 Transformer」吗？</h2>
+
+<div class="callout red">
+  <strong>你的想法：A、B 各自走两套 Transformer，有两套 QKV</strong>
+  <p style="margin:8px 0 0">这里必须先分清两件事：</p>
+  <table style="margin:10px 0 0">
+    <tr><th></th><th>权重（参数 W_q / W_k / W_v）</th><th>激活值（张量 Q / K / V）</th></tr>
+    <tr><td>数量</td><td><strong>一套</strong>，所有视角共用（共享参数）</td><td>每个视角<strong>各自一份</strong></td></tr>
+    <tr><td>类比</td><td>同一本《词典》，大家查同一本</td><td>每个人查出来的结果各不相同</td></tr>
+    <tr><td>会不会被训练</td><td>会</td><td>不会，每次前向临时算出来</td></tr>
+  </table>
+  <p style="margin:8px 0 0">EcoSplat 的 Encoder 是 <strong>Siamese（孪生）结构</strong>：所有视角被展平进<strong>同一个 batch</strong>，
+  走<strong>同一个</strong> <code>patch_embed</code> 和<strong>同一组</strong> <code>enc_blocks</code>：</p>
+  <pre style="margin:8px 0 0">233    images_all = rearrange(images_all, "b v c h w -> (b v) c h w")    # 视角塞进 batch 维
+237    feat, pos, P = self._encode_image(images_all, shape_all, intrinsic_embedding_all)
+239    feat = rearrange(feat, "(b v) l c -> b v l c", b=b, v=v)           # 再拆回每个视角</pre>
+  <p style="margin:8px 0 0">所以「两套 QKV」这句话：</p>
+  <ul style="margin:6px 0 0 18px">
+    <li>如果指<strong>两套不同的参数</strong> → <span class="bad">不对</span>，<strong>权重是共享的</strong>（只有后面说的 <code>dec_blocks2</code> 例外）。</li>
+    <li>如果指<strong>两份不同的 Q/K/V 张量</strong> → <span class="ok">对</span>，每个视角各自算一份。</li>
+  </ul>
+</div>
+
+<h3>8.1 「self-attention 时完全独立」——这句是对的</h3>
+
+<p>Encoder 阶段每个视角只跟自己玩：</p>
+
+<pre>视角 A：  Q = x_A·W_q    K = x_A·W_k    V = x_A·W_v      ← 全是 A 自己
+视角 B：  Q = x_B·W_q    K = x_B·W_k    V = x_B·W_v      ← 全是 B 自己
+
+两张图的 token 之间没有任何数值往来（这就是 Ch.02 结尾那句「视角之间此时还没说话」）。
+之所以能这样批处理，正是因为大家共用同一组 W。</pre>
+
+<h3>8.2 但 cross-attention 不是「两套 QKV 互相串」</h3>
+
+<table>
+  <tr><th></th><th>Q 来自</th><th>K 来自</th><th>V 来自</th><th>用的权重</th></tr>
+  <tr><td>Encoder self-attn</td><td>x（本视角）</td><td>x（本视角）</td><td>x（本视角）</td><td>融合的一个 <code>qkv = Linear(dim, 3*dim)</code></td></tr>
+  <tr><td>Decoder self-attn</td><td>x（本视角）</td><td>x（本视角）</td><td>x（本视角）</td><td>同样是融合的 qkv</td></tr>
+  <tr><td>Decoder cross-attn</td><td><strong>x</strong>（本视角）</td><td><strong>y</strong>（其他视角）</td><td><strong>y</strong>（其他视角）</td><td><strong>三个独立 Linear</strong>：projq / projk / projv</td></tr>
+</table>
+
+<p>在一次 cross-attention 里，<strong>只有查询方产生 Q</strong>，另一边只提供 K/V。
+准确说法是「<strong>一个 Q（来自 x）+ 别人家的 K/V（来自 y）</strong>」，
+而不是「两套 QKV 混合」。</p>
+
+<div class="callout green">
+  <strong>那双向交流是怎么实现的？—— 轮流 + 多层迭代</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>每个视角轮流当查询方</strong>：视角 0 查「1+2」，视角 1 查「0+2」，视角 2 查「0+1」
+        （<code>generate_ctx_views</code> 干的就是这个）。</li>
+    <li><strong>context 每层重新生成</strong>（第 189 行 <code>feat_current_ctx = generate_ctx_views(feat_current)</code>）：
+        第 1 层 B 看到的是原始 A，第 5 层 B 看到的是「已经被前几层更新过的 A」。</li>
+    <li>重复 <strong>12 层</strong>（<code>dec_depth = 12</code>），就是 12 轮互相传阅。</li>
+  </ol>
+  <p style="margin:8px 0 0">类比：两个人各自写笔记（Encoder self-attn）→ 互相传阅并按对方内容修改自己的（Decoder cross-attn）→ 重复 12 轮。</p>
+</div>
+
+<div class="callout amber">
+  <strong>唯一「真有两套权重」的地方</strong>
+  <p style="margin:6px 0 0">视角 0 走 <code>dec_blocks</code>，视角 1+ 走 <code>dec_blocks2</code>（<code>deepcopy</code> 出来的<strong>独立权重</strong>）。
+  因为两者任务不同：视角 0 是<strong>参考帧</strong>，所有输出都表达在它的坐标系里；视角 1+ 是被对齐的一方。<br>
+  所以严格说，<strong>整套网络里只有 <code>dec_blocks</code> / <code>dec_blocks2</code> 这一处是"两套"</strong>。</p>
+</div>
+
+<h2>9. 小结</h2>
+
+<div class="callout">
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>Cross-Attention = 换了个输入源的 Self-Attention</strong>：公式、softmax、缩放、多头全部一样，
+        只是 Q 来自 A、K/V 来自 B。</li>
+    <li><strong>scores 不再是方阵</strong>：形状是 (query 长度) × (context 长度)，这是最直观的识别特征。</li>
+    <li><strong>输出长度跟着 query 走</strong>：进来 257 个 token，出去还是 257 个，变的是每个 token 里的内容。</li>
+    <li><strong>多个 context 靠拼接</strong>：把所有其他视角首尾接成一条长序列，且永远排除自己 → 514 = 2 × 257。</li>
+    <li><strong>DecoderBlock 比 EncoderBlock 多一路</strong>：self-attn → cross-attn → MLP，三个残差、三个 LN + 一个 norm_y。</li>
+    <li><strong>视角 0 和视角 1+ 用两套权重</strong>（dec_blocks / dec_blocks2），因为输出是「以视角 0 为参考系」的不对称设计。</li>
+  </ol>
+</div>
+
+<h3>自测</h3>
+<details>
+  <summary>① 长度为 3 的 A 去 query 长度为 4 的 B，输出有多少个 token？</summary>
+  <p style="margin:8px 0 0">3 个。输出行数永远等于 query 的长度，与 context 多长无关。</p>
+</details>
+<details>
+  <summary>② 为什么 cross-attention 要用三个独立 Linear，不能像 self-attention 那样合成一个？</summary>
+  <p style="margin:8px 0 0">因为 Q、K、V 来自<strong>两个不同的张量</strong>（query 和 key/value），
+  没法用一次矩阵乘同时算出来。合成一个 <code>Linear(dim, 3*dim)</code> 的前提是三者输入相同。</p>
+</details>
+<details>
+  <summary>③ v = 4 个视角、每视角 257 token 时，K/V 的长度是多少？</summary>
+  <p style="margin:8px 0 0">(4−1) × 257 = <strong>771</strong>。scores 形状 (257, 771)。</p>
+</details>
+
+</div>
+</body>
+</html>

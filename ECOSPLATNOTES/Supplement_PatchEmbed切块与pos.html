@@ -199,6 +199,117 @@
   <tr><td>29</td><td>return x, pos</td><td>返回 <strong>token 序列 + 网格坐标</strong>两个东西。坐标随后被送进 Transformer block，由 RoPE 使用。</td></tr>
 </table>
 
+<h3>2.1 逐字拆开：第 25–28 行里的每一个名字</h3>
+
+<p>这三行里出现了 <strong>7 个你可能不认识的东西</strong>。先记住此刻 x 的形状（第 24 行 <code>self.proj</code> 之后）：
+<code>[B, 1024, 16, 16]</code>，四个维度依次是 <code>dim0 = B</code>、<code>dim1 = C = 1024</code>、<code>dim2 = H' = 16</code>、<code>dim3 = W' = 16</code>。
+<strong>下面所有下标都从 0 开始数。</strong></p>
+
+<table class="code">
+  <tr><th>名字</th><th>它是什么</th><th>在这里干了什么 / 出来什么</th></tr>
+  <tr><td><code>x.size(2)</code><br><code>x.size(3)</code></td>
+      <td>tensor 的<strong>取尺寸方法</strong>，完全等价于 <code>x.shape[2]</code></td>
+      <td>取第 2 维和第 3 维 → 都是 <strong>16</strong>（网格的高、宽）。<br>⚠️ 是 proj <strong>之后</strong>的 16，不是原图 256 —— 切完块才有 16×16 个格子，坐标也是按格子给的。</td></tr>
+  <tr><td><code>x.device</code></td>
+      <td>tensor 的<strong>设备属性</strong>，值是 <code>cuda:0</code> 或 <code>cpu</code> 之类</td>
+      <td>传给 position_getter，好让新建的 pos <strong>建在同一块显卡上</strong>。<br>不这么做的话，后面两个张量一运算就会报「Expected all tensors to be on the same device」。</td></tr>
+  <tr><td><code>self.position_getter(...)</code></td>
+      <td>一个<strong>对象被当成函数调用</strong> —— 因为它类里写了 <code>__call__</code> 方法</td>
+      <td>实际执行的是 <code>PositionGetter.__call__(B, 16, 16, device)</code>。<br>返回 <code>[B, 256, 2]</code> 的网格坐标（下面 2.3 单独拆开讲）。</td></tr>
+  <tr><td><code>self.flatten</code></td>
+      <td>一个普通的 <strong>True / False 开关</strong>（<code>__init__</code> 里存的 bool 变量，<strong>不是函数</strong>）</td>
+      <td>默认 True（blocks.py:224 的参数 <code>flatten=True</code>）。<br>为 True 才执行下面那行展平；为 False 就保持 <code>[B,1024,16,16]</code>，留给需要二维特征图的下游 head。<br>所以 <code>if self.flatten:</code> 只是个开关判断，没有别的玄机。</td></tr>
+  <tr><td><code>x.flatten(2)</code></td>
+      <td><strong>摊平方法</strong>。参数 <code>2</code> 是 start_dim = 从第 2 维起，后面全部合并成一维</td>
+      <td><code>[B, 1024, 16, 16]</code> → <code>[B, 1024, 256]</code>。<br>前两维 (B, C) 原封不动，把 (16, 16) 拉成 256。</td></tr>
+  <tr><td><code>.transpose(1, 2)</code></td>
+      <td><strong>交换两个维度</strong>。注意不是线性代数里的「矩阵转置」，只是换轴顺序</td>
+      <td><code>[B, 1024, 256]</code> → <code>[B, 256, 1024]</code>：<br>把「通道数 1024」换到最后一维，让<strong>每个 token 的 1024 个数连在一起</strong>，这才是 Transformer 要的 BNC 格式。</td></tr>
+  <tr><td><code>self.norm(x)</code></td>
+      <td><code>nn.LayerNorm(1024)</code> 模块被调用（同样靠 <code>__call__</code>）</td>
+      <td>对<strong>最后一维那 1024 个数</strong>做归一化，形状不变 → 仍是 <code>[B, 256, 1024]</code>。<br>公式：<code>y = γ ⊙ (x − μ) / σ + β</code>，逐 token 独立算（和 batch 无关，这点和 BatchNorm 不一样）。</td></tr>
+</table>
+
+<h3>2.2 用一个 2 行 3 列的小网格，亲手走一遍</h3>
+
+<p>把通道数缩到 2、网格缩到 2×3（真模型是 1024 和 16×16，道理完全一样）：</p>
+
+<pre>输入 x 形状 = [1, 2, 2, 3]：
+
+      通道 0                通道 1
+      [ 1   2   3 ]         [ 10  20  30 ]
+      [ 4   5   6 ]         [ 40  50  60 ]
+
+① x.flatten(2)  →  形状 [1, 2, 6]
+     通道 0 那一行 = [1, 2, 3,  4,  5,  6]
+     通道 1 那一行 = [10, 20, 30, 40, 50, 60]
+     ↑ 行优先：先数完第 0 行的 3 个，再数第 1 行的 3 个
+
+② .transpose(1, 2)  →  形状 [1, 6, 2]，即 6 个 token、每个 2 维
+     token0 = [1, 10]      ← 它来自网格位置 (0,0)
+     token1 = [2, 20]      ← (0,1)
+     token2 = [3, 30]      ← (0,2)
+     token3 = [4, 40]      ← (1,0)
+     token4 = [5, 50]      ← (1,1)
+     token5 = [6, 60]      ← (1,2)
+
+③ position_getter(1, h=2, w=3, device) 内部：
+     torch.arange(w=3)            → [0, 1, 2]
+     torch.arange(h=2)            → [0, 1]
+     torch.cartesian_prod(y, x)   → (0,0) (0,1) (0,2) (1,0) (1,1) (1,2)
+                                    ↑ 正好 6 个，顺序与上面 token0..token5 一一对应 ✓
+     再 .view(1, 6, 2).expand(1, -1, 2).clone()  →  pos 形状 [1, 6, 2]
+
+⭐ 最关键的一点：pos 的第 i 个坐标永远对得上 x 的第 i 个 token，
+   因为【摊平】和【生成坐标】都是行优先 —— 这是两者能配对的全部原因。</pre>
+
+<h3>2.3 PositionGetter 内部：5 个函数逐个认识</h3>
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 207–219 行</span>
+
+<pre>207  class PositionGetter(object):          # 注意：不是 nn.Module，没有可学习参数
+210      def __init__(self):
+211          self.cache_positions = {}       # 空字典，用来缓存
+213      def __call__(self, b, h, w, device):     # ← 有了它，对象才能被当函数调用
+214          if not (h,w) in self.cache_positions:     # 这个分辨率没算过才算
+215              x = torch.arange(w, device=device)
+216              y = torch.arange(h, device=device)
+217              self.cache_positions[h,w] = torch.cartesian_prod(y, x)   # 形状 (h, w, 2)
+218          pos = self.cache_positions[h,w].view(1, h*w, 2).expand(b, -1, 2).clone()
+219          return pos</pre>
+
+<table class="code">
+  <tr><th>函数 / 写法</th><th>一句话解释</th><th>本例（h=w=16, B）下的结果</th></tr>
+  <tr><td><code>torch.arange(n)</code></td>
+      <td>生成一串整数 <code>[0, 1, 2, …, n-1]</code></td>
+      <td><code>arange(16)</code> → <code>[0,1,…,15]</code>，就是行号 / 列号本身</td></tr>
+  <tr><td><code>torch.cartesian_prod(y, x)</code></td>
+      <td><strong>笛卡尔积</strong>：y 的每个值和 x 的每个值两两配对，输出 <code>(h*w, 2)</code>，每行是 <code>(行号, 列号)</code></td>
+      <td>16×16 = <strong>256 行</strong>，形如 <code>(0,0) (0,1) … (15,15)</code></td></tr>
+  <tr><td><code>.view(1, h*w, 2)</code></td>
+      <td>换个看法（<strong>不改数据</strong>，只改形状标记）</td>
+      <td><code>[16,16,2]</code> → <code>[1, 256, 2]</code>，多出一个 batch 维</td></tr>
+  <tr><td><code>.expand(b, -1, 2)</code></td>
+      <td>把长度为 1 的维度<strong>复制</strong>成 b 份；<code>-1</code> 表示「这一维别动」。<br>只是视图，不真的多占显存</td>
+      <td><code>[1,256,2]</code> → <code>[B, 256, 2]</code>，B 个视角共用同一套坐标</td></tr>
+  <tr><td><code>.clone()</code></td>
+      <td>把上面的「视图」<strong>真拷一份</strong>成独立张量，避免后续就地修改时互相串味</td>
+      <td>形状不变，但变成自己的内存</td></tr>
+  <tr><td><code>cache_positions</code></td>
+      <td>一个普通字典做<strong>缓存</strong>：同一个 (h,w) 只算一次</td>
+      <td>256×256 和 512×512 各算一次，之后每个 batch 直接取</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>为什么顺序必须是 flatten → transpose → norm？先 norm 行不行？</strong>
+  <p style="margin:6px 0 0">不行，是<strong>被形状逼出来的</strong>。<code>LayerNorm(1024)</code> 里的 1024 是写死的，它只认<strong>最后一维</strong>：</p>
+  <ul style="margin:6px 0 0 18px">
+    <li>flatten(2) 之后是 <code>[B, 1024, 256]</code>，最后一维是 <strong>256</strong> → 此时 norm 会因尺寸对不上而报错（或归一化错对象）。</li>
+    <li>transpose(1,2) 之后是 <code>[B, 256, 1024]</code>，最后一维才是 1024 → 这时候 norm 才对得上。</li>
+  </ul>
+  <p style="margin:6px 0 0">另外提醒：<code>self.norm</code> 来自 blocks.py:235，<code>norm_layer(embed_dim) if norm_layer else nn.Identity()</code>。
+  如果构造时没传 norm_layer，它就是 <code>nn.Identity()</code> —— 一个「什么都不做、原样返回」的占位模块，这样第 247 行的代码不用写 if 分支。</p>
+</div>
+
 <!-- ================= 3 ================= -->
 <h2>3. 依赖代码 ①：基类 <code>PatchEmbed</code>（<code>self.proj</code> 从哪来）</h2>
 <span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 221–252 行</span>

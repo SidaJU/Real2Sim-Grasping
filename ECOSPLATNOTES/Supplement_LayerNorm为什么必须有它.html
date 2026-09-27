@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supplement · LayerNorm 为什么必须有它（带完整数值对照实验）</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.82rem; line-height:1.62; font-family:Consolas,"Courier New",monospace}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:24px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.88rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:14px 0}
+  th,td{padding:9px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  table.code td:nth-child(2){font-family:Consolas,"Courier New",monospace; font-size:.82rem; white-space:pre-wrap}
+  .mbox{font-family:"Cambria Math",Georgia,serif; font-size:1.1rem; text-align:center; margin:16px 0}
+  .mbox .hl{background:var(--indigo-soft); border:1.5px solid var(--indigo); border-radius:8px;
+            display:inline-block; padding:8px 22px}
+  .filetag{display:inline-block; background:#0f172a; color:#e2e8f0; font-family:Consolas,monospace;
+           font-size:.78rem; padding:3px 9px; border-radius:5px; margin-bottom:6px}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Supplement · LayerNorm 为什么必须有它</h1>
+  <div class="sub">
+    EcoSplat 学习笔记 · 配套 Chapter 02「Transformer 骨干」<br>
+    内容：问题根源 → <strong>同一例子「不加 LN」与「加 LN」的完整数值对照</strong> → 仿射还原 γ/β → 为什么是 Pre-LN → 回到源码
+  </div>
+</header>
+
+<div class="callout red">
+  <strong>先看结论（后面全部是它的证据）</strong>
+  <p style="margin:8px 0 0">残差连接是<strong>加法</strong>，每过一层，token 向量的量级就会往上堆一点。
+  而 attention 里 <code>scores = q · k</code> 是<strong>两个</strong>这样的向量相乘 ——
+  量级放大 k 倍，scores 就放大 <strong>k² 倍（平方级）</strong>。
+  跑满 24 层后：不加 LN 的 scores 涨到 <strong>9.3 × 10²⁷</strong>，注意力彻底坍缩成「只盯一个 token」；
+  加了 LN 则稳定在 <strong>2.37 → 2.53</strong>，几乎纹丝不动。</p>
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1. 问题从哪来：残差是加法，量级只增不减</h2>
+
+<p>Chapter 02 的例子里，token1 在一个 Block 中的变化（原始数值）：</p>
+
+<pre>输入              [1,    0,    0,    0   ]
++ 注意力输出      + [1.4,  0.4,  0.2,  0.0]   →  [2.4,  0.4,  0.2,  0.0]
++ MLP 输出        + [0.25, 0.10, -0.15, 0.30] →  [2.65, 0.50, 0.05, 0.30]</pre>
+
+<p>一个 Block 就加了<strong>两次</strong>。除非每次加的量恰好正负抵消，否则向量的量级只会往上走。
+EcoSplat 的编码器有 <strong>24 个 Block</strong>（<code>backbone_croco_multiview.py:22</code> <code>'enc_depth': 24</code>），一共加 48 次。</p>
+
+<h3>1.1 为什么「量级变大」会致命</h3>
+
+<p>关键在于 attention 内部：</p>
+
+<div class="mbox"><span class="hl">scores = q · k&nbsp;&nbsp;/&nbsp;&nbsp;√d</span></div>
+
+<ul style="margin:8px 0 0 20px">
+  <li>x 的量级放大 <strong>k 倍</strong> → q、k 各自放大 k 倍</li>
+  <li>点积是「逐个分量相乘再求和」→ <strong>scores 放大 k² 倍</strong></li>
+</ul>
+
+<p>而 softmax 对分差极度敏感（Chapter 02 已算过：分差 8 分 → 0.9957，分差 1 分 → 0.62）。
+scores 一大，softmax 立刻「赢者通吃」，注意力表变成 <code>[1, 0, 0]</code> ——
+每个 token 只盯着一个对象看，模型丧失了「综合多方信息」的能力。</p>
+
+<div class="callout amber">
+  <strong>一个真实会踩到的坑：float32 溢出</strong>
+  <p style="margin:6px 0 0">朴素 softmax 要算 <code>e^score</code>。float32 的上限约 3.4×10³⁸，
+  也就是 <strong>score 超过约 88 就会变成 inf</strong>，接着 inf/inf = NaN，整个网络直接报废。
+  下面你会看到：不加 LN 时，<strong>第 3 层</strong>的 max score 就到了 102 —— 已经越线。</p>
+</div>
+
+<!-- ================= 2 ================= -->
+<h2>2. 实验设定：一个能手算到底的小例子</h2>
+
+<p>为了让每一步都能手算，用 Chapter 02 那个例子的<strong>缩小版</strong>：3 个 token、每个 4 维。</p>
+
+<pre>【输入 X】3 个 token，one-hot（和 Chapter 02 完全一样）
+
+  X = [ 1  0  0  0 ]     ← token1「我」
+      [ 0  1  0  0 ]     ← token2「爱」
+      [ 0  0  1  0 ]     ← token3「中国」        形状 (3, 4)
+
+【三个投影矩阵】W_k、W_v 与 Chapter 02 相同；W_q 取小一号的值，好让分数落在能看清的区间
+
+      [ 1.0  0.2  0.3  0 ]        [ 1  0  0  0 ]        [ 2  0  0  0 ]
+W_q = [ 0.1  1.5  0.4  0 ]   W_k = [ 0  1  0  0 ] = I   W_v = [ 0  2  0  0 ] = 2·I
+      [ 0.2  0.3  1.2  0 ]        [ 0  0  1  0 ]        [ 0  0  2  0 ]
+      [ 0    0    0    1 ]        [ 0  0  0  1 ]        [ 0  0  0  2 ]
+
+  → K = X·W_k = X        （one-hot 直接抄行）
+  → V = X·W_v = 2X
+  → 缩放：单头 4 维 → 除以 √4 = 2，即 scores = Q·Kᵀ × 0.5
+
+【MLP】真实是 4→16→4 + GELU，为了能手算，简化成一层 Linear(4→4)、不加激活：
+
+      [ 0.25  0.10  0.00  0.05 ]
+W_m = [ 0.05  0.25  0.10  0.00 ]
+      [ 0.00  0.05  0.25  0.10 ]
+      [ 0.10  0.00  0.05  0.25 ]
+
+【一个 Block 的结构】（两种实验里都一样）
+  不加 LN：  a = Attn(x)            → x₁ = x + a   → m = MLP(x₁)      → x₂ = x₁ + m
+  加   LN：  a = Attn(LN(x))        → x₁ = x + a   → m = MLP(LN(x₁))  → x₂ = x₁ + m
+                                                      ↑ Pre-LN：每个子层前先归一化
+
+【说明】W_q、W_m 的数值是为了让手算好看而挑的；其余（X、W_k、W_v、√d、Block 结构）都来自 Chapter 02 的真实设定。
+        所有数字均由脚本实算，不是估算。</pre>
+
+<!-- ================= 3 ================= -->
+<h2>3. 对照组：不加 LayerNorm（第 1 层 + 逐层演变）</h2>
+
+<h3>3.1 第 1 层完整手算</h3>
+
+<pre>① Q = X·W_q = [ 1.000  0.200  0.300  0 ]
+              [ 0.100  1.500  0.400  0 ]        （one-hot → 直接抄 W_q 的前 3 行）
+              [ 0.200  0.300  1.200  0 ]
+
+   K = X·W_k = X，V = X·W_v = 2X = [ 2  0  0  0 ]
+                                    [ 0  2  0  0 ]
+                                    [ 0  0  2  0 ]
+
+② scores = Q·Kᵀ × 0.5 = [ 0.500  0.100  0.150 ]
+                         [ 0.050  0.750  0.200 ]
+                         [ 0.100  0.150  0.600 ]
+
+③ softmax（逐行）      = [ 0.4211  0.2822  0.2967 ]   ← token1 谁都看一点，很健康
+                         [ 0.2395  0.4823  0.2782 ]
+                         [ 0.2703  0.2841  0.4456 ]
+
+④ attn_out = softmax·V = [ 0.842  0.564  0.593  0 ]
+                         [ 0.479  0.965  0.556  0 ]
+                         [ 0.541  0.568  0.891  0 ]
+
+⑤ 残差 x₁ = x + a      = [ 1.842  0.564  0.593  0 ]
+                         [ 0.479  1.965  0.556  0 ]
+                         [ 0.541  0.568  1.891  0 ]
+
+⑥ m = MLP(x₁)          = [ 0.489  0.355  0.205  0.151 ]
+                         [ 0.218  0.567  0.336  0.080 ]
+                         [ 0.164  0.291  0.530  0.216 ]
+
+⑦ 残差 x₂ = x₁ + m     = [ 2.331  0.919  0.798  0.151 ]
+                         [ 0.697  2.531  0.892  0.080 ]
+                         [ 0.704  0.859  2.421  0.216 ]      ← 第 1 层结束，量级 2.53</pre>
+
+<h3>3.2 把同一个 Block 反复堆，逐层看</h3>
+
+<table>
+  <tr><th>层</th><th>max|x|（向量量级）</th><th>max score</th><th>token1 的注意力分布</th><th>状态</th></tr>
+  <tr><td>1</td><td>2.5314</td><td>0.7500</td><td>[0.4211, 0.2822, 0.2967]</td><td class="ok">健康：兼顾三个 token</td></tr>
+  <tr><td>2</td><td>9.0507</td><td>6.7399</td><td>[0.4331, 0.3083, 0.2586]</td><td class="ok">还行</td></tr>
+  <tr><td>3</td><td>35.5977</td><td>102.0845</td><td>[0.0022, 0.9922, 0.0056]</td><td class="bad">坍缩！且注意目标漂到 token2</td></tr>
+  <tr><td>4</td><td>140.6096</td><td>1686.1033</td><td>[0.0, 1.0, 0.0]</td><td class="bad">完全坍缩 + float32 已溢出</td></tr>
+  <tr><td>5</td><td>557.7206</td><td>28062.97</td><td>[0.0, 1.0, 0.0]</td><td class="bad">—</td></tr>
+  <tr><td>6</td><td>2221.1605</td><td>470313.59</td><td>[0.0, 1.0, 0.0]</td><td class="bad">—</td></tr>
+  <tr><td>7</td><td>8880.8093</td><td>7931238.59</td><td>[0.0, 1.0, 0.0]</td><td class="bad">—</td></tr>
+  <tr><td>8</td><td>35643.2704</td><td>134495061.5</td><td>[0.0, 1.0, 0.0]</td><td class="bad">—</td></tr>
+  <tr><td>24</td><td><strong>2.42 × 10¹⁴</strong></td><td><strong>9.30 × 10²⁷</strong></td><td>[0.0, 1.0, 0.0]</td><td class="bad">EcoSplat 的真实深度</td></tr>
+</table>
+
+<div class="callout red">
+  <strong>三个必须看清的后果</strong>
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>量级指数爆炸</strong>：2.53 → 2.42×10¹⁴。每层大约 ×4，24 层就是 <strong>4²⁴</strong>。</li>
+    <li><strong>scores 平方级爆炸</strong>：0.75 → 9.30×10²⁷。第 3 层（102）就已经让 float32 的 <code>e^score</code> 溢出成 inf/NaN。</li>
+    <li><strong>注意力坍缩且漂移</strong>：token1 本来「自己 42%、token2 28%、token3 30%」，
+        第 3 层变成「99.2% 盯 token2」——<strong>连该看谁都变了</strong>。这不是「更专注」，是计算已经失真。</li>
+  </ol>
+</div>
+
+<!-- ================= 4 ================= -->
+<h2>4. 实验组：加上 LayerNorm（同一个例子）</h2>
+
+<h3>4.1 第 1 层完整手算（Pre-LN）</h3>
+
+<pre>【第 0 步】先对 x 做 LayerNorm（γ=1、β=0，即纯归一化）
+
+  以 token1 = [1, 0, 0, 0] 为例，dim = 4：
+    μ = (1+0+0+0)/4 = 0.25
+    方差 = [(1-0.25)² + 3×(0-0.25)²] / 4 = (0.5625 + 3×0.0625)/4 = 0.1875
+    σ = √0.1875 = 0.4330
+    归一化 = [(1-0.25)/0.433, (0-0.25)/0.433, (0-0.25)/0.433, (0-0.25)/0.433]
+           = [ 1.732, -0.577, -0.577, -0.577 ]
+           校验：均值 ≈ 0，方差 ≈ 1 ✓
+
+  LN(x₀) = [  1.732  -0.577  -0.577  -0.577 ]   ← token1
+           [ -0.577   1.732  -0.577  -0.577 ]   ← token2
+           [ -0.577  -0.577   1.732  -0.577 ]   ← token3
+           （每个 token 独立算，μ、σ 都是当场现算的，不是参数）
+
+【第 1 步】Q = LN(x)·W_q —— 注意：现在【不再】是「抄 W_q 的行」了！
+
+  Q = [  1.559  -0.693  -0.404  -0.577 ]
+      [ -0.520   2.309  -0.173  -0.577 ]
+      [ -0.289  -0.462   1.674  -0.577 ]
+
+  K = LN(x)·W_k = LN(x)（W_k = I）         V = 2·LN(x)
+
+    V = [  3.464  -1.155  -1.155  -1.155 ]
+        [ -1.155   3.464  -1.155  -1.155 ]
+        [ -1.155  -1.155   3.464  -1.155 ]
+
+【第 2 步】scores = Q·Kᵀ × 0.5 = [  1.833  -0.767  -0.433 ]
+                                  [ -0.900   2.367  -0.500 ]
+                                  [ -0.433  -0.633   1.833 ]
+
+【第 3 步】softmax（逐行）      = [ 0.8489  0.0631  0.0880 ]
+                                  [ 0.0348  0.9132  0.0520 ]
+                                  [ 0.0872  0.0714  0.8414 ]
+
+【第 4 步】attn_out = softmax·V = [  2.766  -0.863  -0.748  -1.155 ]
+                                  [ -0.994   3.063  -0.915  -1.155 ]
+                                  [ -0.752  -0.825   2.731  -1.155 ]
+
+【第 5 步】残差 x₁ = x + a      = [  3.766  -0.863  -0.748  -1.155 ]
+                                  [ -0.994   4.063  -0.915  -1.155 ]
+                                  [ -0.752  -0.825   3.731  -1.155 ]
+
+【第 6 步】进 MLP 前，再做一次 LN（Pre-LN 的第二个 LN）
+
+  以 token1 为例：μ = 0.25，σ = 2.0356
+  LN(x₁) = [  1.727  -0.547  -0.490  -0.690 ]   ← token1
+           [ -0.565   1.731  -0.529  -0.638 ]   ← token2
+           [ -0.497  -0.533   1.727  -0.697 ]   ← token3
+           （量级又被拉回「均值 0、方差 1」，尽管 x₁ 本身已经涨到 4.06）
+
+【第 7 步】m = MLP(LN(x₁))     = [  0.336   0.011  -0.212  -0.135 ]
+                                 [ -0.118   0.350   0.009  -0.240 ]
+                                 [ -0.221  -0.097   0.344  -0.026 ]
+
+【第 8 步】残差 x₂ = x₁ + m    = [  4.102  -0.852  -0.960  -1.290 ]
+                                 [ -1.112   4.413  -0.906  -1.395 ]
+                                 [ -0.972  -0.922   4.075  -1.181 ]   ← 第 1 层结束</pre>
+
+<h3>4.2 继续堆，逐层看</h3>
+
+<table>
+  <tr><th>层</th><th>max|x|（向量量级）</th><th>max score</th><th>token1 的注意力分布</th><th>状态</th></tr>
+  <tr><td>1</td><td>4.4131</td><td>2.3667</td><td>[0.8489, 0.0631, 0.0880]</td><td class="ok">健康</td></tr>
+  <tr><td>2</td><td>7.7785</td><td>2.4004</td><td>[0.8320, 0.0730, 0.0950]</td><td class="ok">几乎没变</td></tr>
+  <tr><td>3</td><td>11.0967</td><td>2.4201</td><td>[0.8188, 0.0811, 0.1001]</td><td class="ok">几乎没变</td></tr>
+  <tr><td>4</td><td>14.3697</td><td>2.4342</td><td>[0.8073, 0.0882, 0.1045]</td><td class="ok">—</td></tr>
+  <tr><td>5</td><td>17.5995</td><td>2.4453</td><td>[0.7965, 0.0949, 0.1086]</td><td class="ok">—</td></tr>
+  <tr><td>6</td><td>20.7875</td><td>2.4545</td><td>[0.7863, 0.1012, 0.1125]</td><td class="ok">—</td></tr>
+  <tr><td>7</td><td>23.9349</td><td>2.4625</td><td>[0.7764, 0.1073, 0.1163]</td><td class="ok">—</td></tr>
+  <tr><td>8</td><td>27.0426</td><td>2.4694</td><td>[0.7667, 0.1133, 0.1200]</td><td class="ok">—</td></tr>
+  <tr><td>24</td><td><strong>71.9924</strong></td><td><strong>2.5271</strong></td><td>[0.6230, 0.1991, 0.1780]</td><td class="ok">仍然分散、仍然健康</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>为什么加了 LN 还是「量级在涨」？</strong>
+  <p style="margin:6px 0 0">这是<strong>残差结构本身</strong>带来的，LN 管不了也不该管：
+  每层都在做 <code>x ← x + 子层输出</code>，子层输出量级大约恒定（因为输入被 LN 归一化了），
+  所以 x 是<strong>线性增长</strong>（本例每层 +3.3 左右，24 层 → 72）。
+  真实 Transformer 也有这个现象，称为残差流的缓慢增长。</p>
+  <p style="margin:6px 0 0"><strong>关键在于：进 attention 的永远是归一化后的 h，不是 x。</strong>
+  所以 <code>scores</code> 被死死钉在 2.37 ~ 2.53 —— 这才是 LN 真正守住的阵地。
+  线性增长（24 层 72 倍）无害；指数爆炸（24 层 10¹⁴ 倍）致命。</p>
+</div>
+
+<!-- ================= 5 ================= -->
+<h2>5. 两张表并排看</h2>
+
+<h3>5.1 量级与 scores</h3>
+
+<table>
+  <tr>
+    <th>层</th>
+    <th>不加 LN：max|x|</th><th>加 LN：max|x|</th>
+    <th>不加 LN：max score</th><th>加 LN：max score</th>
+  </tr>
+  <tr><td>1</td><td>2.53</td><td>4.41</td><td>0.75</td><td>2.37</td></tr>
+  <tr><td>2</td><td>9.05</td><td>7.78</td><td>6.74</td><td>2.40</td></tr>
+  <tr><td>3</td><td>35.60</td><td>11.10</td><td class="bad">102.08</td><td>2.42</td></tr>
+  <tr><td>4</td><td>140.61</td><td>14.37</td><td class="bad">1686.10</td><td>2.43</td></tr>
+  <tr><td>8</td><td>35643.27</td><td>27.04</td><td class="bad">1.34 × 10⁸</td><td>2.47</td></tr>
+  <tr><td>24</td><td class="bad">2.42 × 10¹⁴</td><td class="ok">71.99</td><td class="bad">9.30 × 10²⁷</td><td class="ok">2.53</td></tr>
+  <tr>
+    <td><strong>增长方式</strong></td>
+    <td class="bad" colspan="2">指数（约 ×4 / 层）</td>
+    <td class="ok" colspan="2">scores 恒定；|x| 仅线性增长</td>
+  </tr>
+</table>
+
+<h3>5.2 token1 的注意力分布（最能说明问题）</h3>
+
+<table>
+  <tr><th>层</th><th>不加 LN</th><th>加 LN</th></tr>
+  <tr><td>1</td><td>[0.421, 0.282, 0.297]</td><td>[0.849, 0.063, 0.088]</td></tr>
+  <tr><td>3</td><td class="bad">[0.002, 0.992, 0.006]</td><td class="ok">[0.819, 0.081, 0.100]</td></tr>
+  <tr><td>8</td><td class="bad">[0, 1, 0]</td><td class="ok">[0.767, 0.113, 0.120]</td></tr>
+  <tr><td>24</td><td class="bad">[0, 1, 0]</td><td class="ok">[0.623, 0.199, 0.178]</td></tr>
+</table>
+
+<p>不加 LN：<strong>注意力目标发生了漂移</strong> —— 从「主要看自己」变成「100% 盯 token2」，这是数值失真，不是模型在学习。
+加 LN：24 层后依然是 <code>[0.623, 0.199, 0.178]</code>，三个 token 都有份，只是比例缓慢演化。</p>
+
+<div class="callout">
+  <strong>一句话总结这个对照</strong>
+  <p style="margin:6px 0 0">LN 不改变模型「能表达什么」，它只做一件事：
+  <strong>每到一个子层门口，把向量的尺度按回标准值</strong>，让后续的 Q/K/V 投影和点积始终在可控区间里工作。
+  没有它，网络会在几层之内把自己算崩。</p>
+</div>
+
+<!-- ================= 6 ================= -->
+<h2>6. 那 γ、β（仿射还原）又是干嘛的</h2>
+
+<div class="mbox"><span class="hl">y = γ ⊙ (x − μ) / σ + β</span></div>
+
+<p>纯归一化有个副作用：它强行让每个 token「均值 0、方差 1」，等于把<strong>尺度信息全抹了</strong>。
+可「这一维该多大、该往哪偏」本身可能就是网络想表达的东西。</p>
+
+<p>所以补上 γ（缩放）、β（偏移），每个维度各一个，让网络自己学：</p>
+
+<pre>接第 4.1 节 token1 的归一化结果 [1.732, -0.577, -0.577, -0.577]，dim = 4：
+
+  若 γ = [1,1,1,1]、β = [0,0,0,0]（初始状态）
+    → [1.732, -0.577, -0.577, -0.577]          完全等于归一化结果（恒等）
+
+  若网络学成 γ = [2, 1, 1, 1]、β = [0.1, 0, 0, 0]
+    → [2×1.732 + 0.1, 1×(-0.577), 1×(-0.577), 1×(-0.577)]
+    = [3.564, -0.577, -0.577, -0.577]          只有第 0 维被放大并偏移
+
+  极端情况：γ_d = σ = 0.433、β_d = μ = 0.25
+    → y_d = (x_d − 0.25)/0.433 × 0.433 + 0.25 = x_d
+    → <strong>LN 被完整撤销，变回恒等</strong>（Chapter 02 就是挑了这组值让例子自洽）</pre>
+
+<div class="callout green">
+  <strong>所以 γ、β 的定位是</strong>
+  <p style="margin:6px 0 0">LN 给的是「规整好的标准尺度」，γ/β 把「要不要保留自己的尺度」的<strong>决定权还给网络</strong>。
+  它们是 <code>nn.LayerNorm</code> 里<strong>唯一的可学习参数</strong>（默认 <code>elementwise_affine=True</code>），
+  初始化 γ=1、β=0 —— 训练刚开始时是恒等的，用不用、怎么用，让网络自己学。</p>
+  <p style="margin:6px 0 0">注意 μ、σ <strong>不是参数</strong>，是运行时对当前 token 当场算出来的统计量。</p>
+</div>
+
+<!-- ================= 7 ================= -->
+<h2>7. 为什么放在子层「前面」（Pre-LN）</h2>
+
+<span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 128–130 行</span>
+
+<pre>128      def forward(self, x, xpos):
+129          x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+130          x = x + self.drop_path(self.mlp(self.norm2(x)))
+131          return x</pre>
+
+<ul style="margin:8px 0 0 20px">
+  <li><strong>每个子层拿到的输入一定是被规整过的</strong>（attention 拿 <code>norm1(x)</code>，MLP 拿 <code>norm2(x₁)</code>）。</li>
+  <li><strong>残差那条直连通路 <code>x + ...</code> 里的 x 原封不动</strong> —— LN 不挡在梯度回传的主路上，深层训练才稳。
+      这就是 Pre-LN 取代 Post-LN（把 LN 放在残差之后）成为主流的原因，EcoSplat 用的也是 Pre-LN。</li>
+  <li>一个 Block 里<strong>两个</strong> LN：<code>norm1</code> 管 attention 前，<code>norm2</code> 管 MLP 前。</li>
+</ul>
+
+<!-- ================= 8 ================= -->
+<h2>8. 回到 EcoSplat 源码</h2>
+
+<table>
+  <tr><th>位置</th><th>代码</th><th>说明</th></tr>
+  <tr><td>croco.py:34</td><td><code>norm_layer=partial(nn.LayerNorm, eps=1e-6)</code></td>
+      <td>用 <code>partial</code> 把 <code>eps=1e-6</code> 预先绑好，之后只要传 <code>embed_dim</code>。<br>
+          <code>eps</code> 是防止 σ→0 时除零的小常数。</td></tr>
+  <tr><td>blocks.py:120/124</td><td><code>self.norm1 = norm_layer(dim)</code><br><code>self.norm2 = norm_layer(dim)</code></td>
+      <td>每个 Block 两个独立的 <code>LayerNorm(1024, eps=1e-6)</code>，参数<strong>不共享</strong>。</td></tr>
+  <tr><td>croco.py:70</td><td><code>Block(..., norm_layer=norm_layer, ...)</code></td>
+      <td>编码器真的把 norm_layer 传进去了 → Block 里是<strong>真 LayerNorm</strong>。</td></tr>
+  <tr><td>croco.py:72</td><td><code>self.enc_norm = norm_layer(enc_embed_dim)</code></td>
+      <td>24 个 Block 全部跑完后，收尾再来一次（最后一个 Block 的输出没经过 LN）。</td></tr>
+  <tr><td>blocks.py:235</td><td><code>self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()</code></td>
+      <td><strong>patch embed 那个在本仓库是 <code>nn.Identity()</code></strong> ——
+          <code>get_patch_embed</code>（patch_embed.py:15）没传 norm_layer，所以第 28 行 <code>x = self.norm(x)</code> 是空操作。</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>数量账</strong>
+  <p style="margin:6px 0 0">编码器 <code>enc_depth = 24</code>：<code>24 × 2 + 1(enc_norm) = 49</code> 个 LayerNorm(1024)。<br>
+  每个含 γ、β 各 1024 个参数 → <code>49 × 2048 = 100,352</code> 个参数。<br>
+  而 patch embed 那个本该是第 50 个，但因为没传 norm_layer，变成了 0 参数的 <code>Identity()</code>。</p>
+</div>
+
+<!-- ================= 9 ================= -->
+<h2>9. 小结</h2>
+
+<div class="callout">
+  <ol style="margin:8px 0 0 18px">
+    <li><strong>LN 解决的是「量级漂移」</strong>：残差是加法，量级只增不减；而 scores 是 q·k，会<strong>平方级</strong>放大这个漂移。</li>
+    <li><strong>它稳定的是每个 token 自己的尺度</strong>（最后那 1024 维），跟 batch、跟其他 token 都无关 —— 所以序列长度、分辨率、batch size 都能随便变。</li>
+    <li><strong>守住的是 scores</strong>：本例 24 层后，不加 LN 到 9.3×10²⁷，加 LN 稳定在 2.53。</li>
+    <li><strong>γ、β 是「撤销权」</strong>：归一化不是强加的限制，网络可以学回自己的尺度。</li>
+    <li><strong>Pre-LN 不挡残差通路</strong>：子层前归一化，x 本身直连，深层梯度才稳。</li>
+    <li><strong>EcoSplat 里共 49 个 LayerNorm(1024)</strong>，10 万左右参数；patch embed 那个是 Identity，没生效。</li>
+  </ol>
+</div>
+
+<h3>自测</h3>
+<details>
+  <summary>① 为什么量级放大 k 倍，scores 会放大 k² 倍？</summary>
+  <p style="margin:8px 0 0">因为 <code>scores = q · k</code> 是「对应分量相乘再求和」。
+  x 放大 k 倍后，q 和 k 都各放大 k 倍，每一项乘积就放大 k² 倍，求和后仍是 k² 倍。</p>
+</details>
+<details>
+  <summary>② 加了 LN 之后，|x| 还是在涨（24 层到 72），这算失败吗？</summary>
+  <p style="margin:8px 0 0">不算。那是残差结构固有的<strong>线性</strong>增长，无害。
+  LN 守住的是「进子层的输入尺度」，所以 scores 恒定 —— 致命的是指数爆炸，不是线性增长。</p>
+</details>
+<details>
+  <summary>③ 如果 γ、β 被学成 γ=σ、β=μ，会发生什么？</summary>
+  <p style="margin:8px 0 0"><code>y = (x−μ)/σ × σ + μ = x</code>，归一化被完整撤销，LN 变回恒等。
+  这说明 LN 是「可选的规整器」而不是硬性限制。</p>
+</details>
+
+</div>
+</body>
+</html>
