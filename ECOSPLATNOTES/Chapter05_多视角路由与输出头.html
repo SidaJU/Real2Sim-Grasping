@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 05 · 多视角路由与输出头</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --blue:#2563eb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.75;}
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  h4{font-size:.98rem; margin:18px 0 6px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+  .callout{background:var(--indigo-soft); border:1px solid #c7d2fe;
+           border-left:5px solid var(--indigo); border-radius:10px; padding:18px 22px; margin:20px 0}
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06); margin:14px 0}
+  th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  table.code td:nth-child(2){font-family:Consolas,monospace; font-size:.82rem; white-space:pre-wrap}
+  table.code td:nth-child(1){width:44px; color:#94a3b8; font-family:Consolas,monospace}
+  .filetag{display:inline-block; background:#0f172a; color:#e2e8f0; font-family:Consolas,monospace;
+           font-size:.78rem; padding:3px 9px; border-radius:5px; margin-bottom:6px}
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600}
+  details{background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 16px; margin:10px 0}
+  summary{cursor:pointer; font-weight:600; color:var(--indigo)}
+  .ok{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Chapter 05 · 多视角路由与输出头</h1>
+  <div class="sub">
+    承接 Ch.03（cross-attention 怎么算）与 Ch.04（RoPE）：<br>
+    本章回答最后两个问题 —— <strong>① 那些 context 视角具体怎么组织、为什么分两套 block；
+    ② token 序列最后怎么变成「每像素高斯」和「相机位姿」。</strong><br>
+    全程仍用「我 / 爱 / 中国」这个玩具例子（3 个视角 × 每视角 3 个 token × 4 维）。
+  </div>
+</header>
+
+<!-- ================= 1 ================= -->
+<h2>1. 全景：从 Encoder 输出到最终产物</h2>
+
+<pre>Encoder 输出   feat : [b, v, l, 1024]        # v 个视角，每视角 l=257 个 token，1024 维
+                 pos  : [b, v, l, 2]
+                      ↓ decoder_embed（Linear 1024 → 768）
+Decoder        f     : [b, v, l, 768]
+                      ↓ 12 层 DecoderBlock（Self-Attn + Cross-Attn + MLP）
+              final_output = [多个尺度的特征]   # 一个 list，每层输出都留着
+                      ↓ 三个头并行
+   ┌──────────────────┼──────────────────┐
+   ↓                  ↓                  ↓
+pts3d head      gaussian_param_head   pose head
+(b, h, w, 3)    (b, 83, h, w)         (b, 9)
+每像素 3D 坐标   → (b, h·w, 83)        → process_pose → (b, 4, 4)
+= 高斯的中心     每像素 83 个参数        = 相机外参
+   └──────────────────┼──────────────────┘
+                      ↓
+        每个视角 65536 个高斯（256×256）+ 一个 4×4 位姿</pre>
+
+<div class="callout green">
+  <strong>最关键的一句话</strong>：高斯不是「一个 token 一个」，而是<strong>每个像素一个</strong>（256×256 = 65536 个）。
+  所以 Decoder 末尾必须把 token 序列<strong>还原成二维特征图并上采样回原图分辨率</strong> —— 这一步由 DPT 头完成，
+  它和你在 MiniDiT 里见过的 <code>unpatchify</code> 是同一个目的，但用的是卷积上采样（更平滑，能补足细节）。
+</div>
+
+<!-- ================= 2 ================= -->
+<h2>2. 多视角路由：谁跟谁配对、谁走哪套 block</h2>
+
+<p>用玩具例子：<strong>3 个视角</strong>（视角 0 / 1 / 2），每个视角 3 个 token（我 / 爱 / 中国），每 token 4 维。</p>
+
+<h3>2.1 每个视角的 context 怎么来（已在 Ch.03 学过）</h3>
+
+<pre>generate_ctx_views（backbone_croco_multiview.py:178-184）：
+  把每个视角「复制 v 份」→ 用 mask 去掉对角线（自己不当自己的 context）→ 拼起来
+
+  视角 0 的 context = [视角1 的 3 个 token | 视角2 的 3 个 token] = 6 个 token
+  视角 1 的 context = [视角0 的 3 个 token | 视角2 的 3 个 token] = 6 个 token
+  视角 2 的 context = [视角0 的 3 个 token | 视角1 的 3 个 token] = 6 个 token
+
+→ 每个视角：Q = 自己的 3 个 token，K/V = 别人的 6 个 token
+→ scores 形状 (3, 6) —— 不是方阵</pre>
+
+<h3>2.2 视角 0 单独走 blk1，其余批量走 blk2</h3>
+
+<span class="filetag">backbone_croco_multiview.py · 第 187-200 行</span>
+
+<pre>187  for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
+188      feat_current     = final_output[-1]
+189      feat_current_ctx = generate_ctx_views(feat_current)
+190      # img1 side —— 视角 0 单独
+191      f1, _ = blk1(feat_current[:, 0], feat_current_ctx[:, 0], pose[:, 0], pos_ctx[:, 0])
+192      f1 = f1.unsqueeze(1)
+193      # img2 side —— 视角 1..v-1 打包成一批
+194      f2, _ = blk2(rearrange(feat_current[:, 1:],     "b v l c -> (b v) l c"),
+195                   rearrange(feat_current_ctx[:, 1:], "b v l c -> (b v) l c"),
+196                   rearrange(pose[:, 1:],             "b v l c -> (b v) l c"),
+197                   rearrange(pos_ctx[:, 1:],          "b v l c -> (b v) l c"))
+198      f2 = rearrange(f2, "(b v) l c -> b v l c", b=b, v=v-1)
+200      final_output.append(torch.cat((f1, f2), dim=1))</pre>
+
+<table class="code">
+  <tr><th>行</th><th>代码</th><th>讲解</th></tr>
+  <tr><td>187</td><td>zip(dec_blocks, dec_blocks2)</td>
+      <td>两套 DecoderBlock 参数：<strong>blk1 只服务视角 0，blk2 服务视角 1..v-1</strong>。
+      类比 encoder 里的 pose_head / pose_head2 也是这个「第 0 视角单独、其余共享」的双套设计。</td></tr>
+  <tr><td>191</td><td>blk1(... , 0)</td><td>视角 0 是<strong>参考视角</strong>（relative pose 的基准，见 Ch.03/§5），所以要单独一套参数精细处理。</td></tr>
+  <tr><td>194-197</td><td>rearrange "b v l c -> (b v) l c"</td>
+      <td>把 v−1 个视角<strong>塞进 batch 维</strong>，一次性批量算完 —— 省时间，且这些视角共享 blk2 的同一套权重（权值共享）。</td></tr>
+  <tr><td>200</td><td>cat((f1, f2), dim=1)</td><td>算完再拼回 (b, v, l, c)，追加到 final_output（供下一层和 DPT 头使用）。</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- header labels -->
+  <text x="115" y="30" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">本视角（算 Q）</text>
+  <text x="355" y="30" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">context（算 K/V，别人的拼起来）</text>
+  <text x="640" y="30" fill="#1e293b" font-size="12.5" font-weight="700" text-anchor="middle">走哪套 block</text>
+
+  <!-- row 0: view 0 -->
+  <g>
+    <text x="20" y="72" fill="#4f46e5" font-size="12" font-weight="700">视角 0</text>
+    <rect x="60" y="50" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="79" y="70" fill="#1e293b" font-size="11" text-anchor="middle">我</text>
+    <rect x="102" y="50" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="121" y="70" fill="#1e293b" font-size="11" text-anchor="middle">爱</text>
+    <rect x="144" y="50" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="163" y="70" fill="#1e293b" font-size="11" text-anchor="middle">中</text>
+
+    <line x1="188" y1="65" x2="228" y2="65" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="230,65 220,60 220,70" fill="#64748b"/>
+
+    <rect x="238" y="50" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="257" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">我'</text>
+    <rect x="280" y="50" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="299" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">爱'</text>
+    <rect x="322" y="50" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="341" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">中'</text>
+    <rect x="364" y="50" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="383" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">我"</text>
+    <rect x="406" y="50" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="425" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">爱"</text>
+    <rect x="448" y="50" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="467" y="70" fill="#64748b" font-size="10.5" text-anchor="middle">中"</text>
+    <text x="500" y="70" fill="#64748b" font-size="10.5">← 视角1 + 视角2 拼成 6 个</text>
+
+    <line x1="512" y1="65" x2="552" y2="65" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="554,65 544,60 544,70" fill="#64748b"/>
+    <rect x="560" y="48" width="140" height="34" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+    <text x="630" y="70" fill="#4f46e5" font-size="12" font-weight="700" text-anchor="middle">blk1（dec_blocks）</text>
+    <text x="712" y="70" fill="#64748b" font-size="11">视角 0 专用</text>
+  </g>
+
+  <!-- row 1: view 1 -->
+  <g>
+    <text x="20" y="152" fill="#059669" font-size="12" font-weight="700">视角 1</text>
+    <rect x="60" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="79" y="150" fill="#1e293b" font-size="11" text-anchor="middle">我</text>
+    <rect x="102" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="121" y="150" fill="#1e293b" font-size="11" text-anchor="middle">爱</text>
+    <rect x="144" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="163" y="150" fill="#1e293b" font-size="11" text-anchor="middle">中</text>
+    <line x1="188" y1="145" x2="228" y2="145" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="230,145 220,140 220,150" fill="#64748b"/>
+    <rect x="238" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="257" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">我⁰</text>
+    <rect x="280" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="299" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">爱⁰</text>
+    <rect x="322" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="341" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">中⁰</text>
+    <rect x="364" y="130" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="383" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">我"</text>
+    <rect x="406" y="130" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="425" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">爱"</text>
+    <rect x="448" y="130" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+    <text x="467" y="150" fill="#64748b" font-size="10.5" text-anchor="middle">中"</text>
+    <text x="500" y="150" fill="#64748b" font-size="10.5">← 视角0 + 视角2</text>
+    <line x1="512" y1="145" x2="552" y2="145" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="554,145 544,140 544,150" fill="#64748b"/>
+    <rect x="560" y="128" width="140" height="34" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+    <text x="630" y="150" fill="#059669" font-size="12" font-weight="700" text-anchor="middle">blk2（dec_blocks2）</text>
+  </g>
+
+  <!-- row 2: view 2 -->
+  <g>
+    <text x="20" y="232" fill="#059669" font-size="12" font-weight="700">视角 2</text>
+    <rect x="60" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="79" y="230" fill="#1e293b" font-size="11" text-anchor="middle">我</text>
+    <rect x="102" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="121" y="230" fill="#1e293b" font-size="11" text-anchor="middle">爱</text>
+    <rect x="144" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="163" y="230" fill="#1e293b" font-size="11" text-anchor="middle">中</text>
+    <line x1="188" y1="225" x2="228" y2="225" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="230,225 220,220 220,230" fill="#64748b"/>
+    <rect x="238" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="257" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">我⁰</text>
+    <rect x="280" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="299" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">爱⁰</text>
+    <rect x="322" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="341" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">中⁰</text>
+    <rect x="364" y="210" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="383" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">我'</text>
+    <rect x="406" y="210" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="425" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">爱'</text>
+    <rect x="448" y="210" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+    <text x="467" y="230" fill="#64748b" font-size="10.5" text-anchor="middle">中'</text>
+    <text x="500" y="230" fill="#64748b" font-size="10.5">← 视角0 + 视角1</text>
+    <line x1="512" y1="225" x2="552" y2="225" stroke="#64748b" stroke-width="1.8"/>
+    <polygon points="554,225 544,220 544,230" fill="#64748b"/>
+  </g>
+
+  <!-- batch brace for rows 1-2 -->
+  <path d="M 552 128 L 542 128 L 542 238 L 552 238" fill="none" stroke="#059669" stroke-width="2"/>
+  <text x="715" y="190" fill="#059669" font-size="11.5" font-weight="700">视角 1、2 打包成一批</text>
+  <text x="715" y="212" fill="#64748b" font-size="11">共享 blk2 权重</text>
+  <text x="715" y="234" fill="#64748b" font-size="11">（batch 维 = b×(v−1)）</text>
+
+  <rect x="60" y="272" width="740" height="52" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="80" y="294" fill="#dc2626" font-size="12.5" font-weight="700">关键：永远不把自己算进自己的 context（对角线被 mask 掉了）</text>
+  <text x="80" y="314" fill="#64748b" font-size="11.5">Q 长度 3（自己），K/V 长度 6（另外两个视角拼起来）→ scores 形状 (3, 6)</text>
+</svg>
+<figcaption>图 1 · 多视角路由：视角 0 单独走 blk1，视角 1..v−1 批量走 blk2；context 由「其他视角」拼成。</figcaption>
+</div>
+
+<h3>2.3 一个名字陷阱：<code>_decoder(feat, pose)</code> 里的 pose 其实是坐标</h3>
+
+<div class="callout red">
+  <strong>源码里 <code>_decoder(self, feat, pose, ...)</code> 的第三个参数名叫 <code>pose</code>，但它装的不是位姿！</strong><br>
+  看调用处（backbone_croco_multiview.py:243）：
+  <code>self._decoder(feat[:, :v-target_num_views], pos[:, :v-target_num_views])</code><br>
+  传进去的是 <code>pos</code> —— 就是 Ch.01 里那个 <code>[b, v, l, 2]</code> 的<strong>网格坐标</strong>。
+  它只是被形参命名成了 <code>pose</code>，一路传给 DecoderBlock 的 <code>xpos / ypos</code>，最终喂给 RoPE（Ch.04）。<br>
+  <strong>真正的位姿是网络「输出」的东西（pose head），不是输入。</strong>
+</div>
+
+<h3>2.4 循环 12 层，每层输出都留着</h3>
+
+<p><code>final_output.append(...)</code> 每跑一层就存一份 —— 最后 <code>final_output</code> 是一个
+<strong>多尺度特征列表</strong>（类似 DPT 的 hook）。后面的 DPT 高斯头要的就是这种多层特征
+（浅层管细节/边缘，深层管语义），所以它接收的是 <code>[tok[:, i] for tok in dec_feat]</code>
+——「第 i 个视角在所有层上的特征」。</p>
+
+<!-- ================= 3 ================= -->
+<h2>3. 输出头 A：pts3d head —— 高斯的「中心」从哪来</h2>
+
+<pre>254  res1 = self._downstream_head(1, [tok[:, 0] for tok in dec_feat], shape[:, 0])
+317  pts_all = torch.stack([r['pts3d'] for r in all_mean_res], dim=1)   # [b, v, h, w, 3]
+
+→ 每个像素一个 3D 坐标 (x, y, z)，直接在【第一视角的坐标系】里给出。</pre>
+
+<p><strong>这就是高斯的中心</strong>（μ）。不是从 token 反推的，而是网络直接回归出了一张
+<code>h × w × 3</code> 的点云图 —— 和 DUSt3R 的 pointmap 是同一个思路。</p>
+
+<h3>用玩具例子看</h3>
+
+<pre>3 个 token（我 / 爱 / 中国），4 维  →  pts3d head  →  每个 token（当成 1 个像素）出 3 个数：
+
+  我   → (0.1, 0.2, 1.5)     ← 这个像素对应的 3D 点
+  爱   → (0.4, 0.1, 1.7)
+  中国 → (0.7, 0.3, 2.0)
+
+真实情况：256×256 = 65536 个像素，每个出 3 个数 → [b, v, 256, 256, 3]</pre>
+
+<!-- ================= 4 ================= -->
+<h2>4. 输出头 B：高斯参数头（DPT）—— 除了中心以外的 83 个数</h2>
+
+<span class="filetag">encoder_spfsplat.py · 第 261-274、305 行</span>
+
+<pre>262  GS_res1 = self.gaussian_param_head([tok[:, 0] for tok in dec_feat],
+                                        images[:, 0, :3], shape[0, 0])
+263  GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")     # 摊平成每像素一行
+305  gaussians = torch.stack(all_other_params, dim=1)         # [b, v, 65536, 83]
+325  densities = gaussians[..., 0].sigmoid()                  # 第 0 个 = 不透明度
+326  gaussian_parameters = gaussians[..., 1:]                 # 剩下 82 个 = 尺度/旋转/颜色…</pre>
+
+<table>
+  <tr><th>产物</th><th>形状</th><th>含义</th></tr>
+  <tr><td>gaussian_param_head 输出</td><td><code>(b, 83, h, w)</code></td><td>每像素 83 个数（DPT 卷积上采样出来的）</td></tr>
+  <tr><td>rearrange 后</td><td><code>(b, h·w, 83)</code></td><td>65536 个像素 × 83（256×256 时）</td></tr>
+  <tr><td><code>gaussians[..., 0]</code></td><td>标量</td><td><strong>密度/不透明度</strong>（过 sigmoid）</td></tr>
+  <tr><td><code>gaussians[..., 1:]</code></td><td>82 维</td><td>尺度、旋转、球谐颜色、不透明度等（拆分在读源码阶段确认）</td></tr>
+  <tr><td>pts_all（来自 §3）</td><td><code>(b, h·w, 3)</code></td><td><strong>中心 μ</strong>（不在 83 里！）</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>别搞混</strong>：<strong>中心 μ 不在那 83 个数里</strong> —— 它由 pts3d head 单独给出（§3）。
+  83 个是「中心之外的一切」：1 个密度 + 82 个其他参数。
+  两者合起来才是一个完整的高斯。
+</div>
+
+<h3>4.1 DPT 头怎么把 token 变回图像（对比 unpatchify）</h3>
+
+<pre>你在 MiniDiT 里学过的做法（unpatchify）：
+  token (b, N, patch_dim) → reshape 回 (b, C, H, W)    纯变形，无参数，无信息融合
+
+EcoSplat 的做法（DPT）：
+  dec_feat（多层 token 列表）
+    → 每层重排成 2D 特征图   （16×16 的小图）
+    → 卷积 + 上采样，逐层放大（16 → 32 → 64 → … → 256）
+    → 层与层之间相加融合（浅层补细节，深层给语义）
+    → 输出 (b, 83, 256, 256)
+
+区别：unpatchify 是「拼回去」，DPT 是「画回来」—— 有卷积参数、能补细节、分辨率可变。</pre>
+
+<h3>玩具例子版</h3>
+
+<pre>3 个 token（我 / 爱 / 中国），4 维，当成 (1, 3) 的特征图：
+
+  第 1 步 重排：   [我 | 爱 | 中国]   →  1 行 3 列的小图
+  第 2 步 上采样： 1×3  →  2×6（真实是 16×16 → 256×256）
+  第 3 步 每像素出参数：
+      像素(0,0) → 5 个数（玩具版；真实是 83 个）
+      像素(0,1) → 5 个数
+      …
+  第 4 步 第 0 个数 = 密度，其余 = 尺度/旋转/颜色
+
+→ 于是「每个像素一个高斯」，中心来自 pts3d，其余来自这里。</pre>
+
+<!-- ================= 5 ================= -->
+<h2>5. 输出头 C：pose head —— 相机位姿怎么出来</h2>
+
+<span class="filetag">encoder_spfsplat.py · 第 288-313 行</span>
+
+<pre>288  pose_res1 = self.pose_head([tok[:, 0] for tok in dec_feat], shape[0, 0])   # (b, 9)
+291  pose_res2 = self.pose_head2([tok[:, i] for tok in dec_feat], shape[0, i])   # (b, 9)
+308  poses_enc = torch.stack(all_pose_params, dim=1)          # (b, v, 9)
+309  pred_extrinsics = self.process_pose(poses_enc, context['index'])   # (b, v, 4, 4)</pre>
+
+<table>
+  <tr><th>阶段</th><th>形状</th><th>讲解</th></tr>
+  <tr><td>pose_head 输出</td><td><code>(b, 9)</code></td>
+      <td>每个视角 9 个数：<strong>3 个平移 + 6 个旋转</strong>（6D 旋转表示，避免四元数/欧拉角的奇异性）</td></tr>
+  <tr><td>stack 后</td><td><code>(b, v, 9)</code></td><td>v 个视角各一套</td></tr>
+  <tr><td>process_pose</td><td><code>(b, v, 4, 4)</code></td>
+      <td>把 9 维组装成 4×4 外参矩阵（旋转矩阵由 6D 表示还原，拼接平移向量）</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>注意 pose_head / pose_head2 又是两套</strong> —— 和 blk1 / blk2、gaussian_param_head / gaussian_param_head2
+  是同一个规律：<strong>第 0 视角单独一套参数，其余视角共享另一套</strong>。
+  因为第 0 视角被当作<strong>参考坐标系</strong>（<code>pose_make_relative=True</code>），
+  它自己的位姿是「单位阵基准」，其余视角回归的是<strong>相对它的位姿</strong>。
+</div>
+
+<h3>玩具例子</h3>
+
+<pre>3 个视角的 decoder token → pose head：
+
+  视角 0 → 9 个数 (0,0,0, 1,0,0,0,1,0)  → 4×4 = 单位阵（它就是参考系）
+  视角 1 → 9 个数 → 4×4 = 相对视角 0 的外参
+  视角 2 → 9 个数 → 4×4 = 相对视角 0 的外参
+
+所以 EcoSplat 是 pose-free 的：它<strong>不需要输入位姿</strong>，
+而是自己在 forward 里把位姿「算出来」（这就是 SPFSplat / NoPoSplat 这一系的核心卖点）。</pre>
+
+<!-- ================= 6 ================= -->
+<h2>6. 完整前向：Ch.01 → Ch.05 串起来</h2>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <rect x="20" y="30" width="130" height="56" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="85" y="54" fill="#4f46e5" font-size="11.5" font-weight="700" text-anchor="middle">输入</text>
+  <text x="85" y="72" fill="#64748b" font-size="10" text-anchor="middle">v 张图 + 内参</text>
+
+  <line x1="156" y1="58" x2="196" y2="58" stroke="#64748b" stroke-width="2"/>
+  <polygon points="198,58 188,53 188,63" fill="#64748b"/>
+
+  <rect x="204" y="30" width="130" height="56" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="269" y="54" fill="#4f46e5" font-size="11.5" font-weight="700" text-anchor="middle">Ch.01 切块</text>
+  <text x="269" y="72" fill="#64748b" font-size="10" text-anchor="middle">257 token + pos</text>
+
+  <line x1="340" y1="58" x2="380" y2="58" stroke="#64748b" stroke-width="2"/>
+  <polygon points="382,58 372,53 372,63" fill="#64748b"/>
+
+  <rect x="388" y="30" width="130" height="56" rx="8" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="453" y="54" fill="#059669" font-size="11.5" font-weight="700" text-anchor="middle">Ch.02 Encoder</text>
+  <text x="453" y="72" fill="#64748b" font-size="10" text-anchor="middle">24 层 self-attn</text>
+
+  <line x1="524" y1="58" x2="564" y2="58" stroke="#64748b" stroke-width="2"/>
+  <polygon points="566,58 556,53 556,63" fill="#64748b"/>
+
+  <rect x="572" y="30" width="130" height="56" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="637" y="54" fill="#d97706" font-size="11.5" font-weight="700" text-anchor="middle">Ch.03/05 Decoder</text>
+  <text x="637" y="72" fill="#64748b" font-size="10" text-anchor="middle">12 层 + cross-attn</text>
+
+  <line x1="708" y1="58" x2="748" y2="58" stroke="#64748b" stroke-width="2"/>
+  <polygon points="750,58 740,53 740,63" fill="#64748b"/>
+
+  <rect x="756" y="30" width="90" height="56" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="801" y="54" fill="#dc2626" font-size="11.5" font-weight="700" text-anchor="middle">Ch.05 输出头</text>
+  <text x="801" y="72" fill="#64748b" font-size="10" text-anchor="middle">三个头</text>
+
+  <!-- outputs -->
+  <rect x="20" y="140" width="250" height="60" rx="8" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="145" y="164" fill="#059669" font-size="12" font-weight="700" text-anchor="middle">pts3d head</text>
+  <text x="145" y="184" fill="#64748b" font-size="10.5" text-anchor="middle">每像素 3D 坐标 = 高斯中心 μ</text>
+
+  <rect x="290" y="140" width="270" height="60" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+  <text x="425" y="164" fill="#d97706" font-size="12" font-weight="700" text-anchor="middle">gaussian_param_head（DPT）</text>
+  <text x="425" y="184" fill="#64748b" font-size="10.5" text-anchor="middle">每像素 83 个 = 1 密度 + 82 参数</text>
+
+  <rect x="580" y="140" width="266" height="60" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+  <text x="713" y="164" fill="#4f46e5" font-size="12" font-weight="700" text-anchor="middle">pose head</text>
+  <text x="713" y="184" fill="#64748b" font-size="10.5" text-anchor="middle">每视角 9 维 → 4×4 外参</text>
+
+  <rect x="20" y="222" width="826" height="56" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="40" y="246" fill="#1e293b" font-size="12.5" font-weight="700">最终产物：每个视角 65536 个 3D 高斯（中心 + 尺度 + 旋转 + 颜色 + 不透明度） + 一套 4×4 相机外参</text>
+  <text x="40" y="268" fill="#64748b" font-size="11.5">→ 交给 diff_gauss_pose / gsplat 光栅化渲染 → 渲染图 vs 真图算 loss（后面就是训练与 IGF 效率正则了）</text>
+</svg>
+<figcaption>图 2 · 完整前向链路（Ch.01 → Ch.05）与三个输出头。</figcaption>
+</div>
+
+<!-- ================= 7 ================= -->
+<h2>7. 学完了，接下来：源码阅读路线</h2>
+
+<p>理论部分（Ch.01–05）到此结束。要开始认真读源码，建议按这个顺序，每一步都对应一个已学的概念：</p>
+
+<ol class="steps">
+  <li><strong><code>src/dataset/types.py</code></strong> —— 看清输入到底有哪几个张量、各自的 shape（对应 Ch.01）</li>
+  <li><strong><code>src/model/encoder/backbone/croco/patch_embed.py</code></strong> —— patchify 与 pos 的生成（Ch.01 + Supplement_PatchEmbed）</li>
+  <li><strong><code>.../croco/blocks.py</code></strong> —— Attention / CrossAttention / Block / DecoderBlock 四个类（Ch.02 骨干 + Ch.03 跨视角）</li>
+  <li><strong><code>.../croco/pos_embed.py</code> + <code>curope/kernels.cu</code></strong> —— RoPE 的 PyTorch 版与 CUDA 版对照读（Ch.04，也是你练手 CUDA 的入口）</li>
+  <li><strong><code>backbone_croco_multiview.py</code></strong> —— 多视角路由：<code>_encode_image</code> / <code>_decoder</code> / <code>generate_ctx_views</code>（Ch.05 §2）</li>
+  <li><strong><code>encoder_spfsplat.py</code></strong> —— 三个输出头怎么挂上去、gaussians 怎么组装（Ch.05 §3-5）</li>
+  <li><strong><code>.../heads/dpt_gs_head.py</code>、<code>pose_head.py</code></strong> —— DPT 上采样与 9 维位姿回归的细节</li>
+  <li><strong><code>src/model/decoder/cuda_splatting.py</code></strong> —— 高斯怎么被渲染成图（进入训练/推理阶段）</li>
+</ol>
+
+<div class="callout">
+  <strong>读源码的建议</strong>：带着「shape 会怎么变」去读 —— 每到一个函数先确认输入输出形状，
+  和本篇笔记里的数字对得上，就说明你理解了。对不上就是还没懂，回头查笔记对应章节。
+</div>
+
+<h2>8. 自测</h2>
+
+<ol class="steps">
+  <li>Decoder 里视角 0 和视角 1..v−1 分别走哪套 block？为什么分两套？</li>
+  <li><code>_decoder(feat, pose)</code> 里的 <code>pose</code> 到底是什么？</li>
+  <li>高斯的中心 μ 在哪产生？在那 83 个数里吗？</li>
+  <li>83 个数分别是什么？每个视角总共产生多少个高斯（256×256 时）？</li>
+  <li>pose head 输出几个数？怎么变成 4×4 矩阵？为什么说 EcoSplat 是 pose-free 的？</li>
+</ol>
+
+<details>
+  <summary>答案</summary>
+  <p><strong>1.</strong> 视角 0 走 <code>blk1</code>（<code>dec_blocks</code>），视角 1..v−1 打包成一批走 <code>blk2</code>（<code>dec_blocks2</code>）。因为视角 0 是参考视角（相对位姿的基准），单独一套参数精算；其余共享以省参数并支持批量。</p>
+  <p><strong>2.</strong> 不是位姿，是 <code>pos</code> —— <code>[b, v, l, 2]</code> 的网格坐标，只是形参名叫 pose。真正的位姿是输出（pose head）。</p>
+  <p><strong>3.</strong> 中心 μ 由 <strong>pts3d head</strong>（<code>_downstream_head</code>）给出，形状 <code>[b, v, h, w, 3]</code>；<strong>不在 83 个数里</strong>。</p>
+  <p><strong>4.</strong> 第 0 个是密度（过 sigmoid），剩下 82 个是尺度/旋转/球谐颜色/不透明度等。256×256 时每视角 65536 个高斯。</p>
+  <p><strong>5.</strong> 每视角 9 个数（3 平移 + 6 旋转的 6D 表示），<code>process_pose</code> 组装成 4×4。因为它不需要输入位姿、而是自己算出位姿，所以是 pose-free。</p>
+</details>
+
+</div>
+</body>
+</html>

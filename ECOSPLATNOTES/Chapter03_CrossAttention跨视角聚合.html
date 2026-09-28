@@ -320,6 +320,15 @@ A 的 token 从此不再是「只看过自己这张图」，而是「看过别�
   → Q 长度 257，K/V 长度 514，scores 形状 (257, 514)
   → 再分头：12 头 × 64 维 → attn 形状 [b, 12, 257, 514]   ← 源码注释里写的就是这个</pre>
 
+  <div class="callout amber">
+    <strong>核对补充：514 只在 v = 3 时成立。</strong>
+    context 长度 = (v − 1) × l，其中 <strong>v 是一次喂进 decoder 的视角数</strong>。
+    源码注释里的 514 来自 3 视角的调试运行（2 × 257）。<br>
+    而我们实际推理用 <code>num_context_views = 4</code> → v = 4 →
+    context = 3 × 257 = <strong>771</strong>，attn 形状是 <code>[b, 12, 257, 771]</code>。<br>
+    公式不变，只是数字跟着 v 走 —— 别把 514 当成固定常数。
+  </div>
+
 <!-- ================= 5 ================= -->
 <h2>5. 源码：CrossAttention 逐行</h2>
 <span class="filetag">src/model/encoder/backbone/croco/blocks.py · 第 133–179 行</span>
