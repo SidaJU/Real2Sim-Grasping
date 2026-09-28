@@ -115,6 +115,39 @@ pts3d head      gaussian_param_head   pose head
 → 每个视角：Q = 自己的 3 个 token，K/V = 别人的 6 个 token
 → scores 形状 (3, 6) —— 不是方阵</pre>
 
+<h4>2.1.1 完整矩阵链 —— 纠正一个高频错误：拼接方向</h4>
+
+<div class="callout red">
+  <strong>易错点</strong>：把「视角1 的 3 个 token」和「视角2 的 3 个 token」<strong>横着接</strong>成 3×8
+  → 于是 scores 变成 <code>[3,4] × [8,3]</code>，根本乘不了。<br>
+  <strong>正确</strong>：它们是<strong>竖着叠</strong>（沿 token 维），3+3 = 6 个 token，特征维仍是 4 → <strong>6×4</strong>。
+</div>
+
+<pre>视角 1 的 token:  3 行 × 4 列
+视角 2 的 token:  3 行 × 4 列
+                    ↓ 竖着叠（token 维相加，特征维不变）
+context:          6 行 × 4 列      ← 不是 3×8！
+
+代码证据（第 183 行）：
+  ctx_views.flatten(2, 3)   # (b, v, v-1, l, c) → (b, v, (v-1)*l, c)
+                            # 只压 token 维 (v-1, l) → (v-1)*l，特征维 c 不动</pre>
+
+<pre>以视角 0 为例的完整矩阵链：
+
+  视角 0 的 token:   (3, 4)
+  context:           (6, 4)
+
+  Q = (3,4) @ W_q(4,4) = (3,4)     ← W_q 来自 blk1
+  K = (6,4) @ W_k(4,4) = (6,4)     ← W_k 也来自 blk1（不是 blk2！见 §2.5）
+  V = (6,4) @ W_v(4,4) = (6,4)
+
+  scores = Q @ Kᵀ = (3,4) @ (4,6) = (3,6)     ← 3 个 query × 6 个 key ✓ 合法
+  attn   = softmax(scores, dim=-1) → (3,6)，每行和 = 1
+  out    = attn @ V = (3,6) @ (6,4) = (3,4)   ← 回到「3 个 token × 4 维」
+
+真实维度（v=3、256×256 输入）：
+  Q = (257,768)   K = V = (514,768)   scores = (257,514)   out = (257,768)</pre>
+
 <h3>2.2 视角 0 单独走 blk1，其余批量走 blk2</h3>
 
 <span class="filetag">backbone_croco_multiview.py · 第 187-200 行</span>
@@ -273,6 +306,94 @@ pts3d head      gaussian_param_head   pose head
 <strong>多尺度特征列表</strong>（类似 DPT 的 hook）。后面的 DPT 高斯头要的就是这种多层特征
 （浅层管细节/边缘，深层管语义），所以它接收的是 <code>[tok[:, i] for tok in dec_feat]</code>
 ——「第 i 个视角在所有层上的特征」。</p>
+
+<h4>2.4.1 context 的刷新时机：特征每层重算，坐标只算一次</h4>
+
+<pre>186  pos_ctx = generate_ctx_views(pose)                     # 循环【之前】算一次
+                                                            # 网格坐标不变 → 算一次就够
+187  for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
+188      feat_current     = final_output[-1]                 # 上一层的输出（已拼好）
+189      feat_current_ctx = generate_ctx_views(feat_current)  # 循环【里面】每层重算
+191      f1 = blk1(feat_current[:,0], feat_current_ctx[:,0], ...)   # context 当参数 y 传进去</pre>
+
+<p><strong>两个要点</strong>：</p>
+<ol style="margin:6px 0 0 18px">
+  <li><strong>context 不是 block「存」的</strong> —— 是 decoder 循环在 block <strong>外面</strong>现算好，
+      当成 <code>y</code> 参数传进去的。block 自己不保存任何 context。</li>
+  <li><strong>第 i 层的 context = 其他视角在第 i−1 层「更新后」的 token</strong>，不是原始 token。
+      所以视角 0 下一层查到的是「视角 1、2 刚被 blk2 处理过的样子」——
+      跨视角对应关系就是这样一层层精炼出来的（这也是为什么要堆 12 层，而不是 1 层）。</li>
+</ol>
+
+<div class="callout green">
+  <strong>信息怎么跨 block 流动</strong>：blk1 产出的 <code>f1</code> 与 blk2 产出的 <code>f2</code>
+  拼回 <code>final_output</code> → 成为下一层的 <code>feat_current</code> →
+  再 <code>generate_ctx_views</code> → 下一层的 context。<br>
+  <strong>参数各自独立，特征共享流动。</strong>
+</div>
+
+<!-- ================= 2.5 ================= -->
+<h2>2.5 这套路由的三条铁律（易错点合集）</h2>
+
+<table>
+  <tr><th>#</th><th>铁律</th><th>常见误解</th></tr>
+  <tr><td>①</td><td><strong>拼接沿 token 维（竖着叠）</strong>：3+3 → 6 个 token × 4 维 = <code>6×4</code></td>
+      <td>误以为横着接成 <code>3×8</code>，导致 <code>scores</code> 乘不出来（见 §2.1.1）</td></tr>
+  <tr><td>②</td><td><strong>W 不跨 block</strong>：视角 0 这条链的 W_q / W_k / W_v <strong>全部来自 blk1</strong></td>
+      <td>误以为「Q 用 blk1 的 W_q、K/V 用 blk2 的 W_k/W_v」</td></tr>
+  <tr><td>③</td><td><strong>两套路由规则互相独立</strong>（见下表）</td>
+      <td>把「用哪套权重」和「去查谁」混为一谈</td></tr>
+</table>
+
+<h3>2.5.1 ③ 的两套规则（务必分清）</h3>
+
+<table>
+  <tr><th>路由类型</th><th>规则</th><th>决定什么</th><th>会不会变</th></tr>
+  <tr><td><strong>权重路由</strong><br>（谁被哪个 block 处理）</td>
+      <td><strong>按下标固定</strong>：视角 0 → blk1；视角 1..v−1 → blk2<br>
+      （其余视角共用同一套权重、打包成一批）</td>
+      <td>用谁的 W_q / W_k / W_v</td>
+      <td class="bad">永不轮换</td></tr>
+  <tr><td><strong>context 路由</strong><br>（谁的 token 当 K/V）</td>
+      <td><strong>按排除自己</strong>：每个视角的 context = 其他所有视角拼起来</td>
+      <td>Q 去查谁</td>
+      <td class="ok">每层随特征更新</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>举例：视角 1 的 cross-attention</strong><br>
+  Q = 视角 1 自己的 token（<strong>被 blk2 处理</strong>）<br>
+  K/V = 视角 0 + 视角 2 的 token —— 其中<strong>视角 0 的 token 是上一层 blk1 产出的</strong>，
+  视角 2 的 token 是上一层 blk2 产出的。<br>
+  → 所以 context 里<strong>混着两个栈的产出</strong>，但「用哪套权重处理查询」只由下标决定。
+</div>
+
+<h3>2.5.2 一主多从，不轮换</h3>
+
+<pre>视角 0            → 永远 blk1（dec_blocks）      ← 参考视角 / 锚点（位姿 = 单位阵）
+视角 1, 2, 3, 4…  → 永远 blk2（dec_blocks2）     ← 共用同一套权重，打包成一批
+
+代码（第 191、194 行）：
+  f1 = blk1(feat_current[:, 0],  ...)      # 只取下标 0
+  f2 = blk2(feat_current[:, 1:], ...)      # 其余全部塞进 batch 维 b×(v−1)</pre>
+
+<ul>
+  <li><strong>术语别反</strong>：<strong>视角 0 才是参考 / 锚点视角（reference / anchor）</strong> ——
+      它的预测位姿是单位阵，是所有相对位姿的基准；其余视角是「相对它估计位姿」的视角，
+      <strong>不是</strong>"参考视角"。</li>
+  <li><strong>参数量不随视角数增长</strong>：训 2 张图和 8 张图用同一套模型；推理时视角数可任意（我们用 4 张）。</li>
+  <li><strong>视角 1..v−1 之间置换等变</strong>：交换视角 1 和 2 的顺序，结果等价
+      （共享权重 + context 排除自身）。</li>
+  <li><strong>同样的「一主多从」在全网出现 4 次</strong>：dec_blocks / dec_blocks2、
+      pose_head / pose_head2、gaussian_param_head / gaussian_param_head2、
+      _downstream_head(1) / _downstream_head(2)。</li>
+</ul>
+
+<div class="callout">
+  <strong>小坑</strong>：<code>forward</code> 里有 <code>symmetrize_batch</code> 参数（默认 False），
+  文件里也 import 了 <code>make_batch_symmetric</code>；若开启会把批次复制并交换角色（DUSt3R 处理两张图时的技巧）。
+  <strong>EcoSplat / SPFSplat 这条路径默认不走</strong> —— 所以我们看到的就是固定分配、不轮换。
+</div>
 
 <!-- ================= 3 ================= -->
 <h2>3. 输出头 A：pts3d head —— 高斯的「中心」从哪来</h2>
