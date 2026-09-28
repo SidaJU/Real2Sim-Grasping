@@ -220,12 +220,12 @@ context:          6 行 × 4 列      ← 不是 3×8！
 
   <!-- row 1: view 1 -->
   <g>
-    <text x="20" y="152" fill="#059669" font-size="12" font-weight="700">视角 1</text>
-    <rect x="60" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <text x="20" y="152" fill="#d97706" font-size="12" font-weight="700">视角 1</text>
+    <rect x="60" y="130" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
     <text x="79" y="150" fill="#1e293b" font-size="11" text-anchor="middle">我</text>
-    <rect x="102" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <rect x="102" y="130" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
     <text x="121" y="150" fill="#1e293b" font-size="11" text-anchor="middle">爱</text>
-    <rect x="144" y="130" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <rect x="144" y="130" width="38" height="30" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
     <text x="163" y="150" fill="#1e293b" font-size="11" text-anchor="middle">中</text>
     <line x1="188" y1="145" x2="228" y2="145" stroke="#64748b" stroke-width="1.8"/>
     <polygon points="230,145 220,140 220,150" fill="#64748b"/>
@@ -244,18 +244,18 @@ context:          6 行 × 4 列      ← 不是 3×8！
     <text x="500" y="150" fill="#64748b" font-size="10.5">← 视角0 + 视角2</text>
     <line x1="512" y1="145" x2="552" y2="145" stroke="#64748b" stroke-width="1.8"/>
     <polygon points="554,145 544,140 544,150" fill="#64748b"/>
-    <rect x="560" y="128" width="140" height="34" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
-    <text x="630" y="150" fill="#059669" font-size="12" font-weight="700" text-anchor="middle">blk2（dec_blocks2）</text>
+    <rect x="560" y="128" width="140" height="34" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+    <text x="630" y="150" fill="#334155" font-size="12" font-weight="700" text-anchor="middle">blk2（dec_blocks2）</text>
   </g>
 
   <!-- row 2: view 2 -->
   <g>
     <text x="20" y="232" fill="#059669" font-size="12" font-weight="700">视角 2</text>
-    <rect x="60" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <rect x="60" y="210" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
     <text x="79" y="230" fill="#1e293b" font-size="11" text-anchor="middle">我</text>
-    <rect x="102" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <rect x="102" y="210" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
     <text x="121" y="230" fill="#1e293b" font-size="11" text-anchor="middle">爱</text>
-    <rect x="144" y="210" width="38" height="30" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+    <rect x="144" y="210" width="38" height="30" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
     <text x="163" y="230" fill="#1e293b" font-size="11" text-anchor="middle">中</text>
     <line x1="188" y1="225" x2="228" y2="225" stroke="#64748b" stroke-width="1.8"/>
     <polygon points="230,225 220,220 220,230" fill="#64748b"/>
@@ -277,16 +277,19 @@ context:          6 行 × 4 列      ← 不是 3×8！
   </g>
 
   <!-- batch brace for rows 1-2 -->
-  <path d="M 552 128 L 542 128 L 542 238 L 552 238" fill="none" stroke="#059669" stroke-width="2"/>
-  <text x="715" y="190" fill="#059669" font-size="11.5" font-weight="700">视角 1、2 打包成一批</text>
+  <path d="M 552 128 L 542 128 L 542 238 L 552 238" fill="none" stroke="#64748b" stroke-width="2"/>
+  <text x="715" y="190" fill="#334155" font-size="11.5" font-weight="700">视角 1、2 打包成一批</text>
   <text x="715" y="212" fill="#64748b" font-size="11">共享 blk2 权重</text>
   <text x="715" y="234" fill="#64748b" font-size="11">（batch 维 = b×(v−1)）</text>
 
-  <rect x="60" y="272" width="740" height="52" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
-  <text x="80" y="294" fill="#dc2626" font-size="12.5" font-weight="700">关键：永远不把自己算进自己的 context（对角线被 mask 掉了）</text>
-  <text x="80" y="314" fill="#64748b" font-size="11.5">Q 长度 3（自己），K/V 长度 6（另外两个视角拼起来）→ scores 形状 (3, 6)</text>
+  <rect x="60" y="266" width="740" height="66" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="80" y="286" fill="#dc2626" font-size="12" font-weight="700">① 颜色 = 视角身份（紫=视角0，橙=视角1，绿=视角2）；无论它是「本视角」还是 context 里的一员，颜色不变</text>
+  <text x="80" y="305" fill="#64748b" font-size="11.5">② 这三行是【同一层内并行】发生的，不是轮换！每层都固定：视角0→blk1，视角1、2→blk2，永不交换</text>
+  <text x="80" y="322" fill="#64748b" font-size="11.5">③ Q 长度 3（自己），K/V 长度 6（另外两个视角拼起来）→ scores 形状 (3, 6)</text>
 </svg>
-<figcaption>图 1 · 多视角路由：视角 0 单独走 blk1，视角 1..v−1 批量走 blk2；context 由「其他视角」拼成。</figcaption>
+<figcaption>图 1 · 多视角路由：视角 0 单独走 blk1，视角 1..v−1 批量走 blk2；context 由「其他视角」拼成。<br>
+<strong>读图注意</strong>：颜色只表示「视角身份」（紫=视角0、橙=视角1、绿=视角2），不表示"当前主角"；
+三行是<strong>同一层内并行</strong>发生的，<strong>不是轮换</strong>——每层都固定「视角0→blk1、其余→blk2」。</figcaption>
 </div>
 
 <h3>2.3 一个名字陷阱：<code>_decoder(feat, pose)</code> 里的 pose 其实是坐标</h3>
