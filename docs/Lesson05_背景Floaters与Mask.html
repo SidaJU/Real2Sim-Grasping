@@ -239,6 +239,10 @@
       <code>gt_img *= mask; pred_img *= mask</code></li>
 </ol>
 
+<p style="color:#475569;font-size:14px">为什么<strong>两张图都要乘</strong>、为什么 SSIM 那一项会有少量泄漏、
+以及「背景像素 → 梯度全 0 → floaters 断粮」的逐层推导，见
+<strong>《08 反向传播、损失函数与可微渲染》§2.3</strong>。</p>
+
 <div class="card warn">
   <h4>mask 生成本身有两个坑</h4>
   <p><strong>① 不能用"非白"阈值</strong>：实测桌面亮度 207~214，任何"不是纯白就算物体"的规则都会把整张桌子判成物体。

@@ -1,84 +1,92 @@
 # 待办 / 已知未完成项
 
-> 当前状态：T1 渲染 ✅ · T2 训练 ✅ · T3 GT 资产 ✅ · **T4 抓取进行中**
+> 当前状态：T1 渲染 ✅ · T2 训练 ✅ · T3 GT 资产 ✅ · **T5 3DGS→mesh 闭环 ✅（2026-09-29）** · T4 抓取进行中
 >
-> 重要：**现在用的 mesh 是 GT（真值深度 TSDF 建的），不是 3DGS 重建的。**
-> 任何对外表述都必须说清这一点，不能把它当作重建成果。
+> 重要：**抓取脚本 `17_setup_grasp_asset.py` 目前挂的仍是 GT mesh（`gt_mesh.obj`），
+> 还没换成 3DGS 重建的 `gs_mesh_v2`。** 换之前，任何抓取成功率都不能算"重建成果"。
 
 ---
 
-## P0 · 严格闭环未完成（最关键）
+## P0 · 唯一剩下的闭环缺口：把抓取资产换成 3DGS 重建的
 
-### 1. 真·3DGS mesh 尚未产出
-
-**现状**：`exports/ycb/gt_mesh_tsdf.obj` 是拿 **Isaac Sim 真值深度**融出来的 Ground Truth，
-**没有经过 3DGS**，精度 0.2 mm 代表"上界"，不是重建成绩。
-
-**正确闭环应该是**：
+**已完成的部分**（T5，见 Lesson 07）：
 
 ```
-① 用训练好的 3DGS 模型【自己渲染】99 个视角的深度图
-      ↑ 关键：深度是模型推断的，不是仿真真值
-② 渲染深度 + 位姿 → TSDF 融合 → 3DGS mesh
-③ 3DGS mesh vs GT mesh 算 Chamfer distance → 量化重建误差（mm）
-④ 两个 mesh 各跑 N 次抓取 → 对比成功率
+① 22_render_gs_depth.py   训练好的 3DGS 自渲染 99 视角 → depth / rgb / acc
+② 23b_gs_to_mesh_v2.py    几何掩码（footprint + 高度窗 + 轮廓腐蚀）→ TSDF → mesh
+③ 23c_compare_meshes.py   v1 / v2 的 A/B 对比
+④ 23d_coverage_check.py   每个表面点被多少帧观测到
 ```
 
-**卡点**：`ns-export` 在 nerfstudio 1.1.5 上全线崩溃（`splatfacto.get_outputs()`
-收到非 `Cameras` 参数时 `return {}`，见 `Lesson03`）。
+结果（对 GT 网格）：
 
-**绕过方案**：不用导出器，直接调模型渲染：
+| 指标 | v1（色度掩码） | v2（几何掩码） |
+|---|---|---|
+| Chamfer | 5.00 mm | **3.00 mm** |
+| 边界边（破洞） | 4566 | 1136（−75%） |
+| bbox x×y×z | 0.174×0.221×0.042 | **0.164×0.213×0.036**（GT 0.164×0.213×0.042） |
 
-```python
-# 构造正确的 Cameras 对象（而不是 tuple/ndarray），即可拿到 depth
-outputs = pipeline.model.get_outputs(camera)   # camera 必须是 Cameras 类型
-depth = outputs["depth"]
+**还没做的一步**：
+
+```
+C:\isaacsim_data\mesh\gt_mesh.obj
+   ↓ 换成
+...\3DGS\exports\ycb\gs_mesh_v2_mask-footprint+worldz_color-gsrgb_voxel2mm.obj
 ```
 
-参考：`nerfstudio/scripts/render.py` 里构造 Cameras 的方式。
+即把 `17_setup_grasp_asset.py` 的 `OBJ` / `USD` 指向 v2 网格（Scale 保持 (1,1,1)，顶点已是米），
+然后跑 `19_grasp_trial.py`，与 GT 资产各跑 N 次对比成功率——
+**这才是那句最值钱的话**：
 
-**做完之后才能得到那句最值钱的话**：
-> "用仿真数据重建的资产，抓取成功率达到真值资产的 X%，重建误差 Y mm"
+> "用仿真数据重建的资产，抓取成功率达到真值资产的 X%，重建误差 3.00 mm"
 
 ---
 
-## P1 · 训练配置
+## P1 · 已知待优化（不阻塞闭环）
 
-### 2. 3DGS 训练应关闭自动缩放
+### 1. 底部 ~6 mm 缺失
 
-当前训练默认开启 `auto-scale-poses`，场景被归一化 → 导出 mesh 尺寸无意义，
-导致 Lesson 03 里那次标定失败（误差 102 mm）。
+`gs_mesh_v2` 的 bbox z = 0.036，GT 是 0.042。原因：物体—桌面接触带在掠射角下
+`expected depth` 会把壁面与桌面混合，掩码的腐蚀 + 桌面 3 mm 余量把这一圈剔掉了。
+对凸包/碰撞影响极小，抓取几乎不受影响，但 Chamfer 会略吃亏。
 
-重训时应加：
+想修可从两条路走：降低 `MASK_ERODE`（但会放回斗形变形），或增加更贴近桌面的视角。
 
-```
-nerfstudio-data --auto-scale-poses False
-```
+### 2. 顶面小凹坑
 
-注意：场景尺度变小后梯度量级会变，需同步评估
-`--pipeline.model.densify-grad-thresh`（可能需要调小）。
+GS 深度本身的空洞（RGB-only 管线上限），非掩码问题。
+
+### 3. 发白（顶点色偏淡）
+
+数据端已到上限（换 GS 自渲染色只 +9%）。剩余大概率是 **Isaac 显示端**：
+PBR 材质 + 白光下顶点色本就偏淡。验证：MeshLab 打开同一 obj 若明显更红，
+就别动数据管线，去 Isaac 里给材质启用 vertex color，或 xatlas 烘贴图。
+
+### 4. 尺度归一化（原 P1，已缓解）
+
+当前模型用 `auto-scale-poses` 训练；**不必重训**——
+`22`/`23b` 已通过 `dataparser_transforms.json` 的 `scale` 把深度还原成真实米制
+（并与真值深度交叉验证一致）。若将来重训，仍建议 `--auto-scale-poses False`。
 
 ---
 
-## P2 · 场景与数据
+## P2 · 场景与数据（保持原样）
 
-### 3. 饼干盒陷进桌面 2.5 cm
+### 5. 饼干盒陷进桌面 2.5 cm
 
 盒子底面 z=0，桌面 z=0.0252 m → 下缘 1/3 埋在桌面里，永远拍不到。
 （真实场景物体放桌上底部同样不可见，属物理真实；但这里是**穿模**。）
+修法：抬高 0.025 m 使底面与桌面齐平。
 
-修法：把物体抬高 0.025 m，使底面与桌面齐平。
-
-### 4. 曝光由自动曝光控制
+### 6. 曝光由自动曝光控制
 
 采集时自动曝光跟随画面内容漂移（Lesson 03 记录）。
-当前用**后处理增益归一化**缓解（漂移 8.49 → 2.66）。
-更彻底的做法是在渲染端锁定曝光。
+当前用**后处理增益归一化**缓解（漂移 8.49 → 2.66）。更彻底的做法是渲染端锁定曝光。
 
-### 5. 物体本身偏简单
+### 7. 物体本身偏简单
 
-单个 YCB 盒子，纹理丰富但形状简单。若想让重建更有说服力，可考虑
-增加物体（多物体场景）或换更难的形状（薄壁、反光件）。
+单个 YCB 盒子，纹理丰富但形状简单。想让重建更有说服力，
+可增加物体（多物体场景）或换更难的形状（薄壁、反光件）。
 
 ---
 
@@ -87,7 +95,12 @@ nerfstudio-data --auto-scale-poses False
 | 结论 | 依据 |
 |---|---|
 | 盒状物体用 **TSDF**，不用泊松 | 泊松把 0.164×0.213 肿成 0.234×0.234 |
+| **掩码判据要用几何，不要用颜色** | 色度掩码误杀物体白色区域 → 破洞；换物体即崩 |
+| **acc ≈ 1，不能分前景** | 桌面背景高斯同样不透明（99 帧实测 acc.mean()=1.000） |
+| **众数估计桌面在多峰分布下失效** | footprint 外点 z 散布 0.03~0.07，众数落在噪声峰（0.0437） |
+| **掠射角会污染期望深度** | 壁面+桌面被 ED 混合 → 底部"斗形"变形；掩码腐蚀 8 px 可治 |
+| **单边 Chamfer 会奖励"少重建"** | 切掉坏区域反而得分更好；必须同时看 gs→gt / gt→gs / bbox |
 | Kit 渲染**各向同性**，`fy = fx` | 桌面水平性判据：0.1 mm vs 15 mm |
 | 中文路径会导致 Python 传参崩溃 | `UnicodeDecodeError` at `read_triangle_mesh`；一律用 `C:\isaacsim_data\` |
+| gsplat 需**同环境**预编译并缓存 | flag 不一致（如 `TORCH_CUDA_ARCH_LIST`）会缓存不命中 → 重编失败 |
 | 初始点云用**真值深度反投影** | 比 COLMAP 稠密、精确、秒级（Lesson 01） |
-| gsplat 需预编译并缓存 | 否则训练时 JIT 编译失败（Lesson 02） |

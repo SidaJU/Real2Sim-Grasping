@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 07 · 从色度掩码到几何掩码：gs_mesh 的两个缺陷是怎么修掉的</title>
+<style>
+  :root{
+    --indigo:#4f46e5; --indigo-soft:#eef2ff;
+    --green:#059669; --green-soft:#ecfdf5;
+    --red:#dc2626;   --red-soft:#fef2f2;
+    --amber:#d97706; --amber-soft:#fffbeb;
+    --ink:#1e293b;   --muted:#64748b; --line:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:#f8fafc; color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    line-height:1.75;
+  }
+  .wrap{max-width:980px; margin:0 auto; padding:48px 24px 80px}
+  header{border-left:5px solid var(--indigo); padding-left:20px; margin-bottom:32px}
+  h1{font-size:1.9rem; margin:0 0 8px; letter-spacing:-.5px}
+  .sub{color:var(--muted); font-size:1rem}
+  h2{font-size:1.35rem; margin:48px 0 16px; padding-bottom:8px; border-bottom:2px solid var(--line)}
+  h3{font-size:1.05rem; margin:24px 0 8px}
+  h4{font-size:.98rem; margin:18px 0 6px}
+  p{margin:10px 0}
+  code{background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:.9em}
+  pre{background:#0f172a; color:#e2e8f0; padding:14px 18px; border-radius:10px;
+      overflow-x:auto; font-size:.85rem; line-height:1.6}
+
+  .callout{
+    background:var(--indigo-soft); border:1px solid #c7d2fe; border-left:5px solid var(--indigo);
+    border-radius:10px; padding:18px 22px; margin:24px 0;
+  }
+  .callout strong{color:var(--indigo)}
+  .callout.green{background:var(--green-soft); border-color:#a7f3d0; border-left-color:var(--green)}
+  .callout.green strong{color:var(--green)}
+  .callout.red{background:var(--red-soft); border-color:#fecaca; border-left-color:var(--red)}
+  .callout.red strong{color:var(--red)}
+  .callout.amber{background:var(--amber-soft); border-color:#fde68a; border-left-color:var(--amber)}
+  .callout.amber strong{color:var(--amber)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+
+  .fig{background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin:18px 0}
+  .fig img{display:block; width:100%; height:auto; border-radius:8px}
+  .fig svg{display:block; width:100%; height:auto}
+  figcaption{font-size:.85rem; color:var(--muted); margin-top:10px; text-align:center}
+
+  table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden;
+        font-size:.9rem; box-shadow:0 1px 3px rgba(15,23,42,.06)}
+  th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line)}
+  th{background:#f1f5f9; font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.num{font-variant-numeric:tabular-nums}
+  .good{color:var(--green); font-weight:600}
+  .bad{color:var(--red); font-weight:600}
+
+  .chain{display:flex; flex-direction:column; gap:0; margin:20px 0}
+  .chain .node{background:#fff; border:2px solid var(--indigo); border-radius:10px;
+               padding:10px 18px; text-align:center; font-weight:600}
+  .chain .arrow{text-align:center; color:var(--indigo); font-size:1.4rem; line-height:1.4; font-weight:700}
+  .chain .node.loop{border-color:var(--red); color:var(--red)}
+  .chain .arrow.loop{color:var(--red)}
+
+  .steps{counter-reset:s; list-style:none; padding:0; margin:16px 0}
+  .steps li{counter-increment:s; position:relative; padding-left:46px; margin-bottom:12px}
+  .steps li::before{
+    content:counter(s); position:absolute; left:0; top:2px;
+    width:30px; height:30px; border-radius:50%; background:var(--indigo); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.9rem; font-weight:600;
+  }
+  footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Lesson 07 · 从色度掩码到几何掩码</h1>
+  <div class="sub">
+    gs_mesh 的两个缺陷（破损 + 发白）是怎么定位、怎么修掉的：<br>
+    一次「外观判据 → 几何判据」的替换，和一次「二维误差地图」驱动的变形修复。
+    对应脚本：<code>22_render_gs_depth.py</code>（扩展）、<code>23b_gs_to_mesh_v2.py</code>（新）、<code>23c_compare_meshes.py</code>（A/B）。
+  </div>
+</header>
+
+<div class="callout">
+  <strong>核心结论：</strong>v1 的掩码问的是「这个像素<strong>够不够彩</strong>」（外观判据），
+  而真正该问的是「这个像素<strong>属不属于物体</strong>」（几何判据）。
+  判据错位导致物体上的白色区域被当成背景剔掉 → TSDF 无观测 → Marching Cubes 出洞。
+  换成<strong>世界坐标 footprint + 高度窗口 + 轮廓腐蚀</strong>的几何掩码后，
+  Chamfer <strong>5.00 → 3.00 mm（−40%）</strong>，边界边（破洞周长）<strong>4566 → 1136（−75%）</strong>。
+</div>
+
+<!-- ================= 1 ================= -->
+<h2>1 · 现象：v1 网格的两个缺陷</h2>
+
+<table>
+  <tr><th>缺陷</th><th>量化指标</th><th>直观表现</th></tr>
+  <tr><td><strong>破损（洞）</strong></td>
+      <td class="num">边界边 4566 条<br>（边界边 = 只被 1 个三角形使用的边）</td>
+      <td>顶面白色插画 / 文字区域整片缺失，洞又大又连片，<code>fill_holes</code> 补不上</td></tr>
+  <tr><td><strong>纹理发白</strong></td>
+      <td class="num">顶点色 chroma 均值 102/255</td>
+      <td>红色包装在 Isaac 里呈粉白色；数据端饱和度就偏低</td></tr>
+</table>
+
+<p><strong>边界边</strong>是破洞的量化手段：一个封闭曲面里每条边恰好被 2 个三角形共享；
+被 1 个三角形共享的边就是「面的边缘」——每个洞贡献一圈边界边，所以边界边总数 ∝ 洞的总周长。</p>
+
+<!-- ================= 2 ================= -->
+<h2>2 · 根因链条</h2>
+
+<h3>2.1 破洞：判据与目的错位</h3>
+
+<div class="chain">
+  <div class="node loop">chroma = max(RGB) − min(RGB) &gt; 40 → 白色插画 / 文字 / 高光被判为「背景」</div>
+  <div class="arrow">↓</div>
+  <div class="node loop">depth = depth × mask → 这些像素深度置 0（Open3D 视为无效观测）</div>
+  <div class="arrow">↓</div>
+  <div class="node loop">TSDF 在这些体素上<strong>从未累积任何观测</strong></div>
+  <div class="arrow">↓</div>
+  <div class="node loop">SDF 场在该区域没有可靠的零交叉</div>
+  <div class="arrow">↓</div>
+  <div class="node loop">Marching Cubes 抽不出面 → <strong>洞</strong></div>
+</div>
+
+<p>这条链的关键在第一环：<strong>色度衡量的是外观（颜色饱和度），掩码想要的是语义（属不属于物体）</strong>。
+两者只在「红盒子 + 白桌面」这个巧合下近似等价——换成白色物体，整张图会被 mask 掉，直接得到空网格。
+所以这不是「当前物体有几个洞」的问题，而是管线不具备通用性。</p>
+
+<h3>2.2 发白：三帧平均把颜色「平均成灰」</h3>
+
+<div class="chain">
+  <div class="node">v1 用<strong>原始照片</strong>做 TSDF 颜色来源</div>
+  <div class="arrow">↓</div>
+  <div class="node">Open3D <code>RGB8</code> 模式对每个体素做<strong>多帧加权平均</strong></div>
+  <div class="arrow">↓</div>
+  <div class="node loop">逐帧曝光 / 白平衡差异 + 高光过曝像素 → 平均后饱和度坍塌</div>
+</div>
+
+<!-- ================= 3 ================= -->
+<h2>3 · 涉及的算法：为什么会有洞、为什么 acc 没用</h2>
+
+<h3>3.1 TSDF 融合与 Marching Cubes：洞的数学成因</h3>
+
+<p>TSDF 在每个体素 x 上维护一个<strong>截断符号距离</strong>的加权平均：</p>
+
+<pre>SDF(x) = Σₖ wₖ(x) · sdfₖ(x)  /  Σₖ wₖ(x)
+
+sdfₖ(x) = dₖ − tₖ(x)        第 k 帧中，沿该像素射线到表面距离 dₖ 与体素深度 tₖ(x) 之差
+wₖ(x)   = 1, |sdfₖ| &lt; sdf_trunc；否则 0      ← 只融合「表面附近 ±sdf_trunc」的观测</pre>
+
+<p>Marching Cubes 提取 <code>SDF(x) = 0</code> 的等值面。<strong>某区域若没有任何帧提供有效观测，
+它的 SDF 分子分母都是 0（未定义）→ 不存在零交叉 → 不生成任何三角形 → 洞</strong>。
+所以「洞」不是 Marching Cubes 的 bug，而是「输入观测的空洞」被忠实地传递到了输出。
+修洞的唯一正路是<strong>修观测</strong>（掩码），事后补面只会伪造几何。</p>
+
+<h3>3.2 3DGS 的期望深度与累积不透明度</h3>
+
+<p>splatfacto 的 <code>get_outputs()</code>（splatfacto.py:644-649）返回四个量，其中两个和掩码设计直接相关：</p>
+
+<pre>accumulation = Σᵢ αᵢ·Tᵢ ∈ [0,1]        累积不透明度：射线被「实心几何」吸收的比例
+                                        αᵢ = 第 i 个高斯的不透明度，Tᵢ = 到它为止的透射率
+
+depth (ED)   = Σᵢ wᵢ·dᵢ / Σᵢ wᵢ        期望深度：按权重 wᵢ = αᵢTᵢ 加权平均的命中距离</pre>
+
+<div class="callout red">
+  <strong>实测打脸的一步</strong>：渲染 99 帧后打印 <code>acc.mean() = 1.000</code>（每一帧都是）。
+  原因：<strong>白色桌面的背景高斯也是不透明的</strong>，射线打在物体上 acc≈1，打在桌面上同样 acc≈1。
+  所以 <code>acc &gt; 0.5</code> 根本分不开前景和背景——它只能当<strong>有效性检查</strong>
+  （acc=0 表示射线什么都没打到，此时 splatfacto.py:637 会把深度填成哨兵值）。
+  「用一个与颜色无关的信号分前景」这个思路是对的，但选错了信号。
+</div>
+
+<h3>3.3 色度判据为什么错：语义 ≠ 外观</h3>
+
+<table>
+  <tr><th></th><th>误杀（False Negative）→ 洞</th><th>误留（False Positive）→ 雾</th></tr>
+  <tr><td>机理</td><td>白色插画 / 文字 / 高光的 chroma &lt; 40</td><td>彩色反光、彩色噪点、带颜色的 floater</td></tr>
+  <tr><td>后果</td><td>深度置 0 → 无观测 → 洞</td><td>伪表面被融进体素场</td></tr>
+</table>
+
+<p>阈值 40 还是无依据的全局常数，不随光照、曝光、物体颜色自适应。</p>
+
+<!-- ================= 4 ================= -->
+<h2>4 · 掩码的运作流程：逐帧、逐像素的一张开关表</h2>
+
+<h3>4.1 它在数据流里的位置</h3>
+
+<div class="fig">
+<svg viewBox="0 0 860 230" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <rect x="20" y="60" width="120" height="60" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="80" y="86" fill="#4f46e5" font-size="11.5" font-weight="700" text-anchor="middle">3DGS 模型</text>
+  <text x="80" y="104" fill="#64748b" font-size="10" text-anchor="middle">splat.ply 那堆高斯</text>
+
+  <line x1="146" y1="90" x2="176" y2="90" stroke="#64748b" stroke-width="2"/>
+  <polygon points="178,90 168,85 168,95" fill="#64748b"/>
+  <text x="161" y="76" fill="#64748b" font-size="9.5" text-anchor="middle">22 渲染</text>
+
+  <rect x="184" y="50" width="150" height="80" rx="8" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="259" y="76" fill="#059669" font-size="11.5" font-weight="700" text-anchor="middle">每帧三件套 ×99</text>
+  <text x="259" y="94" fill="#64748b" font-size="10" text-anchor="middle">depth / rgb / acc</text>
+  <text x="259" y="110" fill="#64748b" font-size="10" text-anchor="middle">（.npy，各 99 个文件）</text>
+
+  <line x1="340" y1="90" x2="370" y2="90" stroke="#64748b" stroke-width="2"/>
+  <polygon points="372,90 362,85 362,95" fill="#64748b"/>
+  <text x="355" y="76" fill="#dc2626" font-size="9.5" font-weight="700" text-anchor="middle">23b</text>
+
+  <rect x="378" y="50" width="150" height="80" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="453" y="74" fill="#dc2626" font-size="11.5" font-weight="700" text-anchor="middle">★ 逐帧生成掩码</text>
+  <text x="453" y="92" fill="#64748b" font-size="10" text-anchor="middle">白=可信 / 黑=置 0</text>
+  <text x="453" y="108" fill="#64748b" font-size="10" text-anchor="middle">footprint + z 窗 + 腐蚀</text>
+
+  <line x1="534" y1="90" x2="564" y2="90" stroke="#64748b" stroke-width="2"/>
+  <polygon points="566,90 556,85 556,95" fill="#64748b"/>
+
+  <rect x="572" y="50" width="130" height="80" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="637" y="74" fill="#d97706" font-size="11.5" font-weight="700" text-anchor="middle">RGBD 打包</text>
+  <text x="637" y="92" fill="#64748b" font-size="10" text-anchor="middle">黑处深度 = 0</text>
+  <text x="637" y="108" fill="#64748b" font-size="10" text-anchor="middle">= Open3D 的无效值</text>
+
+  <line x1="708" y1="90" x2="738" y2="90" stroke="#64748b" stroke-width="2"/>
+  <polygon points="740,90 730,85 730,95" fill="#64748b"/>
+
+  <rect x="746" y="60" width="94" height="60" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+  <text x="793" y="86" fill="#334155" font-size="11.5" font-weight="700" text-anchor="middle">integrate ×63</text>
+  <text x="793" y="104" fill="#64748b" font-size="10" text-anchor="middle">→ TSDF 体素场</text>
+
+  <rect x="20" y="160" width="820" height="52" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="40" y="182" fill="#1e293b" font-size="11.5" font-weight="700">然后：extract_triangle_mesh()（Marching Cubes）→ 包围盒裁剪 → 取最大连通块 → 写 obj</text>
+  <text x="40" y="200" fill="#64748b" font-size="10.5">掩码本身<strong>不落盘</strong>：每帧现算现用；只有 DEBUG_FRAME=50 那一帧被 dump 成 PNG（下面的图）。</text>
+</svg>
+<figcaption>图 A · 掩码在整条链路中的位置：它是 22 渲染与 TSDF 融合之间的一道「逐像素开关」。</figcaption>
+</div>
+
+<h3>4.2 单帧掩码的五步（对应 <code>23b_gs_to_mesh_v2.py</code> 主循环）</h3>
+
+<ol class="steps">
+  <li><strong>取数据</strong>：读 <code>depth_i.npy</code>（÷SCALE=3.697 换算成米）、<code>acc_i.npy</code>、<code>rgb_i.npy</code>。</li>
+  <li><strong>反投影到世界坐标</strong>：把每个深度像素变成 3D 点。
+      <pre>p_cam = ( (u−cx)·d/fx , (v−cy)·d/fy , d )      OpenCV 相机系（z 向前）
+w2c   = inv(c2w @ FLIP)                      与 vol.integrate 用的是同一个矩阵
+p_w   = (p_cam − t) @ R                      R = w2c[:3,:3],  t = w2c[:3,3]</pre>
+      <em>必须用同一个变换</em>，否则掩码判据所在的坐标系和 TSDF 的不一致，掩码就白做了。</li>
+  <li><strong>五条件取交集</strong>：
+      <table>
+        <tr><th>条件</th><th>阈值</th><th>剔除什么</th></tr>
+        <tr><td>深度有效</td><td><code>0.01 &lt; d &lt; 0.8</code></td><td>GS 深度空洞 / 哨兵值</td></tr>
+        <tr><td>累积不透明度</td><td><code>acc &gt; 0.1</code></td><td>射线什么都没打到（此时深度是 max 哨兵）</td></tr>
+        <tr><td>footprint</td><td><code>|x| &lt; 0.083, |y| &lt; 0.107</code></td><td>桌面、背景墙等物体之外的一切</td></tr>
+        <tr><td>高度窗口</td><td><code>0.033 &lt; z &lt; 0.080</code></td><td>桌面（与物体底面同高，靠 3 mm 余量剔除）</td></tr>
+        <tr><td>轮廓腐蚀</td><td><code>binary_erosion(it=8)</code></td><td>掠射角被污染的轮廓/接触带一圈（见 §6）</td></tr>
+      </table></li>
+  <li><strong>应用</strong>：<code>depth = np.where(m, depth, 0.0)</code> —— 黑色像素深度变 0，Open3D 视为「此处无观测」，
+      <strong>既不加 SDF 也不加颜色</strong>。</li>
+  <li><strong>送进 TSDF</strong>：与 GS 渲染色打包成 RGBD，<code>vol.integrate(rgbd, intr, w2c)</code>。</li>
+</ol>
+
+<h3>4.3 白 / 黑到底是什么意思（第 50 帧实例）</h3>
+
+<div class="grid2">
+  <div class="fig">
+    <img src="assets/lesson07_gs_rgb_f0050.png" alt="第 50 帧 GS 自渲染">
+    <figcaption>第 50 帧 GS 自渲染：Cheez-It 盒子平放在白桌上，左侧有阴影。</figcaption>
+  </div>
+  <div class="fig">
+    <img src="assets/lesson07_mask_f0050.png" alt="第 50 帧掩码">
+    <figcaption>第 50 帧掩码：白=这一帧可信、交给 TSDF；<strong>其余全黑</strong>。</figcaption>
+  </div>
+</div>
+
+<table>
+  <tr><th>区域</th><th>为什么是黑的</th><th>是故意的吗</th></tr>
+  <tr><td>四周大片（桌子、背景墙）</td><td>世界坐标落在 footprint 之外，或 z 低于「桌面+3mm」</td><td class="good">是</td></tr>
+  <tr><td>白色区域边缘的一圈</td><td><code>binary_erosion</code> 腐蚀掉的 8 像素</td><td class="good">是</td></tr>
+  <tr><td>白色区域内部的黑斑 / 下缘锯齿</td><td>① 与桌面接触带（z 落到窗口下方）② GS 深度本身的空洞</td><td>① 是；② 是管线上限</td></tr>
+  <tr><td>白色区域</td><td>五个条件全部通过 → 深度与颜色被融合</td><td class="good">是</td></tr>
+</table>
+
+<div class="callout">
+  <strong>常见误解</strong>：这张图不是「物体分割图」。它是<strong>单帧可信度图</strong>——
+  只包含这一帧相机能看见、且观测干净的那部分表面。<strong>单帧残缺是设计如此</strong>。
+</div>
+
+<h3>4.4 63 张残缺掩码怎么拼成完整表面</h3>
+
+<p>用 <code>23d_coverage_check.py</code> 实测：把最终网格均匀采样 4000 个点，逐点投影回每一帧，
+统计「落在白区且观测深度与该点一致（±8 mm）」的次数：</p>
+
+<table>
+  <tr><th>部位</th><th>点数</th><th>平均被几帧看到</th><th>中位</th><th>从未被看到</th></tr>
+  <tr><td>顶面</td><td class="num">962</td><td class="num good">36.2</td><td class="num">36</td><td class="num good">0</td></tr>
+  <tr><td>上段壁面</td><td class="num">1793</td><td class="num">26.6</td><td class="num">22</td><td class="num good">0</td></tr>
+  <tr><td>下段壁面</td><td class="num">1178</td><td class="num bad">8.9</td><td class="num">7</td><td class="num">18</td></tr>
+  <tr><td>底面 / 接触带</td><td class="num">67</td><td class="num bad">5.0</td><td class="num">4</td><td class="num">0</td></tr>
+  <tr><td colspan="2"><strong>全体</strong></td><td class="num">23.3（最多 59）</td><td class="num">19</td><td class="num">18（0.45%）</td></tr>
+</table>
+
+<p>三个结论：</p>
+<ol class="steps">
+  <li><strong>并集覆盖</strong>：表面完整性来自 63 帧的并集，不依赖任何单帧。顶面平均被 36 帧看到，
+      所以第 50 帧缺的那块由别的视角补上——<strong>没有任何一个顶面点从未被观测</strong>。</li>
+  <li><strong>冗余抗噪</strong>：同一处被 ~23 帧重复观测，偏差被 TSDF 的加权平均投票掉。</li>
+  <li><strong>弱区在下段壁面</strong>：均值只有 8.9 帧，是唯一出现「从未被看到」的地方——
+      这正好对应 §10 的遗留限制（底部 6 mm 缺失）。腐蚀对观测本就稀缺的区域伤害最大。</li>
+</ol>
+
+<h3>4.5 这个 mask 和 3DGS 训练时的 mask 是一回事吗？</h3>
+
+<div class="callout red">
+  <strong>不是一回事，只是同名。</strong>两者都是「前景/背景二值图」，但作用阶段、作用对象、后果完全不同。
+  混淆它们会导致一个典型误解：以为「训练时加了 mask，重建就不用管了」。
+</div>
+
+<table>
+  <tr><th></th><th><strong>训练 mask</strong>（Lesson 05）</th><th><strong>重建 mask</strong>（本 Lesson）</th></tr>
+  <tr><td>作用阶段</td><td><strong>训练时</strong>（nerfstudio，跑 30k 步之前）</td><td><strong>训练后</strong>（TSDF 重建时现算）</td></tr>
+  <tr><td>作用对象</td><td><strong>loss 计算</strong>：决定哪些像素参与梯度</td><td><strong>深度图</strong>：决定哪些像素的观测被融合</td></tr>
+  <tr><td>直接目的</td><td>背景 loss=0 → 梯度=0 → 不 densify → <strong>不长 floater</strong></td><td>背景/污染深度=0 → TSDF 看不见 → <strong>不生成伪表面</strong></td></tr>
+  <tr><td>判据</td><td>图像空间的前景分割（chroma / SAM / 手工）</td><td><strong>世界坐标几何</strong>：footprint + 高度窗 + 腐蚀</td></tr>
+  <tr><td>影响对象</td><td>改变<strong>模型本身</strong>（高斯数量、几何质量）</td><td>不改模型，只改「我们从模型里取哪些观测」</td></tr>
+  <tr><td>迭代成本</td><td>改了要<strong>重训</strong>（30k 步，小时级）</td><td>改了<strong>秒级重跑</strong>重建，可反复试</td></tr>
+  <tr><td>本项目状态</td><td class="bad"><strong>没用</strong>（22/23 脚本注释：this run was trained WITHOUT a mask）</td><td class="good">本次新建（23b）</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>两者的因果关系（本项目的关键）</strong>：正因为<strong>训练时没加 mask</strong>，
+  模型里混进了整张白桌面的背景高斯，所以重建侧才必须靠一个「几何掩码」去分辨「哪些深度属于物体」——
+  <strong>重建掩码是在事后补偿训练掩码的缺失</strong>。<br>
+  如果训练时用了 mask：背景干净、没有 floater，重建侧只需复用同一张前景分割图（投影到对应帧）即可，
+  世界坐标判据和腐蚀这套机制<strong>大半都不需要</strong>。
+</div>
+
+<p>一句话区分：<strong>训练 mask 决定「模型学什么」，重建 mask 决定「我们从模型里拿什么」。</strong></p>
+
+<h2>5 · 方法演进：三次迭代，两次打脸</h2>
+
+<h3>迭代 ①：数据驱动的桌面估计 —— 失败</h3>
+
+<p><strong>想法</strong>：掩码 = footprint 内 + 桌面上方。桌面高度不写死，从数据里估——
+取 footprint <strong>之外</strong>的点（那些一定是桌面）的世界坐标 z 做<strong>直方图众数</strong>。</p>
+
+<pre>估计结果：z_table = 0.0437 m
+真实桌面（由 GT 网格底面验证）：z ≈ 0.030 m
+后果：掩码从 0.0437+0.003 = 0.0467 开始 → 物体底部 16 mm 被切掉
+     bbox z 只剩 0.026 m（GT 0.0422）</pre>
+
+<div class="callout amber">
+  <strong>为什么众数估计会翻车</strong>：诊断显示 footprint 外的点在世界 z 上<strong>散布在 0.03 ~ 0.07 一大片</strong>
+  （杂物、墙、floater 都在）——这是一个<strong>多峰分布</strong>，众数落在哪个峰全凭运气。
+  教训：<strong>众数估计只对「单峰且占比压倒性」的分布可靠</strong>；场景里桌面不是最大的连通表面时，别用它。
+  最后改用资产先验（物体底面 = 桌面 = 0.030，与裁剪框同一个先验），并在代码里保留失败估计作为诊断输出。
+</div>
+
+<h3>迭代 ②：资产先验 + 收紧 footprint —— 指标反而变差，但暴露了真问题</h3>
+
+<p>把 footprint 从裁剪框（0.090 / 0.115）收紧到资产真实尺寸（0.083 / 0.107），重跑后：</p>
+
+<table>
+  <tr><th>版本</th><th>verts</th><th>bbox x / y / z (m)</th><th>Chamfer</th></tr>
+  <tr><td>v1（chroma）</td><td class="num">34158</td><td class="num">0.174 / 0.221 / 0.042</td><td class="num">5.00 mm</td></tr>
+  <tr><td>迭代①（错切底部）</td><td class="num">24232</td><td class="num">0.164 / 0.213 / <span class="bad">0.026</span></td><td class="num">3.90 mm</td></tr>
+  <tr><td>迭代②（本步）</td><td class="num">61520</td><td class="num good">0.165 / 0.214 / 0.039</td><td class="bad">7.87 mm</td></tr>
+</table>
+
+<p>bbox 对了，Chamfer 却暴涨——<code>gs→gt = 13.38 mm</code> 说明网格里混进了大量<strong>远离 GT 的几何</strong>。
+指标变差在这里是好事：它逼出了 v1 一直藏着的问题。</p>
+
+<h3>迭代 ③：二维误差地图定位「斗形变形」，腐蚀掩码治好</h3>
+
+<h4>诊断工具：z × 半径 的二维误差地图</h4>
+
+<p>把网格均匀采样 8 万点，逐点算到 GT 点云的最近距离，按「高度带 × 到中轴距离带」分桶求均值。
+这张表直接把误差<strong>在物体上定位</strong>：</p>
+
+<table>
+  <tr><th>z 带 \ r 带</th><th>0–0.02</th><th>0.04–0.06</th><th>0.06–0.08</th><th>0.08–0.10</th><th>0.10–0.12</th><th>0.12–0.14</th></tr>
+  <tr><td class="num">0.066–0.072（顶）</td><td class="num good">0.8</td><td class="num good">1.4</td><td class="num good">1.5</td><td class="num good">1.4</td><td class="num good">1.1</td><td class="num good">0.8</td></tr>
+  <tr><td class="num">0.060–0.066</td><td class="num">1.7</td><td class="num">4.1</td><td class="num">4.4</td><td class="num">4.2</td><td class="num good">1.4</td><td class="num good">0.9</td></tr>
+  <tr><td class="num">0.054–0.060</td><td class="num">9.5</td><td class="num">10.1</td><td class="num">10.8</td><td class="num">10.1</td><td class="num">3.2</td><td class="num good">1.0</td></tr>
+  <tr><td class="num">0.048–0.054</td><td class="num">13.8</td><td class="num">14.9</td><td class="num">16.2</td><td class="num">14.9</td><td class="num">4.9</td><td class="num good">0.9</td></tr>
+  <tr><td class="num">0.042–0.048</td><td class="num bad">20.2</td><td class="num bad">21.8</td><td class="num bad">22.4</td><td class="num bad">18.3</td><td class="num">4.3</td><td class="num good">0.8</td></tr>
+  <tr><td class="num">0.036–0.042</td><td class="num bad">25.2</td><td class="num bad">26.9</td><td class="num bad">27.5</td><td class="num bad">17.4</td><td class="num">2.1</td><td class="num good">0.9</td></tr>
+  <tr><td class="num">0.030–0.036</td><td class="num bad">29.7</td><td class="num bad">32.3</td><td class="num bad">32.2</td><td class="num good">5.0</td><td class="num good">1.2</td><td class="num good">1.2</td></tr>
+</table>
+<p style="font-size:.85rem;color:var(--muted)">单位 mm。r = 到物体中轴的水平距离（米），r&gt;0.10 的环带基本是四壁外缘和角落。</p>
+
+<p>两个规律一目了然：</p>
+<ol class="steps">
+  <li><strong>误差沿 z 单调增大</strong>：顶面 0.8~1.5 mm（准），底部 25~32 mm（错）。</li>
+  <li><strong>外缘（r&gt;0.10）全程 1 mm 左右</strong>：说明不是整体平移/缩放，而是<strong>壁面随高度倾斜</strong>——
+      顶面周长正确、越往下越向内收缩，整个盒子是一个「斗」。</li>
+</ol>
+
+<div class="fig">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- ground -->
+  <line x1="40" y1="270" x2="820" y2="270" stroke="#94a3b8" stroke-width="2"/>
+  <text x="60" y="292" fill="#64748b" font-size="11">桌面 z=0.030</text>
+
+  <!-- GT box (dashed, correct) -->
+  <rect x="480" y="150" width="300" height="120" fill="#ecfdf5" stroke="#059669"
+        stroke-width="2" stroke-dasharray="7 4"/>
+  <text x="630" y="138" fill="#059669" font-size="12" font-weight="700" text-anchor="middle">GT：四壁垂直（0.164 × 0.213 × 0.042）</text>
+
+  <!-- reconstructed tent -->
+  <polygon points="120,150 420,150 400,270 140,270" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="270" y="138" fill="#dc2626" font-size="12" font-weight="700" text-anchor="middle">v2b 重建：顶部正确，底部向内收（斗形）</text>
+
+  <!-- annotations -->
+  <line x1="270" y1="150" x2="270" y2="270" stroke="#4f46e5" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="280" y="215" fill="#4f46e5" font-size="11">顶面误差 0.8–1.5 mm ✓</text>
+  <text x="150" y="248" fill="#dc2626" font-size="11">底部壁面内收 → 误差 25–32 mm ✗</text>
+
+  <!-- top face label -->
+  <rect x="120" y="150" width="300" height="18" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.5"/>
+  <text x="270" y="164" fill="#4f46e5" font-size="10.5" text-anchor="middle">顶面（唯一被「正对」观察的面）</text>
+
+  <text x="60" y="40" fill="#1e293b" font-size="12.5" font-weight="700">斗形变形的读法</text>
+  <text x="60" y="62" fill="#64748b" font-size="11">同一张误差地图里：外缘全程 ~1 mm、中部随 z 单调变差</text>
+  <text x="60" y="80" fill="#64748b" font-size="11">→ 不是平移/缩放/噪声，而是「壁面倾斜」这一类系统性变形</text>
+  <text x="60" y="98" fill="#64748b" font-size="11">→ 定位到物体—桌面接触带的观测污染（见 §6）</text>
+</svg>
+<figcaption>图 1 · 二维误差地图揭示的「斗形」变形：绿色虚线框为 GT 尺寸，红色为 v2b 重建轮廓（示意）。</figcaption>
+</div>
+
+<!-- ================= 5 ================= -->
+<h2>6 · 斗形变形的根因：掠射角下的期望深度污染</h2>
+
+<p>3DGS 的期望深度是<strong>沿射线加权平均</strong>：<code>ED = Σ wᵢdᵢ / Σ wᵢ</code>。
+当射线<strong>近乎平行于壁面</strong>（掠射）时，同一根射线会以不小的时间权重先后穿过
+「壁面高斯」和「壁面后方桌面上的高斯」，两个命中被平均成一个——落点被拉向更远处。
+在图像上，这类像素恰好集中在<strong>物体轮廓与桌面的接触带</strong>。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <!-- table -->
+  <line x1="60" y1="240" x2="800" y2="240" stroke="#94a3b8" stroke-width="2.5"/>
+  <text x="70" y="262" fill="#64748b" font-size="11">桌面（不透明高斯，acc ≈ 1）</text>
+
+  <!-- box cross-section -->
+  <rect x="360" y="140" width="220" height="100" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="470" y="196" fill="#4f46e5" font-size="12" text-anchor="middle">物体</text>
+
+  <!-- camera -->
+  <circle cx="700" cy="60" r="14" fill="#0f172a"/>
+  <text x="700" y="40" fill="#1e293b" font-size="11.5" font-weight="700" text-anchor="middle">相机</text>
+
+  <!-- good ray: hits top face -->
+  <line x1="690" y1="70" x2="470" y2="140" stroke="#059669" stroke-width="2"/>
+  <circle cx="470" cy="140" r="5" fill="#059669"/>
+  <text x="500" y="108" fill="#059669" font-size="11">近垂直入射：只命中壁面 → ED 准确（1.1 mm）</text>
+
+  <!-- grazing ray -->
+  <line x1="705" y1="74" x2="380" y2="238" stroke="#dc2626" stroke-width="2"/>
+  <circle cx="380" cy="238" r="5" fill="#dc2626"/>
+  <text x="395" y="285" fill="#dc2626" font-size="11">掠射：先擦过壁面（蓝），再命中后方桌面（红）</text>
+  <circle cx="560" cy="200" r="4" fill="#2563eb"/>
+  <text x="575" y="222" fill="#2563eb" font-size="10.5">壁面命中</text>
+
+  <!-- ED landing -->
+  <line x1="690" y1="70" x2="392" y2="252" stroke="#d97706" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <polygon points="386,256 398,246 402,258" fill="#d97706"/>
+  <text x="640" y="150" fill="#d97706" font-size="11" font-weight="700">ED = 两者加权平均</text>
+  <text x="640" y="167" fill="#d97706" font-size="11">→ 落点被拉向桌面上更远处</text>
+  <text x="640" y="184" fill="#d97706" font-size="11">→ 接触带一整圈像素都被污染</text>
+</svg>
+<figcaption>图 2 · 掠射角污染机制：ED 是沿射线的加权平均，掠射时「壁面 + 桌面」两次命中被合并，深度系统偏差。
+图像上这些像素恰好构成物体轮廓/接触带的一圈——这就是为什么修复手段是「腐蚀掩码」。</figcaption>
+</div>
+
+<h3>修复算法：二值腐蚀（binary erosion）</h3>
+
+<p>对每帧的 2D 掩码 m 做形态学腐蚀：</p>
+
+<pre>m ⊖ B = { p : Bₚ ⊆ m }        结构元 B = 8×8 邻域（iterations=8 的 3×3 十字等价于 8 次膨胀式收缩）
+
+效果：m 的边界向内收缩 8 像素 —— 恰好剥掉「轮廓 / 接触带」这一圈被掠射污染的像素。
+代价：物体在图像上变"瘦" 8 px，但 TSDF 从 63 个视角融合，真实表面仍被大量近垂直观测覆盖；
+     被剥掉的只是<strong>每一帧里不可信的那一圈</strong>，不是几何本身。</pre>
+
+<pre>from scipy.ndimage import binary_erosion
+m = binary_erosion(m, iterations=8)     # 23b_gs_to_mesh_v2.py，掩码生成之后、深度置零之前</pre>
+
+<div class="callout green">
+  <strong>为什么腐蚀能治「斗形」</strong>：斗形由接触带一圈被污染的深度观测投票造成。
+  腐蚀把这圈观测从<strong>每一帧</strong>里删掉，TSDF 里就只剩近垂直的干净观测——
+  壁面恢复垂直。验证：重跑后 <code>gs→gt</code> 从 13.38 → <strong>3.70 mm</strong>，Chamfer 7.87 → <strong>3.00 mm</strong>。
+</div>
+
+<!-- ================= 6 ================= -->
+<h2>7 · 最终方案与结果</h2>
+
+<h3>7.1 v2 掩码的完整判据（全部几何量，无一涉及颜色）</h3>
+
+<ol class="steps">
+  <li><strong>有效性</strong>：<code>depth ∈ (0.01, 0.8)</code> 且 <code>acc &gt; 0.1</code>（剔除空射线与哨兵深度）</li>
+  <li><strong>footprint</strong>：反投影到世界坐标，<code>|x| &lt; 0.083, |y| &lt; 0.107</code>（资产真实尺寸，比 v1 裁剪框收紧 8 mm）</li>
+  <li><strong>高度窗口</strong>：<code>0.033 &lt; z &lt; 0.080</code>（桌面上方 3 mm 起步：桌面与物体底面同高，footprint 内有 ~8 mm 宽的桌面环带可见，靠 3 mm 余量剔除）</li>
+  <li><strong>轮廓腐蚀</strong>：<code>binary_erosion(m, iterations=8)</code>（剔除掠射污染带）</li>
+  <li><strong>颜色</strong>：用 GS 自渲染的 rgb 替代原始照片（单一 3D 一致模型，无逐帧曝光跳变）</li>
+</ol>
+
+<pre>世界坐标反投影（与 vol.integrate 同一套变换，保证一致）：
+  p_cam = ( (u−cx)·d/fx , (v−cy)·d/fy , d )          OpenCV 相机系
+  w2c   = inv(c2w @ FLIP)                             OpenGL→OpenCV 翻转，Lesson03 的老坑
+  p_w   = (p_cam − t) @ R                             R = w2c[:3,:3], t = w2c[:3,3]</pre>
+
+<div class="grid2">
+  <div class="fig">
+    <img src="assets/lesson07_gs_rgb_f0050.png" alt="GS 自渲染：Cheez-It 盒子平放在白桌上">
+    <figcaption>GS 自渲染（帧 50）：单一 3D 一致模型，多帧间无曝光跳变 → 用作 TSDF 顶点色来源。</figcaption>
+  </div>
+  <div class="fig">
+    <img src="assets/lesson07_mask_f0050.png" alt="v2 掩码：白色为保留像素">
+    <figcaption>v2 掩码（帧 50，白 = 保留）：顶面完整（白色插画不再被误杀）；
+      中央少量黑斑是 GS 深度本身的空洞。对比 v1 的 chroma 掩码，白色区域全部找回。</figcaption>
+  </div>
+</div>
+
+<h3>7.2 最终对比</h3>
+
+<table>
+  <tr><th>指标</th><th>v1（chroma 掩码）</th><th>v2（几何掩码）</th><th>GT 参照</th><th>含义</th></tr>
+  <tr><td>Chamfer</td><td class="num">5.00 mm</td><td class="num good">3.00 mm（−40%）</td><td class="num">—</td><td>整体几何误差</td></tr>
+  <tr><td>gs → gt</td><td class="num">—</td><td class="num">3.70 mm（p95 15.5）</td><td class="num">—</td><td>重建里有多少假几何</td></tr>
+  <tr><td>gt → gs</td><td class="num">—</td><td class="num">2.29 mm（p95 7.1）</td><td class="num">—</td><td>GT 表面被覆盖得多完整</td></tr>
+  <tr><td>边界边（破洞）</td><td class="num">4566</td><td class="num good">1136（−75%）</td><td class="num">378*</td><td>洞的总周长</td></tr>
+  <tr><td>顶点色 chroma</td><td class="num">102</td><td class="num">111（+9%）</td><td class="num">—</td><td>数据端饱和度</td></tr>
+  <tr><td>bbox x × y × z</td><td class="num">0.174 × 0.221 × 0.042</td>
+      <td class="num good">0.164 × 0.213 × 0.036</td>
+      <td class="num">0.164 × 0.213 × 0.042</td><td>足迹完全吻合；z 少 6 mm</td></tr>
+</table>
+<p style="font-size:.85rem;color:var(--muted)">* GT 网格自身也不是完全封闭的（378 条边界边，底面几乎无顶点），所以 gt→gs 不会归零。</p>
+
+<h3>7.3 迭代全过程的指标轨迹（防止「只看最终数字」的错觉）</h3>
+
+<table>
+  <tr><th>版本</th><th>关键改动</th><th>verts</th><th>bbox z</th><th>Chamfer</th><th>评价</th></tr>
+  <tr><td>v1</td><td>chroma &gt; 40</td><td class="num">34158</td><td class="num">0.042</td><td class="num">5.00</td>
+      <td>洞伪装成「几何完整」——坏区域直接缺失</td></tr>
+  <tr><td>迭代①</td><td>众数估桌面 0.0437 ❌</td><td class="num">24232</td><td class="num bad">0.026</td><td class="num">3.90</td>
+      <td>指标好看是假象：切掉了底部 16 mm 真实几何</td></tr>
+  <tr><td>迭代②</td><td>先验 z=0.030 + 收紧 footprint</td><td class="num">61520</td><td class="num">0.039</td><td class="num bad">7.87</td>
+      <td>bbox 对了，但斗形变形显形 → 指标暴涨暴露真问题</td></tr>
+  <tr><td><strong>迭代③ v2</strong></td><td>+ 轮廓腐蚀 8 px</td><td class="num">22163</td><td class="num">0.036</td><td class="num good">3.00</td>
+      <td class="good">污染观测被剔除，壁面恢复垂直</td></tr>
+</table>
+
+<div class="callout amber">
+  <strong>迭代①的教训值得单独记住</strong>：它的 Chamfer（3.90）比最终版（3.00）之外的所有版本都「好」，
+  但它是靠<strong>切掉错误区域</strong>刷出来的——误差低是因为坏几何被删了，不是因为修好了。
+  <strong>单看 Chamfer 会奖励「少重建」，不会惩罚「重建不全」</strong>。
+  所以诊断必须看双向（gs→gt 和 gt→gs）加 bbox 三件套，缺一不可。
+</div>
+
+<!-- ================= 7 ================= -->
+<h2>8 · 发白问题的诚实结论</h2>
+
+<p>换 GS 自渲染颜色只带来 <strong>+9%</strong> 的饱和度提升——远低于预期。复盘后判断数据端已到上限：</p>
+
+<ul>
+  <li>GS 是<strong>拟合原图</strong>训练的，原图里的高光它也会学进去（减轻但不根除）；</li>
+  <li>TSDF 的 RGB8 平均仍是简单加权，没有「哪帧更可信」的机制；</li>
+  <li>剩余发白大概率在<strong>显示端</strong>：Isaac 的 PBR 材质 + 白光下，顶点色本来就偏淡。</li>
+</ul>
+
+<p><strong>验证方法</strong>：用 MeshLab 打开同一个 obj——若颜色明显更红，就别再动数据管线，
+去 Isaac 里给材质启用 vertex color，或用 xatlas 展开 UV 把顶点色烘成贴图。</p>
+
+<!-- ================= 8 ================= -->
+<h2>9 · 可复用经验</h2>
+
+<ol class="steps">
+  <li><strong>掩码判据要问语义，不是外观</strong>。「够不够彩」在红物体+白桌面上侥幸可用，换物体即崩。
+      几何判据（世界坐标 footprint + 高度窗）与物体颜色完全解耦。</li>
+  <li><strong>先验证假设再写代码</strong>。本次最贵的弯路（斗形）源于凭直觉设计掩码；
+      后来一张 z × r 误差地图 5 分钟定位根因。距离分桶表应成为重建任务的标准诊断工具。</li>
+  <li><strong>众数估计只对单峰分布可靠</strong>。场景里桌面不是最大表面时，几何先验反而更稳。</li>
+  <li><strong>acc ≠ 前景掩码</strong>。背景高斯同样不透明，acc≈1；它只是有效性信号。</li>
+  <li><strong>掠射观测不可信</strong>。ED 在轮廓/接触带会混合前后两次命中——腐蚀掉这一圈，
+      比任何事后网格修补都便宜且诚实。</li>
+  <li><strong>单边 Chamfer 会奖励「少重建」</strong>。报告时必须同时给 gs→gt、gt→gs 和 bbox。</li>
+  <li><strong>指标变差不一定是坏事</strong>：迭代②把 v1 藏着的坏几何显形（7.87 mm），
+      没有这次「变差」，就找不到斗形。</li>
+</ol>
+
+<h2>10 · 遗留限制</h2>
+
+<ul>
+  <li><strong>底部 ~6 mm 缺失</strong>（bbox z 0.036 vs GT 0.042）：接触区被腐蚀 + 桌面余量剔除。
+      对凸包/碰撞影响极小，且比 v1 用破洞「假装」这块区域诚实。</li>
+  <li><strong>顶面小凹坑</strong>：GS 深度本身的空洞，属 RGB-only 管线上限。</li>
+  <li><strong>gsplat JIT 缓存</strong>：重跑渲染前需保证与编译时一致的环境（TORCH_CUDA_ARCH_LIST 等），
+      已固化为 <code>scripts/fix_gsplat.bat</code>（预编译）与 <code>scripts/run_nerfstudio.bat</code>（带环境运行），
+      详见 Lesson02 第 4 节的缓存命中条件。</li>
+</ul>
+
+<footer>
+  产物：<code>exports/ycb/gs_mesh_v2_mask-footprint+worldz_color-gsrgb_voxel2mm.obj</code> ·
+  脚本：<code>22_render_gs_depth.py</code> / <code>23b_gs_to_mesh_v2.py</code> / <code>23c_compare_meshes.py</code> ·
+  日期：2026-09-29
+</footer>
+
+</div>
+</body>
+</html>

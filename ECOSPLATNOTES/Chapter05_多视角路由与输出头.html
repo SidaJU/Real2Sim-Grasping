@@ -308,7 +308,7 @@ context:          6 行 × 4 列      ← 不是 3×8！
 <p><code>final_output.append(...)</code> 每跑一层就存一份 —— 最后 <code>final_output</code> 是一个
 <strong>多尺度特征列表</strong>（类似 DPT 的 hook）。后面的 DPT 高斯头要的就是这种多层特征
 （浅层管细节/边缘，深层管语义），所以它接收的是 <code>[tok[:, i] for tok in dec_feat]</code>
-——「第 i 个视角在所有层上的特征」。</p>
+——「第 i 个视角在所有层上的特征」。<strong>这 13 份到底长什么样、每份是什么，逐份清单见 §2.6。</strong></p>
 
 <h4>2.4.1 context 的刷新时机：特征每层重算，坐标只算一次</h4>
 
@@ -398,18 +398,368 @@ context:          6 行 × 4 列      ← 不是 3×8！
   <strong>EcoSplat / SPFSplat 这条路径默认不走</strong> —— 所以我们看到的就是固定分配、不轮换。
 </div>
 
+<!-- ================= 2.6 ================= -->
+<h2>2.6 Decoder 到底产出什么：dec_feat 的 13 份逐份点清</h2>
+
+<p>三个头（§3/§4/§5）吃的都是 <code>dec_feat</code> 这个 list。先逐段追踪 shape（b=1、v=4、256×256、含内参 token，l=257），再<strong>逐份点清这 13 个张量</strong>。</p>
+
+<h3>逐段 shape（b=1、v=4、256×256 输入）</h3>
+
+<table>
+  <tr><th>阶段</th><th>shape</th><th>变化</th><th>源码行</th></tr>
+  <tr><td>patch_embed 切块</td><td><code>(4, 256, 1024)</code></td><td>B = b×v = 4，每视角 256 个 patch token</td><td>backbone 140</td></tr>
+  <tr><td>拼内参 token</td><td><code>(4, 257, 1024)</code></td><td>256 + 1 个内参 token（就是 Ch.01 那个「257」的来源）</td><td>backbone 151</td></tr>
+  <tr><td>24 层 Encoder</td><td><code>(4, 257, 1024)</code></td><td>形状完全不变，只精炼内容</td><td>backbone 160-163</td></tr>
+  <tr><td>rearrange 回视角维</td><td><code>(1, 4, 257, 1024)</code></td><td>把 batch 拆回 (b, v)</td><td>backbone 239</td></tr>
+  <tr><td>decoder_embed</td><td><code>(1, 4, 257, 768)</code></td><td>Linear 1024 → 768</td><td>backbone 173-176</td></tr>
+  <tr><td>12 层双栈 Decoder（每层）</td><td><code>(1, 4, 257, 768)</code></td><td>形状不变；cross-attn 的 K/V = (v−1)×257 = <strong>771</strong> 个 token（§2.1.1 的修正）</td><td>backbone 187-200</td></tr>
+  <tr><td>del + dec_norm</td><td>删掉 1 份，末层归一化</td><td><code>del final_output[1]</code>；最后一层过 <code>dec_norm</code></td><td>backbone 203-206</td></tr>
+  <tr><td><strong>产出</strong></td><td colspan="2"><code>final_output</code>（= <code>dec_feat</code>）：<strong>13 个张量的 list</strong>，逐份见下表</td><td>backbone 207</td></tr>
+</table>
+
+<h3>13 份逐份点清（剥内参 token 前 / 后）</h3>
+
+<table>
+  <tr><th>下标</th><th>是什么</th><th>剥前（257 token）</th><th>剥后（P=256）</th><th>通道</th></tr>
+  <tr><td><strong>0</strong></td><td>encoder 特征（最浅，第 168 行存下）</td>
+      <td><code>(1, 4, 257, 1024)</code></td>
+      <td><code>(1, 4, 256, <strong>1024</strong>)</code></td>
+      <td><strong>1024</strong></td></tr>
+  <tr><td>1 ~ 11</td><td>decoder 第 1 ~ 11 层输出（第 200 行逐层 append）</td>
+      <td><code>(1, 4, 257, 768)</code></td>
+      <td><code>(1, 4, 256, 768)</code></td>
+      <td>768</td></tr>
+  <tr><td><strong>12</strong></td><td>decoder 第 12 层输出（<strong>过了 dec_norm</strong>，第 205 行）</td>
+      <td><code>(1, 4, 257, 768)</code></td>
+      <td><code>(1, 4, 256, 768)</code></td>
+      <td>768</td></tr>
+</table>
+
+<div class="callout red">
+  <strong>三个必须记住的点（有一处是常见笔记写错的）</strong><br>
+  ① <strong>槽 0 剥完内参 token 后仍是 1024 维，不是 768</strong> —— 13 份里第 0 份和其余通道不同，
+  <code>torch.stack</code> 直接报错，所以<strong>物理上就堆不成 <code>(13, 1, 4, 257, 768)</code>，只能用 list</strong>。<br>
+  ② 剥内参 token 发生在 backbone 里（第 245-248 行）：<code>dec_feat[i] = dec_feat[i][:, :, :P]</code>，13 份全部从 257 → 256。<br>
+  ③ 三个头<strong>收下全部 13 份</strong>，但 DPT 内部按 hooks <strong>只挑 4 份</strong>用（见下）。
+</div>
+
+<span class="filetag">heads/dpt_head.py · 第 112-113、51 行（create_dpt_head / forward）</span>
+
+<pre>112  hooks_idx = [0, l2*2//4, l2*3//4, l2]    # l2 = dec_depth = 12 → [0, 6, 9, 12]
+113  dim_tokens = [ed, dd, dd, dd]            # ed=1024（对应槽0），dd=768（其余三份）
+                                               # ↑ 通道不同是设计既定，也是 list 不能 stack 的根因
+51   layers = [encoder_tokens[hook] for hook in self.hooks]   # 13 份里只挑 4 份
+
+挑层策略 = 「浅 1 + 深 3」金字塔：
+  槽 0  → encoder 特征（1024 维，最浅，细节最多）
+  槽 6  → decoder 第 6 层（768 维）
+  槽 9  → decoder 第 9 层（768 维）
+  槽 12 → decoder 第 12 层（768 维，最深，语义最强）</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="28" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">dec_feat：13 个张量的 list（b=1、v=4、256×256，剥内参 token 后）</text>
+
+  <!-- slot 0 (encoder, indigo) -->
+  <text x="90" y="76" fill="#4f46e5" font-size="11" font-weight="700" text-anchor="middle">encoder 特征</text>
+  <rect x="64" y="90" width="52" height="52" rx="6" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+  <text x="90" y="112" fill="#4f46e5" font-size="12" font-weight="700" text-anchor="middle">0</text>
+  <text x="90" y="132" fill="#1e293b" font-size="11" text-anchor="middle">1024</text>
+
+  <!-- slots 1..12 (gray) -->
+  <rect x="122" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="148" y="112" fill="#334155" font-size="12" text-anchor="middle">1</text>
+  <text x="148" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="180" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="206" y="112" fill="#334155" font-size="12" text-anchor="middle">2</text>
+  <text x="206" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="238" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="264" y="112" fill="#334155" font-size="12" text-anchor="middle">3</text>
+  <text x="264" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="296" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="322" y="112" fill="#334155" font-size="12" text-anchor="middle">4</text>
+  <text x="322" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="354" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="380" y="112" fill="#334155" font-size="12" text-anchor="middle">5</text>
+  <text x="380" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="412" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="438" y="112" fill="#334155" font-size="12" text-anchor="middle">6</text>
+  <text x="438" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="470" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="496" y="112" fill="#334155" font-size="12" text-anchor="middle">7</text>
+  <text x="496" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="528" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="554" y="112" fill="#334155" font-size="12" text-anchor="middle">8</text>
+  <text x="554" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="586" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="612" y="112" fill="#334155" font-size="12" text-anchor="middle">9</text>
+  <text x="612" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="644" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="670" y="112" fill="#334155" font-size="12" text-anchor="middle">10</text>
+  <text x="670" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="702" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="728" y="112" fill="#334155" font-size="12" text-anchor="middle">11</text>
+  <text x="728" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <rect x="760" y="90" width="52" height="52" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="786" y="112" fill="#334155" font-size="12" text-anchor="middle">12</text>
+  <text x="786" y="132" fill="#1e293b" font-size="11" text-anchor="middle">768</text>
+  <text x="786" y="76" fill="#059669" font-size="9.5" font-weight="700" text-anchor="middle">dec_norm ✓</text>
+
+  <!-- divider 1024 | 768 -->
+  <line x1="119" y1="84" x2="119" y2="148" stroke="#dc2626" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="119" y="160" fill="#dc2626" font-size="9.5" text-anchor="middle">1024 | 768 分界</text>
+
+  <!-- hook markers under slots 0,6,9,12 -->
+  <rect x="67" y="172" width="46" height="24" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="90" y="188" fill="#059669" font-size="9.5" font-weight="700" text-anchor="middle">hook 0</text>
+  <rect x="415" y="172" width="46" height="24" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="438" y="188" fill="#059669" font-size="9.5" font-weight="700" text-anchor="middle">hook 6</text>
+  <rect x="589" y="172" width="46" height="24" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="612" y="188" fill="#059669" font-size="9.5" font-weight="700" text-anchor="middle">hook 9</text>
+  <rect x="763" y="172" width="46" height="24" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="786" y="188" fill="#059669" font-size="9.5" font-weight="700" text-anchor="middle">hook 12</text>
+
+  <text x="430" y="216" fill="#64748b" font-size="11" text-anchor="middle">槽 1 – 12 = decoder 第 1 – 12 层逐层输出（第 200 行 append）；槽 12 过 dec_norm（第 205 行）</text>
+
+  <rect x="40" y="228" width="790" height="62" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="60" y="250" fill="#dc2626" font-size="12" font-weight="700">① 槽 0 剥完 token 仍是 1024 维（不是 768）→ 13 份通道不同，不能堆成 (13, 1, 4, 257, 768)，只能用 list</text>
+  <text x="60" y="270" fill="#dc2626" font-size="12" font-weight="700">② 三个头收下全部 13 份，但 DPT 内部按 hooks=[0, 6, 9, 12] 只挑绿框 4 份（浅 1 + 深 3）</text>
+  <text x="60" y="285" fill="#64748b" font-size="10.5">每份剥内参 token 257 → 256（backbone 第 245-248 行）；三个头对第 i 个视角逐份取 tok[:, i]</text>
+</svg>
+<figcaption>图 2 · dec_feat 全景：13 份的构成、通道分界（1024 | 768）与 DPT 的 hook 挑层。<br>
+注意槽 0 是 <strong>encoder 特征</strong>（1024 维），其余 12 份才是 decoder 各层输出（768 维）。</figcaption>
+</div>
+
+<h3>三个头分别怎么收这 13 份</h3>
+
+<table>
+  <tr><th>头</th><th>调用（encoder_spfsplat.py）</th><th>收到什么</th></tr>
+  <tr><td>pts3d head（§3）</td>
+      <td><code>[tok[:, i].float() for tok in dec_feat]</code>（254 / 257 行）</td>
+      <td>第 i 视角的 13 份 → DPT 内部挑 4 份 → 每像素 3 维</td></tr>
+  <tr><td>gaussian head（§4）</td>
+      <td>同上，另多传一张原图 <code>images[:, i, :3]</code>（262 / 272 行）</td>
+      <td>同上，且最后多融合一份「原图卷积特征」补细节</td></tr>
+  <tr><td>pose head（§5）</td>
+      <td>同上（288 / 291 行）</td>
+      <td>同上，但汇总成每视角 9 维（不是每像素输出）</td></tr>
+</table>
+
+<div class="callout green">
+  <strong>「13 份」的正确理解</strong>：它是<strong>一条流水线沿途的快照</strong>（encoder 1 份 + decoder 12 层各 1 份），
+  不是 13 个可互换的样本 —— 所以既不能堆成张量（通道不同），也不会被全用（head 只挑 4 份）。
+  浅层快照带细节、深层快照带语义，DPT 用这 4 份「画回」像素空间。
+</div>
+
 <!-- ================= 3 ================= -->
 <h2>3. 输出头 A：pts3d head —— 高斯的「中心」从哪来</h2>
 
-<pre>254  res1 = self._downstream_head(1, [tok[:, 0] for tok in dec_feat], shape[:, 0])
-317  pts_all = torch.stack([r['pts3d'] for r in all_mean_res], dim=1)   # [b, v, h, w, 3]
+<div class="callout red">
+  <strong>先纠正一个术语坑：此「头」非彼「头」—— 三个输出头 ≠ 多头注意力</strong><br>
+  它们只是英文都叫 <code>head</code>，其实是两个<strong>毫不相干</strong>的概念。千万别把 Ch.02 学的那套 QKV 套到这里来。
+</div>
 
-→ 每个像素一个 3D 坐标 (x, y, z)，直接在【第一视角的坐标系】里给出。</pre>
+<table>
+  <tr><th></th><th>Ch.02 的「多头注意力 head」</th><th>本章的「输出头 head」</th></tr>
+  <tr><td>英文</td><td><code>attention head</code></td><td><code>task head</code> / <code>output head</code></td></tr>
+  <tr><td>在哪</td><td><strong>每个 Transformer block 内部</strong></td><td><strong>Decoder 之后、网络最末尾</strong></td></tr>
+  <tr><td>干什么</td><td>把 768 维切成 12 份，每份独立算一遍 QKV attention，结果再拼回来</td><td>把 token 序列<strong>翻译成任务产物</strong>（点云 / 高斯 / 位姿）</td></tr>
+  <tr><td>几个</td><td><strong>12 个</strong>，并行、等价、可互换（每个 block 都有，全网几百个实例）</td><td><strong>3 个</strong>，功能完全不同：pts3d / 高斯 / 位姿</td></tr>
+  <tr><td>有没有 Q/K/V</td><td><strong>有</strong>（它本身就是 QKV）</td><td><strong class="bad">一个 attention 都没有</strong> —— DPT 里全是卷积、转置卷积、插值、残差卷积单元</td></tr>
+  <tr><td>能不能互换</td><td>能（12 个头地位相同）</td><td class="bad">不能（换掉就不是同一个任务了）</td></tr>
+</table>
 
-<p><strong>这就是高斯的中心</strong>（μ）。不是从 token 反推的，而是网络直接回归出了一张
-<code>h × w × 3</code> 的点云图 —— 和 DUSt3R 的 pointmap 是同一个思路。</p>
+<div class="callout green">
+  <strong>一句话记住</strong>：<strong>多头注意力</strong>是「同一个 attention 算 12 遍再拼起来」，是<strong>信息混合的方式</strong>；
+  <strong>输出头</strong>是「把 token 翻译成最终答案」，是<strong>任务的出口</strong>。<br>
+  <strong>三个输出头里没有任何 Q/K/V</strong> —— 看到 <code>head</code> 先问一句「它前面是什么」，是 block 内部的切分还是网络末尾的出口。
+</div>
 
-<h3>用玩具例子看</h3>
+<h3>3.1 调用链：从 dec_feat 到 pts3d</h3>
+
+<pre>254  res1 = self._downstream_head(1, [tok[:, 0].float() for tok in dec_feat], shape[:, 0])
+        ↓ encoder_spfsplat.py:187-191
+190  head = getattr(self, f'head{head_num}')      # head1（视角0）/ head2（其余视角），两套参数
+191  return head(decout, img_shape, ray_embedding=None)
+        ↓ head_factory（heads/__init__.py:18-19）→ create_dpt_head（dpt_head.py:99-117）
+109  PixelwiseTaskWithDPT(num_channels = 3 + has_conf,   # 输出 3 通道 = (x, y, z)
+110                       feature_dim = 256, last_dim = 128,
+112                       hooks_idx  = [0, 6, 9, 12],
+113                       dim_tokens = [1024, 768, 768, 768])
+        ↓ PixelwiseTaskWithDPT.forward（dpt_head.py:92-96）
+93   out = self.dpt(x, image_size=(H, W))          # 真正的 DPT：DPTOutputAdapter_fix.forward
+95   out = self.postprocess(out, ...)              # → dict(pts3d = ...)</pre>
+
+<p><strong>小注</strong>：<code>head1</code> / <code>head2</code> 是 <code>transpose_to_landscape</code> 包过的（竖图先转横图预测、再转回来），
+只为正确处理非正方形输入，<strong>不改变任何形状语义</strong>，后面不提。</p>
+
+<h3>3.2 DPT 内部七步（本章最该看懂的部分）</h3>
+
+<span class="filetag">heads/dpt_head.py · DPTOutputAdapter_fix.forward</span>
+
+<pre>51  layers = [encoder_tokens[hook] for hook in self.hooks]                            # ① 挑 4 份
+54  layers = [self.adapt_tokens(l) for l in layers]                                    # ② 剥 token（此处恒等）
+57  layers = [rearrange(l, 'b (nh nw) c -> b c nh nw', nh=N_H, nw=N_W) for l in layers] # ③ token → 2D
+59  layers = [self.act_postprocess[idx](l) for idx, l in enumerate(layers)]            # ④ 拉成 4 个分辨率
+61  layers = [self.scratch.layer_rn[idx](l) for idx, l in enumerate(layers)]           # ⑤ 统一通道 → 256
+64  path_4 = self.scratch.refinenet4(layers[3])                                        # ⑥ 逐级融合上采样
+65  path_3 = self.scratch.refinenet3(path_4, layers[2])
+66  path_2 = self.scratch.refinenet2(path_3, layers[1])
+67  path_1 = self.scratch.refinenet1(path_2, layers[0])
+71  out = self.head(path_1)                                                            # ⑦ 输出头卷积</pre>
+
+<table>
+  <tr><th>步</th><th>行</th><th>做了什么</th><th>4 份各自的形状</th></tr>
+  <tr><td>① 挑层</td><td>51</td><td>按 <code>hooks=[0,6,9,12]</code> 从 13 份里取 4 份</td>
+      <td><code>(b,256,1024)</code> + <code>(b,256,768)</code>×3</td></tr>
+  <tr><td>② 剥 token</td><td>54</td><td><code>adapt_tokens</code> —— 这里 <code>n_cls_token=0</code>，<strong>恒等操作</strong>
+      （真正的剥离早在 backbone 245-248 行做过了）</td><td>不变</td></tr>
+  <tr><td>③ token → 2D</td><td>57</td><td><code>rearrange</code> 把 256 个 token <strong>摆回 16×16 网格</strong>，通道移到第 2 维</td>
+      <td><code>(b,1024,16,16)</code> + <code>(b,768,16,16)</code>×3</td></tr>
+  <tr><td>④ 拉分辨率</td><td>59</td><td><code>act_postprocess</code>：每份<strong>各用一套</strong> 1×1 conv + 转置卷积，把 16×16 拉到 4 个不同分辨率</td>
+      <td>64×64 / 32×32 / 16×16 / 8×8</td></tr>
+  <tr><td>⑤ 统一通道</td><td>61</td><td><code>layer_rn</code>：3×3 conv 把通道统一到 256</td>
+      <td><code>(b,256,64,64)</code> <code>(b,256,32,32)</code> <code>(b,256,16,16)</code> <code>(b,256,8,8)</code></td></tr>
+  <tr><td>⑥ 融合</td><td>64-67</td><td><code>refinenet</code> 从最深往最浅：<strong>上采样×2 + 与浅层相加 + 残差卷积</strong></td>
+      <td>8 → 16 → 32 → 64 → 128</td></tr>
+  <tr><td>⑦ 输出</td><td>71</td><td><code>head</code>（regression）：卷积 + ×2 上采样 + 1×1 卷积降到 3 通道</td>
+      <td><code>(b, 3, 256, 256)</code></td></tr>
+</table>
+
+<h4>第 ④ 步的细节：四份各拉多少（dpt_block.py:366-420）</h4>
+
+<pre>act_1（槽 0，encoder，1024 维）: Conv2d(1024→96, 1×1)  + ConvTranspose2d(k=4, s=4) → 16×16 → <strong>64×64</strong>  ← 放大 4 倍
+act_2（槽 6，768 维）          : Conv2d(768→192, 1×1)  + ConvTranspose2d(k=2, s=2) → 16×16 → <strong>32×32</strong>  ← 放大 2 倍
+act_3（槽 9，768 维）          : Conv2d(768→384, 1×1)                             → 16×16 → <strong>16×16</strong>  ← 不变
+act_4（槽 12，768 维）         : Conv2d(768→768, 1×1)  + Conv2d(k=3, s=2)         → 16×16 → <strong>8×8</strong>    ← 缩小 2 倍
+
+通道数 96 / 192 / 384 / 768 来自默认 layer_dims=[96,192,384,768]（create_dpt_head 没传，用默认值）</pre>
+
+<div class="callout amber">
+  <strong>为什么最深的那层反而被<em>缩小</em>？</strong><br>
+  DPT 要构造一座<strong>金字塔</strong>：四份特征分辨率各不相同（64 / 32 / 16 / 8），融合时才能逐级提供不同粒度的信息。
+  槽 12 语义最强但空间最糊，本来也不需要高分辨率，所以<strong>降到最粗的 8×8</strong> 就够了 —— 少算很多卷积。<br>
+  反过来，槽 0 是 encoder 特征、细节最多，所以要<strong>放大 4 倍</strong>到 64×64 去补高频。
+</div>
+
+<h4>第 ⑥ 步的细节：融合 = 相加，不是拼接（dpt_block.py:189-218）</h4>
+
+<pre>def forward(self, *xs):
+    output = xs[0]                                   # 来自更深一级的 path
+    if len(xs) == 2:
+        res = self.resConfUnit1(xs[1])               # 本层特征过残差卷积单元
+        output = output + res                        # ★ 逐元素【相加】融合（不是拼接！）
+    output = self.resConfUnit2(output)               # 再过一个残差卷积单元
+    output = F.interpolate(output, scale_factor=2, mode='bilinear')   # ★ 上采样 ×2
+    output = self.out_conv(output)                   # 1×1 conv 收一下
+    return output
+
+ResidualConvUnit（121-142 行）= ReLU → conv3×3 → ReLU → conv3×3 → + 残差跳连</pre>
+
+<p><strong>三条要点</strong>：① 融合是<strong>相加</strong>（通道必须相同，所以第 ⑤ 步要先统一到 256）；
+② 每一级都把分辨率 <strong>×2</strong>；③ 相加前会用双线性插值把浅层特征对齐到当前尺寸。</p>
+
+<h4>第 ⑦ 步的细节：head 把它放大到原图并降到 3 通道（dpt_block.py:318-324）</h4>
+
+<pre>head（head_type='regression'）:
+  Conv2d(256 → 128, 3×3)          # 通道减半
+  Interpolate(scale_factor=2)     # 128×128 → 256×256 ← 最后一步放大，回到【原图分辨率】
+  Conv2d(128 → 128, 3×3)
+  ReLU(True)
+  Conv2d(128 → 3, 1×1)            # ★ 降到 3 通道 = (x, y, z)
+→ (b, 3, 256, 256)</pre>
+
+<h4>最后一步：postprocess（postprocess.py:11-20）</h4>
+
+<pre>15  fmap = out.permute(0, 2, 3, 1)                                # (b,3,H,W) → (b,H,W,3)
+16  res['pts3d'] = reg_dense_depth(fmap[..., 0:3], depth_mode)    # 按 depth_mode 变换（线性无界时 = 原值）
+19  res['conf']  = reg_dense_conf(fmap[..., 3], conf_mode)        # 仅 has_conf 时才有
+
+→ res1 是 dict，取 r['pts3d'] = (b, 256, 256, 3)
+→ stack 后（317 行）pts_all = (b, v, h, w, 3)</pre>
+
+<div class="fig">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,'Microsoft YaHei',sans-serif">
+  <text x="430" y="26" fill="#1e293b" font-size="13" font-weight="700" text-anchor="middle">pts3d head（DPT）内部：4 份特征 → 四分辨率金字塔 → 逐级融合上采样 → 每像素 3 维</text>
+
+  <!-- top: 4 scales -->
+  <text x="305" y="68" fill="#059669" font-size="11.5" font-weight="700" text-anchor="middle">hook 12</text>
+  <text x="305" y="84" fill="#64748b" font-size="10" text-anchor="middle">8×8 · 256ch</text>
+  <rect x="298" y="126" width="14" height="14" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+
+  <text x="435" y="68" fill="#d97706" font-size="11.5" font-weight="700" text-anchor="middle">hook 9</text>
+  <text x="435" y="84" fill="#64748b" font-size="10" text-anchor="middle">16×16 · 256ch</text>
+  <rect x="422" y="120" width="26" height="26" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+
+  <text x="565" y="68" fill="#2563eb" font-size="11.5" font-weight="700" text-anchor="middle">hook 6</text>
+  <text x="565" y="84" fill="#64748b" font-size="10" text-anchor="middle">32×32 · 256ch</text>
+  <rect x="542" y="110" width="46" height="46" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+
+  <text x="695" y="68" fill="#4f46e5" font-size="11.5" font-weight="700" text-anchor="middle">hook 0（encoder）</text>
+  <text x="695" y="84" fill="#64748b" font-size="10" text-anchor="middle">64×64 · 256ch</text>
+  <rect x="660" y="100" width="70" height="70" fill="#eef2ff" stroke="#4f46e5" stroke-width="1.6"/>
+
+  <!-- dashed feeds -->
+  <line x1="305" y1="143" x2="305" y2="194" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <polygon points="305,204 300,194 310,194" fill="#94a3b8"/>
+  <line x1="435" y1="149" x2="435" y2="194" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <polygon points="435,204 430,194 440,194" fill="#94a3b8"/>
+  <line x1="565" y1="159" x2="565" y2="194" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <polygon points="565,204 560,194 570,194" fill="#94a3b8"/>
+  <line x1="695" y1="173" x2="695" y2="194" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <polygon points="695,204 690,194 700,194" fill="#94a3b8"/>
+
+  <!-- fusion chain -->
+  <rect x="250" y="206" width="110" height="88" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.6"/>
+  <text x="305" y="230" fill="#334155" font-size="11" font-weight="700" text-anchor="middle">refinenet4</text>
+  <text x="305" y="250" fill="#64748b" font-size="10" text-anchor="middle">layers[3] 8×8</text>
+  <text x="305" y="270" fill="#059669" font-size="10" font-weight="700" text-anchor="middle">→ ×2 → 16×16</text>
+
+  <rect x="380" y="206" width="110" height="88" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.6"/>
+  <text x="435" y="230" fill="#334155" font-size="11" font-weight="700" text-anchor="middle">refinenet3</text>
+  <text x="435" y="250" fill="#64748b" font-size="10" text-anchor="middle">path_4 + layers[2]</text>
+  <text x="435" y="270" fill="#d97706" font-size="10" font-weight="700" text-anchor="middle">16×16 → ×2 → 32×32</text>
+
+  <rect x="510" y="206" width="110" height="88" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.6"/>
+  <text x="565" y="230" fill="#334155" font-size="11" font-weight="700" text-anchor="middle">refinenet2</text>
+  <text x="565" y="250" fill="#64748b" font-size="10" text-anchor="middle">path_3 + layers[1]</text>
+  <text x="565" y="270" fill="#2563eb" font-size="10" font-weight="700" text-anchor="middle">32×32 → ×2 → 64×64</text>
+
+  <rect x="640" y="206" width="110" height="88" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.6"/>
+  <text x="695" y="230" fill="#334155" font-size="11" font-weight="700" text-anchor="middle">refinenet1</text>
+  <text x="695" y="250" fill="#64748b" font-size="10" text-anchor="middle">path_2 + layers[0]</text>
+  <text x="695" y="270" fill="#4f46e5" font-size="10" font-weight="700" text-anchor="middle">64×64 → ×2 → 128×128</text>
+
+  <line x1="360" y1="250" x2="376" y2="250" stroke="#64748b" stroke-width="1.8"/>
+  <polygon points="378,250 370,246 370,254" fill="#64748b"/>
+  <line x1="490" y1="250" x2="506" y2="250" stroke="#64748b" stroke-width="1.8"/>
+  <polygon points="508,250 500,246 500,254" fill="#64748b"/>
+  <line x1="620" y1="250" x2="636" y2="250" stroke="#64748b" stroke-width="1.8"/>
+  <polygon points="638,250 630,246 630,254" fill="#64748b"/>
+
+  <line x1="695" y1="294" x2="695" y2="318" stroke="#64748b" stroke-width="1.8"/>
+  <polygon points="695,320 691,312 699,312" fill="#64748b"/>
+
+  <!-- head box -->
+  <rect x="575" y="322" width="240" height="88" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="695" y="344" fill="#dc2626" font-size="11.5" font-weight="700" text-anchor="middle">⑦ head（regression）</text>
+  <text x="695" y="362" fill="#64748b" font-size="10" text-anchor="middle">Conv2d 256→128 → ×2 上采样</text>
+  <text x="695" y="378" fill="#64748b" font-size="10" text-anchor="middle">→ 128→128 → ReLU → 1×1 → 3</text>
+  <text x="695" y="396" fill="#dc2626" font-size="10.5" font-weight="700" text-anchor="middle">输出 (b, 3, 256, 256) = 每像素 (x,y,z)</text>
+
+  <!-- pre-steps box -->
+  <rect x="20" y="322" width="300" height="88" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="170" y="344" fill="#334155" font-size="11.5" font-weight="700" text-anchor="middle">前置三步（dpt_head.py 51-61 行）</text>
+  <text x="40" y="362" fill="#64748b" font-size="10.5">① hooks=[0,6,9,12] 从 13 份里挑 4 份</text>
+  <text x="40" y="378" fill="#64748b" font-size="10.5">② rearrange：token → (b, C, 16, 16)</text>
+  <text x="40" y="394" fill="#64748b" font-size="10.5">③ act_post + layer_rn → 4 个分辨率 / 256 通道</text>
+</svg>
+<figcaption>图 3 · pts3d head（DPT）内部全景。四份特征先被拉成 <strong>64 / 32 / 16 / 8</strong> 四种分辨率，
+再从最粗往最细<strong>逐级 ×2 上采样并相加融合</strong>，最后由 head 一步放大到原图分辨率并降到 3 通道。<br>
+<strong>注意</strong>：融合是<strong>相加</strong>（不是拼接），每一步都是卷积/插值 —— 全程<strong>没有 attention、没有 QKV</strong>。</figcaption>
+</div>
+
+<h3>3.3 用玩具例子看一遍</h3>
 
 <pre>3 个 token（我 / 爱 / 中国），4 维  →  pts3d head  →  每个 token（当成 1 个像素）出 3 个数：
 
@@ -417,7 +767,16 @@ context:          6 行 × 4 列      ← 不是 3×8！
   爱   → (0.4, 0.1, 1.7)
   中国 → (0.7, 0.3, 2.0)
 
-真实情况：256×256 = 65536 个像素，每个出 3 个数 → [b, v, 256, 256, 3]</pre>
+玩具版省略了「上采样」：3 个 token 直接当 3 个像素。
+真实版：16×16 = 256 个 token，经 ④⑥⑦ 三步放大成 256×256 = 65536 个像素，每个出 3 个数
+→ [b, v, 256, 256, 3]</pre>
+
+<div class="callout">
+  <strong>这就是高斯的中心 μ</strong>。不是从 token 反推的，而是网络<strong>直接回归</strong>出一张 <code>h × w × 3</code> 的点云图
+  —— 和 DUSt3R 的 pointmap 是同一个思路。<br>
+  <strong>为什么要「画回来」而不是 unpatchify？</strong> 你在 MiniDiT 里学的 <code>unpatchify</code> 是纯变形（拼回去、无参数）；
+  DPT 是<strong>卷积上采样</strong>，有参数、能补细节、分辨率可变 —— 所以它输出的点云比简单「拼回去」锐利得多。
+</div>
 
 <!-- ================= 4 ================= -->
 <h2>4. 输出头 B：高斯参数头（DPT）—— 除了中心以外的 83 个数</h2>
@@ -565,7 +924,7 @@ EcoSplat 的做法（DPT）：
   <text x="40" y="246" fill="#1e293b" font-size="12.5" font-weight="700">最终产物：每个视角 65536 个 3D 高斯（中心 + 尺度 + 旋转 + 颜色 + 不透明度） + 一套 4×4 相机外参</text>
   <text x="40" y="268" fill="#64748b" font-size="11.5">→ 交给 diff_gauss_pose / gsplat 光栅化渲染 → 渲染图 vs 真图算 loss（后面就是训练与 IGF 效率正则了）</text>
 </svg>
-<figcaption>图 2 · 完整前向链路（Ch.01 → Ch.05）与三个输出头。</figcaption>
+<figcaption>图 4 · 完整前向链路（Ch.01 → Ch.05）与三个输出头。</figcaption>
 </div>
 
 <!-- ================= 7 ================= -->

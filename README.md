@@ -1,7 +1,7 @@
 # Real2Sim-Grasping
 
 > 用 3DGS 重建做成高保真仿真资产，在 Isaac Sim 里跑抓取，并量化 sim-to-real 差距。
-> 版本：v1（B 方案 · 真值已知排练版） · 创建 2026-09-14
+> 版本：v1（B 方案 · 真值已知排练版） · 创建 2026-09-14 · 最后更新 2026-09-29（T5 3DGS→mesh 闭环打通）
 
 ---
 
@@ -10,15 +10,39 @@
 ```
 Real2Sim-Grasping/
 ├── README.md          ← 本手册（方法论 + 步骤 + 排错）
-├── scripts/           ← 可独立运行的脚本（粘进 Script Editor 执行）
-│   ├── 01_list_ycb_assets.py      T1.1  列出 YCB 资产
-│   ├── 02_diagnose_bbox.py        T1.1b 诊断物体尺寸/位置
-│   ├── 03_setup_scene.py          T1.2a 建桌面 + 加载物体
-│   ├── 04_render_orbit.py         T1.2b-1 移动相机 + 逐帧 capture（不碰光照）
-│   ├── 05_export_poses.py         T1.2b-2 收集图像 + 导出位姿
-│   ├── 06_setup_lighting.py       可选：脚本化布光（默认在编辑器里手动调）
-│   └── 07_render_standalone.py    ★推荐：standalone 一键（建场景+渲染+位姿）
-└── data/              ← 渲染数据与重建产物（生成中）
+├── docs/              ← 各阶段笔记（Lesson / Problem / TODO）
+├── ECOSPLATNOTES/     ← EcoSplat 源码学习笔记
+└── scripts/           ← 可独立运行的脚本（粘进 Script Editor 执行）
+    ── T1 多视角渲染 ──
+    01_list_ycb_assets.py        列出 YCB 资产
+    02_diagnose_bbox.py          诊断物体尺寸/位置（排错指南引用）
+    03_setup_scene.py            建桌面 + 加载物体
+    04_render_orbit.py           GUI 环形渲染
+    05_export_poses.py           收集图像 + 写 transforms.json
+    05b_export_poses_standalone.py
+    06_capture_multiring.py      多高度环形采集（真深度 + 真内参）
+    06_setup_lighting.py         可选：脚本化布光
+    07_render_standalone.py      ★推荐：standalone 一键渲染
+    07_build_init.py             npy → nerfstudio 数据集 + 初始点云
+    ── T3 资产化 / GT 网格 ──
+    12_postprocess_mesh.py · 13_export_gaussians.py
+    14_build_gt_mesh.py · 15_tsdf_from_depth.py（真值深度 TSDF）
+    16_view_mesh.py（网格查看器）
+    ── T4 抓取 ──
+    17_setup_grasp_asset.py      obj→usd + 刚体 + 凸包
+    18_setup_franka.py           摆放 Franka
+    19_grasp_trial.py            ★真正执行抓取（物理回调状态机）
+    20_joint_test.py · 21_jacobian_ik.py（数值雅可比 IK）
+    ── T5 3DGS → mesh 闭环（2026-09 新增）──
+    22_render_gs_depth.py        训练好的 3DGS 自渲染 → depth/rgb/acc
+    23_gs_to_mesh.py             v1：色度掩码 + 原图颜色
+    23b_gs_to_mesh_v2.py         ★v2：几何掩码 + GS 颜色（当前版本）
+    23c_compare_meshes.py        v1 / v2 A/B 对比
+    23d_coverage_check.py        每个表面点被几帧观测到
+    24_view_gs_depth.py          3DGS 深度 vs 真值深度
+    ── 环境 ──
+    fix_gsplat.bat               预编译 gsplat CUDA 扩展
+    run_nerfstudio.bat           带一致环境运行任意脚本（保证 JIT 缓存命中）
 ```
 
 脚本与手册分离：手册讲**为什么**和**怎么做**，脚本是**可直接执行的代码**。
@@ -223,13 +247,28 @@ UsdPhysics.MassAPI.Apply(obj).GetMassAttr().Set(0.5)
 
 | 任务 | 状态 | 完成时间 |
 |---|---|---|
-| T1.1 确认 YCB 路径 | ✅ 完成 | 2026-09-14 |
-| T1.1b 诊断物体尺寸 | ✅ 完成 | 2026-09-14 |
-| T1.2a 摆场景 | ⬜ 待做 | |
-| T1.2b 36 视角渲染 | ⬜ 待做 | |
-| T2 3DGS 重建 | ⬜ 待做 | |
-| T3 资产化 + 物理 | ⬜ 待做 | |
-| T4 抓取 + 评估 | ⬜ 待做 | |
+| T1 多视角渲染（99 帧 + 真位姿/真深度） | ✅ 完成 | 2026-09 |
+| T2 3DGS 训练（splatfacto 30k 步） | ✅ 完成 | 2026-09-23 |
+| T3 GT 网格资产（真值深度 TSDF） | ✅ 完成 | 2026-09 |
+| T4 抓取（Franka + 状态机） | 🔶 能跑通，资产仍是 GT | 进行中 |
+| **T5 3DGS → mesh 闭环** | ✅ 完成 | 2026-09-29 |
+| T6 抓取成功率对比（GT vs 3DGS） | ⬜ 待做 | 见 TODO P0 |
+
+### ✅ T5 已取得的量化结果（详见 `docs/Lesson07_从色度掩码到几何掩码.html`）
+
+```
+输入：3DGS 自渲染的 99 视角深度（纯 RGB 推断，未用任何真值深度）
+重建：23b_gs_to_mesh_v2.py —— 几何掩码（footprint + 高度窗 + 轮廓腐蚀）→ TSDF → Marching Cubes
+产物：3DGS/exports/ycb/gs_mesh_v2_mask-footprint+worldz_color-gsrgb_voxel2mm.obj
+```
+
+| 指标 | v1（色度掩码） | v2（几何掩码） | GT |
+|---|---|---|---|
+| Chamfer | 5.00 mm | **3.00 mm** | — |
+| 边界边（破洞） | 4566 | **1136（−75%）** | 378 |
+| bbox x×y×z (m) | 0.174×0.221×0.042 | **0.164×0.213×0.036** | 0.164×0.213×0.042 |
+
+**下一步**：把 `17_setup_grasp_asset.py` 指向 v2 网格，跑 GT vs 3DGS 的抓取成功率对比。
 
 ---
 
@@ -280,6 +319,8 @@ curl -L -o ecoSplat/pretrained_weights/ecosplat-spfsplat-re10k.ckpt \
 
 - [x] Ch.01 输入与预处理（patch 切块 / 归一化 / pos 网格坐标）
 - [x] Ch.02 Transformer 骨干（原笔记复习 + 真实维度对齐 + 全部实算）
-- [ ] Ch.03 Cross-Attention（多视角聚合，257 × 514 的由来）
-- [ ] Ch.04 RoPE 与 curope（CUDA 算子入口）
-- [ ] Ch.05 多视角路由与输出头（DPT head / pose head）
+- [x] Ch.03 Cross-Attention（多视角聚合，257 × 514 的由来）
+- [x] Ch.04 RoPE 与 curope（CUDA 算子入口）
+- [x] Ch.05 多视角路由与输出头（DPT head / pose head / 13 份 dec_feat 逐份清单）
+
+补充（Supplement）：广播机制 · PatchEmbed 切块与 pos · LayerNorm 为什么必须有它

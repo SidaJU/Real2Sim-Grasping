@@ -86,11 +86,32 @@ with torch.no_grad():
             continue
         depth = outputs["depth"].detach().cpu().numpy().reshape(H, W)
         np.save(OUT / f"depth_{i:04d}.npy", depth)
+
+        # --- v2: also dump the model's own colour and accumulated opacity -------
+        # rgb          = the 3DGS model's self-rendering. One single 3D-consistent
+        #                model -> no per-frame exposure / white-balance jumps, so
+        #                TSDF colour averaging stops washing out.
+        # accumulation = sum(alpha_i * T_i) in [0,1]. 1 = the ray hit solid
+        #                geometry, 0 = it missed everything (splatfacto.py:637 then
+        #                fills depth with a sentinel max value). It is a VALIDITY
+        #                signal that does not depend on colour - which is exactly
+        #                what the old chroma mask got wrong.
+        acc = None
+        if "accumulation" in outputs:
+            acc = outputs["accumulation"].detach().cpu().numpy().reshape(H, W)
+            np.save(OUT / f"acc_{i:04d}.npy",
+                    (np.clip(acc, 0.0, 1.0) * 255).astype(np.uint8))
+        if "rgb" in outputs:
+            rgb = outputs["rgb"].detach().cpu().numpy().reshape(H, W, 3)
+            np.save(OUT / f"rgb_{i:04d}.npy",
+                    (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8))
+
         if depth.max() > 0:
             hit += 1
         if i % 15 == 0:
+            acc_txt = f"acc mean {acc.mean():.3f}" if acc is not None else "acc N/A"
             print(f"frame {i:3d}: depth mean {depth.mean():.3f} "
-                  f"max {depth.max():.3f} (normalised units)")
+                  f"max {depth.max():.3f} | {acc_txt} (normalised units)")
 
 print(f"\nframes that saw geometry: {hit}/{len(tf['frames'])}")
 print("next: 23_gs_to_mesh.py (TSDF + compare against the GT mesh)")
