@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lesson 08 · Isaac Sim 侧抓调试报告</title>
+<style>
+  :root {
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --ink: #0f172a;
+    --muted: #475569;
+    --line: #e2e8f0;
+    --ok: #059669;
+    --bad: #dc2626;
+    --amber: #d97706;
+    --blue: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 20px 64px;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    line-height: 1.75;
+    font-size: 15.5px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header {
+    border-bottom: 3px solid var(--ink);
+    padding-bottom: 18px;
+    margin-bottom: 28px;
+  }
+  h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.5px; }
+  .sub { color: var(--muted); font-size: 14.5px; }
+  .badges { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    background: #eef2ff;
+    color: #3730a3;
+    border: 1px solid #c7d2fe;
+    border-radius: 999px;
+    padding: 3px 11px;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  h2 {
+    font-size: 23px;
+    margin: 40px 0 14px;
+    padding-left: 12px;
+    border-left: 5px solid var(--blue);
+  }
+  h3 { font-size: 17.5px; margin: 26px 0 8px; color: #1e293b; }
+  p { margin: 10px 0; }
+  code {
+    background: #f1f5f9;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 13.5px;
+  }
+  pre {
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 13.2px;
+    line-height: 1.6;
+    border: 1px solid #1e293b;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: inherit;
+    font-size: inherit;
+  }
+  .filetag {
+    display: block;
+    color: var(--muted);
+    font-size: 12.5px;
+    margin: 14px 0 6px;
+    font-weight: 600;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin: 16px 0;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  .callout {
+    border-left: 5px solid var(--blue);
+    background: #eff6ff;
+    border-radius: 0 10px 10px 0;
+    padding: 14px 18px;
+    margin: 16px 0;
+  }
+  .callout.warn { border-color: var(--amber); background: #fffbeb; }
+  .callout.bad { border-color: var(--bad); background: #fef2f2; }
+  .callout.good { border-color: var(--ok); background: #ecfdf5; }
+  .callout h4 { margin: 0 0 6px; font-size: 15.5px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 14px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: #f1f5f9; font-weight: 700; font-size: 13.5px; }
+  tr:last-child td { border-bottom: none; }
+  .good { color: var(--ok); font-weight: 700; }
+  .bad { color: var(--bad); font-weight: 700; }
+  ul, ol { margin: 10px 0; padding-left: 24px; }
+  li { margin: 5px 0; }
+  .kv { display: grid; grid-template-columns: 190px 1fr; gap: 6px 14px; margin: 10px 0; font-size: 14.5px; }
+  .kv b { color: #334155; }
+  .muted { color: var(--muted); }
+  .nowrap { white-space: nowrap; }
+  footer {
+    margin-top: 46px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Lesson 08 · Isaac Sim 侧抓调试报告</h1>
+  <div class="sub">
+    从“夹空、碰飞、抓不稳”到稳定夹取：六个关键词对照真实调试过程与最终代码
+  </div>
+  <div class="badges">
+    <span class="badge">Isaac Sim 6.0.1</span>
+    <span class="badge">Franka + cuMotion RMPflow</span>
+    <span class="badge">脚本 19d_grasp_side.py</span>
+    <span class="badge">最终状态：抓取成功</span>
+  </div>
+</header>
+
+<p>
+  这份报告记录我们在 Isaac Sim 中，让 Franka 机械臂通过<b>侧向夹取</b>一块平放在支柱上的物件，并最终稳定抬起的全过程。报告按六个关键词组织：
+  <b>与场景交互中的碰撞、接触、关节、动力学参数、抓取位姿、任务约束</b>。
+  每个关键词包含：概念解释、我们实际遇到的问题、最终修正方法、以及对应的真实代码。
+</p>
+
+<div class="callout">
+  <h4>相关文件</h4>
+  <div class="kv">
+    <b>成功侧抓脚本</b><span><code>scripts/grasp/19d_grasp_side.py</code>（本次调试主体，已清理为 477 行）</span>
+    <b>上抓备份</b><span><code>scripts/grasp/19_grasp_trial_topdown.py</code>（<b>本次未改动</b>）</span>
+    <b>上抓主脚本</b><span><code>scripts/grasp/19_grasp_trial.py</code>（<b>本次未改动</b>）</span>
+  </div>
+</div>
+
+<h2>1. 与场景交互中的碰撞</h2>
+
+<h3>1.1 概念解释</h3>
+<p>
+  这里的碰撞，指机械臂或夹爪在接近物体过程中，与<b>支柱、物体本身</b>发生的非预期接触。
+  侧向夹取时，手指需要从物体边缘外侧伸入，因此接近路径很容易刮到物体顶面或撞到支柱。
+  这类碰撞会把物体推离支柱，导致后续无法夹取。
+</p>
+
+<h3>1.2 我们遇到的问题</h3>
+<div class="callout bad">
+  <h4>现象</h4>
+  <p>
+    机械臂在 <code>descend</code> 阶段推进时，直接把物体<b>顶开/撞倒</b>。日志中出现过物体中心位移触发保护，也出现过接近高度偏高导致手指先刮到顶面。
+  </p>
+</div>
+
+<h3>1.3 最终修正</h3>
+<ul>
+  <li><b>缓速接近</b>：目标点从预抓点滑动到抓点，用 <code>APPROACH_STEPS = 180</code>，不再一步冲进去。</li>
+  <li><b>位移保护</b>：接近途中若物体中心移动超过 <b>5 mm</b>，立即停止推进，避免把物体推离支柱。</li>
+  <li><b>降低接近高度</b>：<code>SIDE_Z_FRAC = 0.35</code>，让上手指和手腕从顶边下方经过，避免刮到顶部。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 缓速接近与位移保护</span>
+<pre><code>        elif self.phase in ("hover", "descend", "lift"):
+            tgt = self.target
+            if self.phase == "descend" and self.approach_from is not None:
+                a = min(1.0, self.step / float(APPROACH_STEPS))
+                tgt = tuple(np.asarray(self.approach_from) + a * (
+                    np.asarray(self.target) - np.asarray(self.approach_from)))
+
+                if (self.phase == "descend"
+                        and self.obj_center0 is not None and self.step % 5 == 0):
+                    mn, mx = box_bounds()
+                    c_now = np.array([(mn[0] + mx[0]) / 2,
+                                      (mn[1] + mx[1]) / 2])
+                    disp = float(np.linalg.norm(c_now - self.obj_center0))
+                    if disp &gt; 0.005:
+                        self.finish(f"object displaced {disp*1000:.0f} mm; approach stopped")
+                        return</code></pre>
+
+<h2>2. 接触</h2>
+
+<h3>2.1 概念解释</h3>
+<p>
+  接触指夹爪闭合时，指垫真正压住物体的上下表面，形成有效夹持。
+  关键难点是：控制器控制的是模型的<b>左指尖</b>，不是两指中点；如果把左指尖位置误当作夹口中心，
+  即使日志显示“到位”，实际夹口仍可能离物体很远，导致夹空。
+</p>
+
+<h3>2.2 我们遇到的问题</h3>
+<div class="callout bad">
+  <h4>现象</h4>
+  <p>
+    日志曾显示横向残差约 <b>46 mm</b>，但脚本忽略了这一误差并直接闭合，
+    结果物体高度完全没变，判定为失败（夹空）。
+  </p>
+</div>
+
+<h3>2.3 最终修正</h3>
+<ul>
+  <li>用两根手指的实际世界位姿计算<b>夹口中心</b>，不再依赖单个指尖或 <code>panda_hand</code> 原点。</li>
+  <li>用模型已知的手指尖偏移 <code>FINGER_TIP_Z = 0.045</code> 还原真实指尖位置。</li>
+  <li>要求位置误差小于 <b>12 mm</b>、方向误差小于 <b>8°</b>，持续稳定后才允许闭合。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 夹口中心与接触到位判断</span>
+<pre><code>def gripper_target_error(target, quat):
+    tips = [np.asarray(m.Transform(Gf.Vec3d(0.0, 0.0, FINGER_TIP_Z))) for m in matrices]
+    centre = (tips[0] + tips[1]) / 2.0
+    delta = centre - np.asarray(target)
+    return centre, delta, float(np.linalg.norm(delta)), angle</code></pre>
+
+<pre><code>        elif self.phase == "descend":
+            ideal = np.array(self.descend_target)
+            centre, delta, distance, angle = gripper_target_error(ideal, self.side_q)
+            if distance &gt;= TCP_POSITION_TOL or angle &gt;= TCP_ANGLE_TOL_DEG:
+                self.finish(f"jaw not aligned: {distance*1000:.1f} mm, {angle:.1f} deg")
+                return
+            set_grip(False)
+            self.enter("close", tuple(ideal), self.side_q)</code></pre>
+
+<h2>3. 关节</h2>
+
+<h3>3.1 概念解释</h3>
+<p>
+  脚本最终控制的是机械臂与夹爪的<b>关节目标</b>。手指关节是位置指令，夹持效果由关节目标与驱动增益共同决定。
+  另外，仿真重启会使旧的关节句柄失效，必须等物理就绪后再创建对象，否则读取关节会报错。
+</p>
+
+<h3>3.2 我们遇到的问题</h3>
+<ul>
+  <li><b>上升途中夹爪松开</b>：发送机械臂关节目标时，夹爪闭合目标被覆盖。</li>
+  <li><b>关节读取报错</b>：<code>stop → play</code> 重置仿真后，旧的机械臂对象不能再读关节。</li>
+</ul>
+
+<h3>3.3 最终修正</h3>
+<ul>
+  <li>每次发送机械臂目标时，<b>强制保留夹爪闭合目标</b>。</li>
+  <li>新增初始化阶段：等物理句柄有效后，再创建机械臂对象与控制器。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 关节指令保持夹爪闭合</span>
+<pre><code>def apply(desired):
+    full = np.asarray(art.get_dof_positions().numpy(), dtype=np.float64).reshape(-1).copy()
+    q = np.asarray(desired.joints.positions.numpy(), dtype=np.float64).reshape(-1)
+    if q.size == len(full):
+        full[:] = q
+    else:
+        full[: len(q)] = q
+    full[grip_idx] = _GRIP_STATE["target"]   # 机械臂更新时不再松开手指
+    art.set_dof_position_targets(full)
+    return full</code></pre>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 物理就绪后再初始化关节对象</span>
+<pre><code>        if self.phase == "initialize":
+            if art is None:
+                art = Articulation(ROBOT)
+            if not art.is_physics_tensor_entity_valid():
+                if self.step &gt;= 120:
+                    self.finish("physics initialization TIMEOUT; no joint commands sent")
+                return
+            art.get_dof_positions()
+            box = GeomPrim(BOX_PRIM)</code></pre>
+
+<h2>4. 动力学参数</h2>
+
+<h3>4.1 概念解释</h3>
+<p>
+  手指关节只是位置指令；真正决定“夹多紧”的是<b>驱动刚度、阻尼、最大出力</b>等动力学参数。
+  若参数过小，即使指令为完全闭合，物体仍会在抬起后滑落。
+</p>
+
+<h3>4.2 我们遇到的问题</h3>
+<div class="callout bad">
+  <h4>现象</h4>
+  <p>
+    夹住后能抬起一小段，随后物体<b>从指间滑脱</b>。增大夹持指令后仍有缝隙，说明不是位置问题，而是出力不足。
+  </p>
+</div>
+
+<h3>4.3 最终修正</h3>
+<ul>
+  <li>闭合目标设为完全闭合：<code>GRIP_CLOSE = 0.0</code>，使指令饱和。</li>
+  <li>放大手指驱动增益：
+    <code>GRIP_STIFFNESS_MULT = 20.0</code>、<code>GRIP_DAMPING_MULT = 10.0</code>、<code>GRIP_EFFORT_MULT = 5.0</code>。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 手指驱动增益放大</span>
+<pre><code>GRIP_STIFFNESS_MULT = 20.0
+GRIP_DAMPING_MULT = 10.0
+GRIP_EFFORT_MULT = 5.0</code></pre>
+
+<pre><code>def boost_gripper():
+    kp, kd = art.get_dof_gains(dof_indices=grip_idx)
+    eff = art.get_dof_max_efforts(dof_indices=grip_idx)
+    art.set_dof_gains(
+        stiffnesses=flat(kp) * GRIP_STIFFNESS_MULT,
+        dampings=flat(kd) * GRIP_DAMPING_MULT,
+        dof_indices=grip_idx,
+    )
+    art.set_dof_max_efforts(flat(eff) * GRIP_EFFORT_MULT, dof_indices=grip_idx)</code></pre>
+
+<h2>5. 抓取位姿</h2>
+
+<h3>5.1 概念解释</h3>
+<p>
+  抓取位姿指夹爪到达的<b>位置与朝向</b>，决定物体能否卡进夹口。
+  侧抓要求：接近方向水平、开口轴竖直，并且抓点要从物体边缘向内推进足够深度。
+</p>
+
+<h3>5.2 我们遇到的问题</h3>
+<ul>
+  <li><b>目标点算错</b>：曾用半宽再除以 2，导致抓点远离物体边缘。</li>
+  <li><b>坐标变换不一致</b>：位置转为基座坐标，姿态却没有同步转换，导致接近方向偏转约 90°。</li>
+</ul>
+
+<h3>5.3 最终修正</h3>
+<ul>
+  <li>抓点直接由 bbox 的 <code>min/max</code> 计算近侧边缘，不再重复减半。</li>
+  <li>构造侧抓姿态：工具 z 沿接近方向，工具 y 竖直；再把夹口中心目标转为模型左指尖目标，并统一做坐标系转换。</li>
+  <li>咬合深度最终成功值：<code>SIDE_INSET = 0.06</code>。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 边缘抓点与预抓点计算</span>
+<pre><code>    mn, mx = box_bounds()
+    z_tcp = mn[2] + SIDE_Z_FRAC * (mx[2] - mn[2])
+    rim = np.array([cx, cy, z_tcp])
+    if abs(d[0]) &gt;= abs(d[1]):
+        d = np.array([np.sign(d[0]), 0.0, 0.0])
+        rim[0] = mn[0] if d[0] &gt; 0.0 else mx[0]
+    else:
+        d = np.array([0.0, np.sign(d[1]), 0.0])
+        rim[1] = mn[1] if d[1] &gt; 0.0 else mx[1]
+    tcp = rim + d * SIDE_INSET
+    back = tcp - d * HOVER_H
+    print(f"  [side-v2] rim={np.round(rim, 3).tolist()} "
+          f"grasp={np.round(tcp, 3).tolist()} "
+          f"pregrasp={np.round(back, 3).tolist()}")</code></pre>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 夹口中心到模型左指尖的位姿转换</span>
+<pre><code>def setpoint(pos, quat):
+    """Convert the jaw-centre pose to the model's left-fingertip pose."""
+    hand_quat = Gf.Quatd(float(quat[0]), Gf.Vec3d(*map(float, quat[1:])))
+    pos = np.asarray(pos, dtype=np.float64) + np.asarray(
+        hand_quat.Transform(Gf.Vec3d(0.0, MODEL_FINGER_OFFSET, 0.0)))
+    tip_quat = hand_quat * Gf.Quatd(0.0, Gf.Vec3d(0.0, 0.0, 1.0))
+    quat = (tip_quat.GetReal(), *tip_quat.GetImaginary())
+    pos = world_to_base(pos)
+    quat = world_quat_to_base(quat)</code></pre>
+
+<h2>6. 任务约束</h2>
+
+<h3>6.1 概念解释</h3>
+<p>
+  本次任务是“<b>夹住并稳定抬起</b>”，不是“碰一下就结束”。
+  因此必须保证真正到位才闭合，判定前保持足够时间，且判定后继续保持夹紧。
+</p>
+
+<h3>6.2 我们遇到的问题</h3>
+<ul>
+  <li><b>提前闭合</b>：缓速接近尚未走完，手臂只跟上中途目标就进入 <code>close</code>，导致夹空。</li>
+  <li><b>判定过早</b>：保持 15 步（约 0.25 s）就判定成功，随后掉落仍算成功。</li>
+  <li><b>判定后放爪</b>：结束阶段主动松爪，导致物体掉落。</li>
+</ul>
+
+<h3>6.3 最终修正</h3>
+<ul>
+  <li>必须完成缓速接近并稳定后，才允许闭合。</li>
+  <li>判定前保持 <code>JUDGE_HOLD = 90</code>（约 1.5 s），避免误判。</li>
+  <li>判定后<b>不松爪</b>，保持最大夹紧。</li>
+</ul>
+
+<span class="filetag">scripts/grasp/19d_grasp_side.py · 任务约束相关最终代码</span>
+<pre><code>                at_final_target = self.phase != "descend" or (
+                    self.step &gt;= APPROACH_STEPS + SETTLE_STEPS
+                )
+                centre, delta, distance, angle = gripper_target_error(tgt, self.quat)
+                pose_ready = distance &lt; TCP_POSITION_TOL and angle &lt; TCP_ANGLE_TOL_DEG
+                self.stable = self.stable + 1 if at_final_target and pose_ready else 0
+
+                if at_final_target and self.stable &gt;= HOLD:
+                    self.on_phase_done()
+                    return</code></pre>
+
+<pre><code>        elif self.phase == "judge":
+            if self.step &gt;= JUDGE_HOLD:
+                z = box_z()
+                rose = z - self.box_z0
+                ok = rose &gt; 0.05
+                print("GRASP RESULT:", "SUCCESS" if ok else "FAILURE")
+                self.finish("trial complete")   # 判定后不放爪，保持夹紧</code></pre>
+
+<h2>7. 最终参数与运行方式</h2>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>最终值</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>SIDE_INSET</code></td><td>0.06</td><td>抓点自边缘向物体内部推进的距离，决定咬合深度</td></tr>
+    <tr><td><code>SIDE_Z_FRAC</code></td><td>0.35</td><td>抓点高度占物体厚度的比例，避免接近时刮顶</td></tr>
+    <tr><td><code>APPROACH_STEPS / SETTLE_STEPS</code></td><td>180 / 30</td><td>缓速接近时长与到位后稳定步数</td></tr>
+    <tr><td><code>TCP_POSITION_TOL</code></td><td>0.012</td><td>夹口中心允许的位置误差（米）</td></tr>
+    <tr><td><code>TCP_ANGLE_TOL_DEG</code></td><td>8.0</td><td>夹口方向允许的角度误差（度）</td></tr>
+    <tr><td><code>GRIP_CLOSE</code></td><td>0.0</td><td>手指完全闭合指令，使夹持力饱和</td></tr>
+    <tr><td><code>GRIP_STIFFNESS_MULT / DAMPING / EFFORT</code></td><td>20 / 10 / 5</td><td>手指驱动增益放大倍数</td></tr>
+    <tr><td><code>JUDGE_HOLD</code></td><td>90</td><td>判定前保持步数，避免“刚夹住就成功”的误判</td></tr>
+  </tbody>
+</table>
+
+<div class="callout good">
+  <h4>运行方式</h4>
+  <p>
+    在 Isaac Sim Script Editor 中打开 <code>scripts/grasp/19d_grasp_side.py</code> → <b>Run</b>。
+    脚本自动启动，无需手动调用 <code>_fsm.start()</code>。可通过 <code>_fsm.stop()</code> 停止。
+  </p>
+</div>
+
+<h2>8. 验证结果</h2>
+
+<p>
+  清理脚本后，我们以成功版本为基准做了对比验证，确认<b>只删除废弃内容，不改变抓取行为</b>。
+</p>
+
+<table>
+  <thead>
+    <tr><th>验证项</th><th>结果</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>新目标点与姿态（5 个基座位置）</td><td class="good">旧版与精简版完全一致</td></tr>
+    <tr><td>FSM 行为（到位、提前闭合、偏差过大、位移、超时）</td><td class="good">旧版与精简版转移完全一致</td></tr>
+    <tr><td>闭合手指指令在机械臂更新后保持</td><td class="good">通过</td></tr>
+    <tr><td>所有成功调参数值</td><td class="good">未改变，<code>SIDE_INSET = 0.06</code></td></tr>
+    <tr><td>是否存在已删分支的残留引用</td><td class="good">无</td></tr>
+    <tr><td>代码规模</td><td><b>731 行 → 477 行</b>（约减少 35%）</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <h4>说明</h4>
+  <p>
+    以上验证为<b>不启动仿真</b>的坐标与状态机一致性检查，以及真实 USD 接口下的位姿计算验证。
+    最终抓取成功已在 Isaac Sim 中实际运行确认；但本报告不包含新的运行日志截图。
+  </p>
+</div>
+
+<footer>
+  报告基于 <code>scripts/grasp/19d_grasp_side.py</code> 的真实调试过程与最终代码编写。
+  上抓脚本 <code>19_grasp_trial.py</code> 与 <code>19_grasp_trial_topdown.py</code> 在本轮工作中未修改。
+</footer>
+
+</div>
+</body>
+</html>
