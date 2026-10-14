@@ -4,6 +4,10 @@
 > 版本：v1（B 方案 · 真值已知排练版） · 创建 2026-09-14 · 最后更新 2026-09-29（T5 3DGS→mesh 闭环打通）
 
 ---
+效果：
+<img width="3126" height="1775" alt="image" src="https://github.com/user-attachments/assets/d251747e-301d-4d74-bd3d-93ed037b99b0" />
+
+
 
 ## 目录结构
 
