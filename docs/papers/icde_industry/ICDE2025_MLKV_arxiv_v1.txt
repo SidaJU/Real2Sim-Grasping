@@ -1,0 +1,1150 @@
+===== PDF PAGE 1 =====
+MLKV: Efficiently Scaling up Large Embedding
+Model Training with Disk-based Key-Value Storage
+Yongjun He
+ETH Z ¨urich
+yongjun.he@inf.ethz.ch
+Roger Waleffe
+UW-Madison
+waleffe@wisc.edu
+Zhichao Han
+eBay
+zhihan@ebay.com
+Johnu George
+Nutanix
+johnu.george@nutanix.com
+Binhang Yuan
+HKUST
+biyuan@ust.hk
+Zitao Zhang
+eBay
+zitzhang@ebay.com
+Yinan Shan
+eBay
+yshan@ebay.com
+Yang Zhao
+eBay
+yzhao5@ebay.com
+Debojyoti Dutta
+Nutanix
+debojyoti.dutta@nutanix.com
+Theodoros Rekatsinas*
+ETH Z ¨urich
+trekatsinas@inf.ethz.ch
+Ce Zhang
+University of Chicago
+cez@uchicago.edu
+Abstract—Many modern machine learning (ML) methods rely
+on embedding models to learn vector representations (embed-
+dings) for a set of entities (embedding tables). As increasingly di-
+verse ML applications utilize embedding models and embedding
+tables continue to grow in size and number, there has been a surge
+in the ad-hoc development of specialized frameworks targeted
+to train large embedding models for specific tasks. Although
+the scalability issues that arise in different embedding model
+training tasks are similar, each of these frameworks indepen-
+dently reinvents and customizes storage components for specific
+tasks, leading to substantial duplicated engineering efforts in both
+development and deployment.
+This paper presents MLKV, an efficient, extensible, and
+reusable data storage framework designed to address the scala-
+bility challenges in embedding model training, specifically data
+stall and staleness. MLKV augments disk-based key-value storage
+by democratizing optimizations that were previously exclusive
+to individual specialized frameworks and provides easy-to-use
+interfaces for embedding model training tasks. Extensive experi-
+ments on open-source workloads, as well as applications in eBay’s
+payment transaction risk detection and seller payment risk
+detection, show that MLKV outperforms offloading strategies
+built on top of industrial-strength key-value stores by 1.6-12.6 ×.
+MLKV is open-source at https://github.com/llm-db/MLKV.
+Index Terms—Embedding Models, Key-Value Stores
+I. I NTRODUCTION
+Embedding models have always been an important machine
+learning (ML) method for a variety of domains, including
+recommendations [1]–[3], knowledge graphs (KGs) [4]–[6],
+and graph neural networks (GNNs) [7]–[10]. In these domains,
+it is common to convert sparse, high-dimensional data (e.g.,
+attributes of entities and the interactions between entities) into
+continuous, low-dimensional (e.g., tens to hundreds) vector
+representations (embeddings). The growing importance of
+these domains necessitates even larger embedding models to
+deliver improved predictive performance for a diverse array
+of tasks [11], such as ranking and click-through rate (CTR)
+prediction for recommendation, node classification, and link
+prediction in KGs and GNNs. For instance, both Meta [12]
+and Kuaishou [13] use embedding models exceeding 10 TB
+in scale for ranking and CTR prediction.
+* Currently at Axelera AI.
+The exponential growth in embedding model size has led to
+the development of a flurry of specialized frameworks [12]–
+[24] for training large embedding models. Although earlier
+studies [25], [26] observed that machine learning models can
+be represented as key-value abstractions, modern disk-based
+key-value stores are rarely used for large embedding model
+training due to scalability issues (details in Section II-C).
+Consequently, they focus on building proprietary storage com-
+ponents for specific tasks or only support scale-out solutions.
+To scale up embedding model training, mainstream frame-
+works usually start by re-implementing basic storage func-
+tionalities in their proprietary in-memory embedding man-
+agement components. By further integrating application logic
+to customize their storage components, they can exploit the
+characteristics of different tasks to minimize data stalls and
+staleness. Unfortunately, from the perspective of developers,
+the maintenance, evolution, and optimization of these frame-
+works require significant duplication of effort and expense.
+From the perspective of users, the deployment of existing
+frameworks is rather difficult, requiring the extensive rewriting
+of their applications due to the tight coupling of processing and
+storage components in these frameworks. Furthermore, their
+applications require different rewrites for different tasks and
+frameworks, although the common goal is to scale embedding
+models. Overall, these lead to two key questions:
+• How can we design a data storage framework that provides
+extensible and reusable data management for embedding
+model training?
+• Can we efficiently scale up large embedding model training
+with modern disk-based key-value stores?
+To answer these questions, we propose MLKV, a data
+storage framework that provides easy-to-use and non-intrusive
+interfaces to existing frameworks for managing embedding
+representations and utilizes bounded staleness consistency and
+look-ahead prefetching to accelerate the out-of-core training of
+large embedding models. In summary, the key contributions of
+this work are as follows:
+• We highlight the major issues in scaling up embedding
+model training: data stalls and staleness, and identify the
+arXiv:2504.01506v1  [cs.LG]  2 Apr 2025
+
+===== PDF PAGE 2 =====
+Sparse 
+Features
+Embedding
+Tables
+Dense 
+Features
+Neural Networks
+Predictions
+Vectors
+Embedding
+Fig. 1. Embedding table and neural network paradigm.
+mismatch between existing and desirable storage systems
+for embedding model training tasks.
+• We present MLKV, a data storage framework for flexibly
+scaling up embedding model training. MLKV offers a set
+of interfaces to help ML task-specific frameworks utilize
+key-value storage for reusable, extensible, and efficient data
+management in embedding model training.
+• We implement MLKV based on FASTER [27]. MLKV
+democratizes optimizations previously exclusive to individ-
+ual specialized frameworks, specifically bounded staleness
+consistency and look-ahead prefetching.
+• We compare MLKV against the SoTA on open-source
+workloads and real-world workloads from eBay (i.e., pay-
+ment transaction risk detection and seller payment risk
+detection) to demonstrate its performance and scalability
+and validate the effectiveness of various optimizations.
+II. P RELIMINARIES AND RELATED WORK
+A. Embedding Models
+To apply deep learning (DL) techniques to practical applica-
+tions, one must adequately preprocess categorical data before
+feeding them into neural networks. This makes the combi-
+nation of embedding tables and neural networks a standard
+paradigm in various domains. As shown in Figure 1, sparse,
+high-dimensional features are first embedded into continuous,
+low-dimensional embedding vectors, and then fed into neural
+networks with dense features.
+Formally, letD ={(xS
+ξ,xD
+ξ ,yξ)}|D|
+ξ=1 be the training dataset,
+where ξ denotes the index of the training sample, xS
+ξ :=
+{xS
+i;ξ|xS
+i;ξ∈ Nni}m
+i=1 denotes the input sparse features from
+m categorical fields, ni denotes the cardinality of the i-th
+category,xD
+ξ denotes the input dense features, and yξ denotes
+the label. The corresponding embedding vectors of the ξ-th
+training sample can be computed by:
+E(wemb;xS
+ξ ) = (wemb
+1 xS
+1;ξ,wemb
+2 xS
+2;ξ,...,w emb
+m xS
+m;ξ)
+where the function E(·) denotes the embedding tables,
+wemb
+i ∈ Rd×ni denotes parameter of the i-th embedding
+table and d denotes the embedding dimension. The training
+objective of a given task can be formulated as:
+min
+wemb,wnn
+f (wemb,wnn) := EξL(N (wnn;E(wemb;xS
+ξ ),xD
+ξ ),yξ)
+where the function N (·) denotes the neural network, wnn
+denotes the parameter of the neural network, L denotes the
+loss function.
+Large embedding models are usually trained asyn-
+chronously [12]–[15], [17]–[19], [21]–[24] to hide data stalls,
+allowing the current iteration to progress without waiting for
+the embedding updates from earlier iterations. Formally, let t
+be the index of the current iteration and k(t) denotes some
+early iterations, the update of wemb and wnn are denoted by
+wemb
+t+1 =wemb
+t −γ∇wembL(wemb
+k(t) ;wnn
+t ;ξt)
+wnn
+t+1 =wnn
+t −γ∇wnnL(wemb
+k(t) ;wnn
+t ;ξt)
+where γ is the learning rate and ∇L(·) is the gradient of a
+functionL. By allowing staleness [28]–[30], described as s =
+t−k(t), asynchronous training improves training throughput
+but may negatively affect embedding quality.
+B. Related Work
+Embedding Model Training Frameworks. A flurry of frame-
+works has recently been developed to meet the emerging
+requirements of training embedding models larger than the
+GPU and CPU memory of a single machine. PERSIA [13]
+scale up deep Learning recommendation models (DLRMs)
+to 100 trillion parameters by leveraging distributed memory
+management built on global hashing schemes and local LRU
+cache. AIBox [14] proposes a bi-level cache management
+system to accelerate the training of 10-TB scale DLRMs on
+a single node. HugeCTR [16] leverages RocksDB [31] for
+out-of-core DLRM inference. PyG [22] allows direct stitching
+of graph learning tasks (e.g., GNNs and KGEs) with off-
+the-shelf key-value stores. However, this approach leads to
+severe performance issues similar to those shown in Figure 2.
+Since the time we conducted our experiments and submitted
+our paper, DGL [23] has been concurrently developing a
+disk-based feature store for GNNs; moreover, it is still not
+compatible with DGL-KE [21]. PBG [17] and Marius [18],
+[19] divide knowledge graph embeddings (KGE) into multiple
+partitions and store each partition as a file. Hetu [24] is
+designed to support multiple tasks, but can not support larger-
+than-memory workloads.
+Parameter Server. This architecture [25], [26], [32], [33] uses
+a set of distributed in-memory key-value stores to provide
+consistency models and fault tolerance for distributed ML.
+However, these scale-out solutions can not address the scala-
+bility issues in out-of-core training. MLKV focuses on scaling
+up large embedding model training with disk-based key-value
+stores, which has not been sufficiently explored in prior work.
+Disked-based Key-Value Storage. The simplicity and unifor-
+mity of the key-value interfaces (e.g., Get, Put, and Delete)
+make them easy to be reused as storage backbone by diverse
+systems [34]–[39]. B+tree [40]–[45] based stores offer better
+read performance, while LSM-tree [27], [31], [46], [47] based
+stores offer better write performance. MLKV is based on
+FASTER [27], a log-structured store, but the optimizations we
+propose can also be applied to B+tree based key-value stores.
+Heterogeneous Storage. Recent studies show that the intro-
+duction of disk-based storage solutions in certain ML [14],
+[16], [48] and database [49] workloads can improve cost-
+effectiveness [50], [51] compared to memory-centric or cloud-
+native storage solutions alone. By periodically checkpointing
+to cloud-native storage, MLKV can leverage the high perfor-
+mance of local NVMe SSDs while ensuring data persistence.
+
+===== PDF PAGE 3 =====
+TABLE I
+COMPARISON OF POPULAR OPEN -SOURCE FRAMEWORKS . BS: B OUNDED
+STALENESS CONSISTENCY . E XT: E XTENSIBILITY . REU: R EUSABILITY .
+Framework DLRM GNN KGE NoSQL Disk BS Ext Reu
+PERSIA ✓ ✓
+AIBox ✓ ✓
+HugeCTR ✓ ✓ –
+PyG ✓ ✓ ✓ –
+PBG ✓ ✓
+DGL(-KE) ✓ ✓ ✓ –
+Hetu ✓ ✓ ✓ ✓ ✓
+MLKV ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓
+ 0
+ 25
+ 50
+ 75
+ 100
+Sync Fully
+Async
+Emb Access
+NN Forward
+NN Backward
+Latency breakdown (%)
+0
+20K
+40K
+60K
+80K
+Sync Fully
+Async
+Throughput (samples/s)
+ 78
+ 79
+ 80
+ 81
+Sync Fully
+Async
+AUC (%)
+Fig. 2. Scalability issues in embedding model training: (left and middle) poor
+throughput in synchronous training due to data stalls; (right) degraded model
+quality in fully asynchronous training due to staleness. We train DLRMs on
+the Criteo dataset using the PERSIA (as the computation layer) and FASTER
+(as the storage layer).
+C. Problems and Opportunities
+Problem 1: Existing frameworks suffer from limited extensi-
+bility, poor reusability, and inadequate functionality (Table I).
+The tight coupling of storage management with application
+logic and the complexity of storage hierarchy implementation
+make these frameworks difficult to extend or reuse to meet new
+requirements and other tasks. Though some of them consider
+extensibility [24], none of them can be reused without a
+massive rewrite of the applications to adopt their components.
+Problem 2: Modern disk-based key-value stores suffer from
+scalability issues in large embedding model training (Figure 2).
+• Issue 1: Data stall. Synchronous training requires that the
+up-to-date embedding vectors are used to train the neural
+network, and the up-to-date gradients are used to update
+the embedding vectors. Therefore, the GPU remains idle
+during the fetching and updating of embedding vectors due
+to disk overheads, which is referred to as data stall.
+• Issue 2: Staleness. Asynchronous training algorithms [28]–
+[30] are thus gradually adopted to alleviate data stalls by
+overlapping data movement with computation. But it also
+introduces staleness to the embedding vectors, which may
+slow down the convergence rate and eventually decrease the
+quality of embedding models.
+Opportunities: By addressing the above scalability issues, a
+data storage framework built on top of disk-based key-value
+storage can be efficient, extensible and reusable. As revisited
+in Section II, embedding tables are used to map sparse features
+into embeddings. Hence, key-value interfaces can cleanly
+decouple the application logic from storage management: the
+computation layer uses the unique identifiers of sparse features
+to finish the application logic execution, and only invokes key-
+value interfaces to fetch and update the actual embeddings
+when neural networks require them.
+1. import MLKV
+2. ... # Application logic
+3. nn_model, emb_tables = MLKV.Open(model_id, dim,
+4. staless_bound)
+5. def train():
+6. for epoch in range(10):
+7. for (inputs, labels) in dataloader:
+8. ... # Application logic
+9. emb_values = emb_tables.Get(emb_keys)
+10. ... # Application logic
+11. output = nn_model(emb_values)
+12. loss = cross_entropy(output, labels)
+13. nn_optimizer.zero_grad()
+14. loss.backward()
+15. nn_optimizer.step()
+16. ... # Application logic
+17. emb_tables.Put(emb_keys, emb_values
+18. + emb_optimizer(emb_values.gradients))
+19. ... # Application logic
+Fig. 3. Example usage of MLKV.
+III. MLKV
+In this section, we describe the design and implementation
+of MLKV. MLKV is a data storage framework that aims to: 1)
+support various mainstream embedding model training tasks;
+2) support larger-than-memory workloads with competitive
+performance; 3) guarantee bounded-staleness consistency; and
+4) retain extensibility and reusability, as shown in Table I.
+A. Interfaces Summary
+MLKV offers users easy-to-use and non-intrusive interfaces
+to scale embedding model training tasks. By simply creating,
+accessing, or modifying the embedding models with MLKV
+interfaces in their applications, users can execute their em-
+bedding model training tasks as before. An example usage of
+MLKV is shown in Figure 3. Next, we briefly describe the
+primary interfaces of MLKV.
+• The Open(model id, dim, staleness bound) interface cre-
+ates an embedding model with controllable staleness bound
+(Section III-C) and dimension.
+• The Get(keys) interface returns the values (i.e., embedding
+vectors) associated with keys (i.e., sparse feature identifiers)
+and is mainly used for forward propagation.
+• The Put(keys, values) upserts the values associated with
+keys and is mainly used for backward propagation.
+• The Lookahead(keys, dest) interface asynchronously loads
+the values associated with keys into the application cache or
+the memory buffer of MLKV. Assisted with it, applications
+can leverage customized prefetching and caching strategies
+to hide and minimize disk accesses (Section III-C).
+B. Workflows
+We sketch the embedding model training workflow with
+MLKV in Figure 4, where each step can be mapped to the code
+in Figure 3. Once users start embedding model training tasks
+(step 0 , line 2), ML task-specific frameworks then start to load
+training data and execute application logic (step 1 , line 8) to
+determine required sparse features. After receiving requests
+containing identifiers for required sparse features, MLKV
+invokes the Get interface to return corresponding embedding
+
+===== PDF PAGE 4 =====
+ML Task-Specific 
+Frameworks
+Training Data
+MLKV Data Storage
+Framework
+Embedding Vectors
+Users
+ML Tasks
+8
+2
+9
+DL Frameworks
+Neural Networks
+0
+4
+6 513
+7
+Fig. 4. Embedding model training with MLKV.
+vectors (step 2 , line 9). ML task-specific frameworks then
+preprocess the embedding vectors according to the application
+logic (step 3 , line 10) before feeding them into the neural net-
+work (step 4 , line 11). The subsequent forward propagation,
+backpropagation, gradient synchronization, and model update
+are completely handled by DL frameworks (step 5 , lines 12
+- 15). After receiving gradients of embedding tables (step
+6 , line 14), ML task-specific frameworks execute application
+logic to determine sparse features that will be updated (step
+7 , line 16). After receiving requests containing identifiers
+and gradients for required sparse features, MLKV invokes
+the Put or Rmw interface to update corresponding embedding
+vectors (step 8 , line 17). Users get results as before without
+extensively rewriting their applications (step 9 , line 19).
+C. Implementation and Optimizations
+Guided by a design goal of extensibility and reusability,
+MLKV tweaks FASTER to democratize optimizations previ-
+ously exclusive to individual custom-built frameworks.
+1) Bounded Staleness Consistency: We augment MLKV
+interfaces with user-configurable staleness bound to address
+the staleness issue. By configuring staleness bound to different
+values when creating embedding models, users can train
+their embedding model under different consistency models.
+Embedding models are trained in Bulk Synchronous Parallel
+(BSP [29]) mode when staleness bound is set to 0 and are
+trained in Asynchronous Parallel (ASP [28]) mode when
+staleness bound is set to infinity (in practice, INT64 MAX).
+For the rest configurations, embedding models are trained in
+Stale Synchronous Parallel (SSP [30]) mode.
+MLKV provides bounded staleness consistency guarantees
+on a per-embedding basis, in other words, each key-value
+pair is associated with a vector clock. Many latch-free key-
+value stores use 64-bit atomic variables as record-level locks
+to support concurrent access. For example, FASTER uses 1
+bit to indicate whether the record is locked, 1 bit to indicate
+whether the memory address of the record is replaced by other
+threads, and 30 bits to indicate the generation of the record
+to ensure that the latest value is returned. MLKV implements
+latch-free vector clocks on top of it by stealing unused bits in
+record-level locks to indicate staleness. The detailed MLKV
+record format is shown in Figure 5(a), and the implementation
+of Get and Put interfaces are introduced below. Concurrent
+Get and Put operations first attempt to acquire the lock for
+the record associated with the key. To acquire the lock, a Get
+Lock Value
+LockedReplacedGenerationStaleness
+std::atomic<std::uint64_t>
+1 bit        1 bit           30 bits        32bits
+Applications
+Cache
+MLKV
+Memory
+Disk
+(a) Record format (b) Look-Ahead Prefetching
+Fig. 5. Key designs of MLKV.
+operation must repeatedly check the staleness flag until it is
+less than the staleness bound, whereas a Put operation can
+skip this step because it only reduces the staleness. Then they
+confirm the record is not locked, the memory address is not
+replaced, the generation is the latest, and swap the original
+lock to a desired lock, all of which can be done with a single
+atomic compare-and-swap. The desired lock has the Locked
+bit set to 1 and increment or decrement the staleness flag by 1
+for Get or Put operations, respectively. Next, the Get operation
+will return the embedding vector for the forward propagation,
+and the Put operation will update the embedding vector for the
+backward propagation. Finally, MLKV will perform a fetch-
+and-sub to set the replaced bit and increment the generation
+flag by 1.
+2) Look-Ahead Prefetching: Read-ahead is a technique
+used in database systems like MySQL [52] and SQL
+Server [53] that predicts when pages will be needed and brings
+them into the buffer pool before they are actually used by
+the query. Inspired by Read-Ahead, we propose look-ahead
+prefetching. Unlike conventional prefetching, which retrieves
+embeddings within the staleness bounds into the application
+cache in advance, look-ahead prefetching further brings em-
+beddings beyond the staleness bounds from the disk into the
+storage system’s buffer pool ahead of time, thus avoiding
+the limitations imposed by staleness bounds. Therefore, users
+can also use look-ahead prefetching to manipulate cache
+admissions for customized caching strategies.
+For example, in a CTR task with a staleness bound of 4,
+even if the application knows the next 100 training samples,
+conventional prefetching can prepare embeddings for only
+up to 4 training samples in advance. Now, with look-ahead
+prefetching, MLKV can further hide the disk accesses of
+the remaining training samples while guaranteeing bounded
+staleness consistency.
+We extend MLKV with a non-blocking Lookahead interface
+that asynchronously loads embedding vectors from the disk
+to the application cache or its memory buffer (Figure 5(b)).
+Once users or applications have customized caching strategies,
+or even just know what future incoming training samples
+will be, they can invoke the Lookahead interface to prefetch
+embedding vectors in advance for future use, hiding disk ac-
+cesses during training. When the destination is the application
+cache, look-ahead prefetching works the same as conventional
+prefetching, so below we only describe the process when
+the destination is MLKV’s memory buffer. Once the value
+is obtained and there are no other threads updating it, a new
+record with the original staleness and value will be copied into
+the mutable memory buffer of MLKV. If the data is not on
+disk but in the immutable memory buffer, we will not copy
+
+===== PDF PAGE 5 =====
+Time (minutes)
+(a) DLRM on Criteo-Ad
+Time (minutes)
+(b) KGE on WikiKG2
+Time (minutes)
+(c) GNN on Papers100M
+70
+75
+80
+PERSIA PERSIA-MLKV
+AUC(%)
+FFNN-Dim8 DCN-Dim8
+70
+75
+80
+0 2 4 6 810
+FFNN-Dim16
+0 2 4 6 810
+DCN-Dim16
+40
+60
+80
+DGL DGL-MLKV
+Accuracy(%)
+GraphSage-Dim64 GAT-Dim64
+45
+60
+75
+0 2 4 6 8
+GraphSage-Dim128
+0 3 6 91215
+GAT-Dim128
+40
+60
+80
+DGL-KE DGL-KE-MLKV
+HITS@10Score
+DistMult-Dim200 ComplEx-Dim200
+40
+60
+80
+0 2 4 6 810
+DistMult-Dim400
+0 3 6 9 12
+ComplEx-Dim400
+Fig. 6. End-to-end training convergence comparison.
+TABLE II
+DATASETS AND MODELS .
+Dataset # Emb Dim Type Model
+Freebase86M 86M 100 KGE DistMult & ComplEx
+WikiKG2 2.5M 400 KGE DistMult & ComplEx
+Papers100M 111M 128 GNN GraphSage & GAT
+eBay-Payout 1.7B 768 GNN GraphSage
+eBay-Trisk 185M 256 GNN GraphSage
+Criteo-Terabyte 883M 16 DLRM FFNN & DCN
+Criteo-Ad 34M 16 DLRM FFNN & DCN
+it into the mutable memory, which can reduce the number
+of pages written to disk. This is because MLKV is built
+on log-structured merge-trees (LSM-trees) like data structure,
+where the current mutable memory buffer will be switched to
+immutable when it is full, and then written to disk.
+IV. E VALUATION
+A. Experimental Setup
+Datasets. We evaluate the performance of MLKV against
+baseline systems using seven datasets (Table II), including five
+open-source datasets [54]–[57] and two real-world production
+datasets, eBay-Trisk and eBay-Payout. eBay-Trisk is a pay-
+ment transaction risk detection workload on a bipartite graph,
+which consists of 185 million nodes that represent either
+transactions or entities (e.g., buyers). eBay-Payout is a seller
+payout risk detection workload on a graph consisting of 1.7
+billion nodes representing sellers, items, or buyer checkouts.
+Hardware. Experiments using the open-source datasets were
+run on a single AWS g5.16xlarge instance, while experiments
+using the eBay datasets were run on eBay machines with one
+V100 GPU, 256 GB CPU memory, and SSDs with 1024 MB/s
+bandwidth per instance.
+Software. We compared MLKV with six open-source systems:
+DGL [23] for GNN training, DGL-KE [21] for KGE model
+training, PERSIA [13] for DLRM training, and the integration
+of the above three systems and FASTER [27], RocksDB [31],
+and WiredTiger [42] for larger-than-memory workloads.
+Tasks, Metrics, Models, and Hyperparameters. We use
+three representative embedding model training tasks to evalu-
+ate the end-to-end performance. For DLRM training, we use
+the CTR task and models including fully connected feed-
+forward neural network (FFNN) and DCN [3], and report Area
+under the ROC Curve (AUC). For KGE model training, we use
+the link prediction task and models including DistMult [5]
+and Complex [6], and report the Hits@k score, which is the
+fraction of the top k entities that are ranked correctly. For
+GNN training, we use the node classification task and models
+including GraphSage [8] and GAT [9], and report accuracy
+and AUC. We also evaluate MLKV on YCSB [58], a NoSQL
+benchmark, to isolate the effects of application code. For all
+the tasks, we also report throughput.
+B. End-to-End Comparison
+We first compare the convergence speed of MLKV with
+the SoTA frameworks on three representative tasks. In this
+experiment, we ensure that all variants share the same ap-
+plication logic and staleness bounds and that the embedding
+models fit in memory. As shown in Fig 6, MLKV can achieve
+the same convergence threshold as the corresponding baseline
+frameworks in a comparable time. The efficient support for
+various tasks demonstrates the extensibility and reusability
+of MLKV. Compared with the specialized frameworks with
+proprietary storage architectures, MLKV is at most 2.5%,
+2.6%, and 22.2% slower than PERSIA, DGL-KE, and DGL
+due to the additional overhead of index traversal.
+0
+25K
+50K
+75K
+PERSIA
+PERSIA-MLKV
+PERSIA-FASTER
+PERSIA-RocksDB
+PERSIA-WiredTiger
+Samples/s 0
+80K
+160K
+240K
+DGL-KE
+DGL-KE-MLKV
+DGL-KE-FASTER
+DGL-KE-RocksDB
+DGL-KE-WiredTiger
+0
+15K
+30K
+45K
+DGL
+DGL-MLKV
+DGL-FASTER
+DGL-RocksDB
+DGL-WiredTiger
+ 0
+ 2
+ 4
+ 6
+32 64 128 192
+Joules/
+batch
+Buffer size (GBs)
+(a) DLRM on Criteo-T erabyte
+ 0
+ 2
+ 4
+ 6
+4 8 16 36
+Buffer size (GBs)
+(b) KGE on Freebase86M
+0
+40
+80
+120
+8 16 32 64
+Buffer size (GBs)
+(c) GNN on Papers100M
+Fig. 7. Impact of cache management on (top) throughput (higher is better) and (bottom) energy consumption (lower is better).
+
+===== PDF PAGE 6 =====
+79.4
+79.7
+80
+80.3
+80.6
+015304560
+FFNN-Dim8
+DCN-Dim8
+AUC(%)
+Throughput(thousandsamples/s)
+(a)DLRMonCriteo-Ad
+015304560
+FFNN-Dim16
+DCN-Dim16
+71
+73
+75
+77
+50 70 90110
+DistMult-Dim200
+ComplEx-Dim200
+HITS@10Score
+Throughput(thousandsamples/s)
+(b)KGEonWikiKG2
+50 70 90110
+DistMult-Dim400
+ComplEx-Dim400
+Fig. 8. Effect of bounded staleness consistency.
+ 0
+ 0.5
+ 1
+ 1.5
+ 2
+0 4 10 20 40 80
+FFNN-Dim8
+DCN-Dim8
+FFNN-Dim16
+DCN-Dim16
+Relative speedup
+Staleness bounds
+(a) DLRM on Criteo-Ad
+0
+50K
+100K
+150K
+200K
+250K
+8 16 24 36
+MLKV
+FASTER
+MLKV (BETA)
+FASTER (BETA)
+Throughput (samples/s)Buffer size (GBs)
+(b) KGE on Freebase86M
+Fig. 9. Effect of look-ahead prefetching.
+In the larger-than-memory workloads, we compare MLKV
+with the integrations of the SoTA frameworks and industrial-
+strength key-value stores, following the same settings as above
+but using larger datasets and varying the buffer size. Fig-
+ure 7(top) shows that the MLKV-based solutions outperform
+other variants by 1.08-2.44× in the DLRM CTR task, 1.36-
+4.89× in the KGE link prediction task, and 1.53-12.57 × in
+the GNN node classification task. The MLKV-based solutions
+can better hide data stalls while guaranteeing staleness bounds
+than the variants. We also report approximate energy consump-
+tion following previous methods [59]–[61]. Figure 7(bottom)
+shows that the MLKV-based solution is more energy-efficient
+than other solutions in larger-than-memory workloads.
+C. Effect of Bounded Staleness Consistency.
+To analyze the effect of bounded staleness consistency in
+isolation, we run the CTR task and the link prediction task
+with MLKV by fixing the buffer size and varying the staleness
+bounds (0-80). By appropriately relaxing the staleness bound,
+the MLKV-based solutions can achieve up to 6.58 × speedup
+with a tolerable degradation in model quality (i.e., less than
+0.1% drop of AUC), as demonstrated by the empirical results
+(Figure 8). In contrast, the FASTER-based solutions inevitably
+cause the AUC to drop by more than 0.8% (Figure 2(right)).
+A rigorous theoretical analysis of the convergence guarantees
+with regard to staleness bound is provided in [13].
+D. Effect of Look-Ahead Prefetching.
+The experiments follow the settings of Section IV-C, but
+vary the buffer size and additionally evaluate a partition-
+based graphing learning algorithm, BETA [18], [19], in the
+KGE model training. When the staleness bounds are low,
+look-ahead prefetching can significantly improve the training
+throughput (Figure 9(a)). However, when the staleness bounds
+are high, conventional prefetching alone is enough to hide
+data stalls, so the effect of look-ahead prefetching is not that
+significant. In the link prediction task, Figure 9(b) shows that
+look-ahead prefetching can improve the training throughput of
+both standard and partition-based graph learning algorithms.
+0
+20M
+40M
+60M
+80M
+100M
+2 4 8 16 24
+MLKV (uniform)
+MLKV (zipfian)
+FASTER (uniform)
+FASTER (zipfian)
+Throughput (ops/s)
+Buffer size (GBs)
+0
+20M
+40M
+60M
+80M
+100M
+2 4 8 16 32
+Number of threads
+0
+20M
+40M
+60M
+80M
+100M
+16 32 64 128 256
+Value size
+Fig. 10. Throughput comparison between MLKV and FASTER on YCSB
+workloads.
+0
+10K
+20K
+30K
+40K
+9 18 45 90 Distrib
+-uted
+DDP
+MLKV
+FASTER
+Throughput (samples/s)Buffer size (GBs)
+(a) eBay-Trisk with 176GB embedding model
+ 72
+ 75
+ 78
+ 81
+ 0  10  20  30  40  50  60
+MLKV-8GB
+MLKV-24GB
+FASTER-8GB
+FASTER-24GB
+AUC
+Time (minutes)
+(b) eBay-Payout with 2.38TB embedding model
+Fig. 11. Application of MLKV in risk detection at eBay.
+E. NoSQL Workloads
+To quantify the overhead brought by our implementation,
+we compare MLKV with FASTER on YCSB workload with
+50% read operations and 50% write operations. For uniform
+access, the performance gap is less than 10%, and for skewed
+access, the performance gap is less than 20% (Figure 10).
+This is attributed to the fact that the overhead from the vector
+clock becomes more pronounced in skewed workloads. If the
+user disables bounded stale consistency, MLKV only incurs
+memory overhead and no performance overhead.
+F . Case Studies: eBay-Trisk and eBay-Payout
+We now illustrate how MLKV helps scale GNN training
+for the payment transaction risk detection and seller payout
+risk detection at eBay. The result reported in Figure 11 leads
+to two findings: 1) Compared to DGL-DPP which requires
+two instances to hold the entire embedding model, DGL-
+MLKV is more cost-effective since it achieves comparable
+training throughput (69.6% of DGL-DDP) with only one
+instance. 2) Look-ahead prefetching effectively hides data
+stalls in larger-than-memory workloads, thereby improving
+training throughput.
+V. C ONCLUSION
+Today’s machine learning applications urgently require
+larger and more embedding models, resulting in many ad-hoc
+solutions with poor extensibility and reusability. This paper
+presents MLKV, a unified data storage framework that scales
+embedding model training with key-value storage. MLKV
+democratizes optimizations previously only implemented in
+individual custom-built frameworks while retaining exten-
+sibility and reusability. Our evaluations show that MLKV
+outperforms offloading strategies built on top of industrial-
+strength key-value stores by 1.6-12.6× for larger-than-memory
+workloads and closely matches the performance of specialized
+frameworks for in-memory workloads.
+ACKNOWLEDGMENT
+We thank Gustavo Alonso for his invaluable comments.
+
+===== PDF PAGE 7 =====
+REFERENCES
+[1] S. Zhang, L. Yao, A. Sun, and Y . Tay, “Deep learning based
+recommender system: A survey and new perspectives,” ACM Comput.
+Surv., vol. 52, no. 1, pp. 5:1–5:38, 2019. [Online]. Available:
+https://doi.org/10.1145/3285029
+[2] B. Smith and G. Linden, “Two decades of recommender systems at
+amazon.com,” IEEE Internet Comput. , vol. 21, no. 3, pp. 12–18, 2017.
+[Online]. Available: https://doi.org/10.1109/MIC.2017.72
+[3] R. Wang, B. Fu, G. Fu, and M. Wang, “Deep & cross network for
+ad click predictions,” in Proceedings of the ADKDD’17, Halifax, NS,
+Canada, August 13 - 17, 2017 . ACM, 2017, pp. 12:1–12:7. [Online].
+Available: https://doi.org/10.1145/3124749.3124754
+[4] H. Cai, V . W. Zheng, and K. C. Chang, “A comprehensive survey of
+graph embedding: Problems, techniques, and applications,” IEEE Trans.
+Knowl. Data Eng. , vol. 30, no. 9, pp. 1616–1637, 2018. [Online].
+Available: https://doi.org/10.1109/TKDE.2018.2807452
+[5] B. Yang, W. Yih, X. He, J. Gao, and L. Deng, “Embedding entities
+and relations for learning and inference in knowledge bases,” in 3rd
+International Conference on Learning Representations, ICLR 2015, San
+Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings , 2015.
+[Online]. Available: http://arxiv.org/abs/1412.6575
+[6] T. Trouillon, J. Welbl, S. Riedel, ´E. Gaussier, and G. Bouchard,
+“Complex embeddings for simple link prediction,” in Proceedings of
+the 33nd International Conference on Machine Learning, ICML 2016,
+New York City, NY, USA, June 19-24, 2016 , ser. JMLR Workshop and
+Conference Proceedings, vol. 48. JMLR.org, 2016, pp. 2071–2080.
+[Online]. Available: http://proceedings.mlr.press/v48/trouillon16.html
+[7] K. Xu, W. Hu, J. Leskovec, and S. Jegelka, “How powerful
+are graph neural networks?” in 7th International Conference on
+Learning Representations, ICLR 2019, New Orleans, LA, USA,
+May 6-9, 2019 . OpenReview.net, 2019. [Online]. Available: https:
+//openreview.net/forum?id=ryGs6iA5Km
+[8] W. L. Hamilton, Z. Ying, and J. Leskovec, “Inductive representation
+learning on large graphs,” in Advances in Neural Information Processing
+Systems 30: Annual Conference on Neural Information Processing
+Systems 2017, December 4-9, 2017, Long Beach, CA, USA , 2017, pp.
+1024–1034. [Online]. Available: https://proceedings.neurips.cc/paper/2
+017/hash/5dd9db5e033da9c6fb5ba83c7a7ebea9-Abstract.html
+[9] P. Velickovic, G. Cucurull, A. Casanova, A. Romero, P. Li `o, and
+Y . Bengio, “Graph attention networks,” in 6th International Conference
+on Learning Representations, ICLR 2018, Vancouver, BC, Canada, April
+30 - May 3, 2018, Conference Track Proceedings . OpenReview.net,
+2018. [Online]. Available: https://openreview.net/forum?id=rJXMpikCZ
+[10] Q. Huang, X. Wang, S. X. Rao, Z. Han, Z. Zhang, Y . He, Q. Xu,
+Y . Zhao, Z. Zheng, and J. Jiang, “Benchtemp: A general benchmark
+for evaluating temporal graph neural networks,” in 40th IEEE
+International Conference on Data Engineering, ICDE 2024, Utrecht,
+The Netherlands, May 13-16, 2024 . IEEE, 2024, pp. 4044–4057.
+[Online]. Available: https://doi.org/10.1109/ICDE60146.2024.00310
+[11] N. Ardalani, C. Wu, Z. Chen, B. Bhushanam, and A. Aziz,
+“Understanding scaling laws for recommendation models,” CoRR, vol.
+abs/2208.08489, 2022. [Online]. Available: https://doi.org/10.48550/a
+rXiv.2208.08489
+[12] D. Mudigere, Y . Hao, J. Huang, Z. Jia, A. Tulloch, S. Sridharan,
+X. Liu, M. Ozdal, J. Nie, J. Park, L. Luo, J. A. Yang, L. Gao,
+D. Ivchenko, A. Basant, Y . Hu, J. Yang, E. K. Ardestani, X. Wang,
+R. Komuravelli, C. Chu, S. Yilmaz, H. Li, J. Qian, Z. Feng,
+Y . Ma, J. Yang, E. Wen, H. Li, L. Yang, C. Sun, W. Zhao,
+D. Melts, K. Dhulipala, K. R. Kishore, T. Graf, A. Eisenman,
+K. K. Matam, A. Gangidi, G. J. Chen, M. Krishnan, A. Nayak,
+K. Nair, B. Muthiah, M. khorashadi, P. Bhattacharya, P. Lapukhov,
+M. Naumov, A. Mathews, L. Qiao, M. Smelyanskiy, B. Jia, and
+V . Rao, “Software-hardware co-design for fast and scalable training of
+deep learning recommendation models,” in ISCA ’22: The 49th Annual
+International Symposium on Computer Architecture, New York, New
+York, USA, June 18 - 22, 2022 . ACM, 2022, pp. 993–1011. [Online].
+Available: https://doi.org/10.1145/3470496.3533727
+[13] X. Lian, B. Yuan, X. Zhu, Y . Wang, Y . He, H. Wu, L. Sun, H. Lyu,
+C. Liu, X. Dong, Y . Liao, M. Luo, C. Zhang, J. Xie, H. Li, L. Chen,
+R. Huang, J. Lin, C. Shu, X. Qiu, Z. Liu, D. Kong, L. Yuan,
+H. Yu, S. Yang, C. Zhang, and J. Liu, “Persia: An open, hybrid
+system scaling deep learning-based recommenders up to 100 trillion
+parameters,” in KDD ’22: The 28th ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, Washington, DC, USA, August
+14 - 18, 2022 . ACM, 2022, pp. 3288–3298. [Online]. Available:
+https://doi.org/10.1145/3534678.3539070
+[14] W. Zhao, J. Zhang, D. Xie, Y . Qian, R. Jia, and P. Li, “Aibox:
+CTR prediction model training on a single node,” in Proceedings
+of the 28th ACM International Conference on Information and
+Knowledge Management, CIKM 2019, Beijing, China, November
+3-7, 2019 . ACM, 2019, pp. 319–328. [Online]. Available: https:
+//doi.org/10.1145/3357384.3358045
+[15] B. Jiang, C. Deng, H. Yi, Z. Hu, G. Zhou, Y . Zheng, S. Huang, X. Guo,
+D. Wang, Y . Songet al., “Xdl: an industrial deep learning framework for
+high-dimensional sparse data,” in Proceedings of the 1st International
+Workshop on Deep Learning Practice for High-Dimensional Sparse
+Data, 2019, pp. 1–9.
+[16] Z. Wang, Y . Wei, M. Lee, M. Langer, F. Yu, J. Liu, S. Liu,
+D. G. Abel, X. Guo, J. Dong, J. Shi, and K. Li, “Merlin hugectr:
+Gpu-accelerated recommender system training and inference,” in RecSys
+’22: Sixteenth ACM Conference on Recommender Systems, Seattle, WA,
+USA, September 18 - 23, 2022 . ACM, 2022, pp. 534–537. [Online].
+Available: https://doi.org/10.1145/3523227.3547405
+[17] A. Lerer, L. Wu, J. Shen, T. Lacroix, L. Wehrstedt, A. Bose, and
+A. Peysakhovich, “Pytorch-biggraph: A large scale graph embedding
+system,” in Proceedings of Machine Learning and Systems 2019,
+MLSys 2019, Stanford, CA, USA, March 31 - April 2, 2019 . mlsys.org,
+2019. [Online]. Available: https://proceedings.mlsys.org/book/282.pdf
+[18] J. Mohoney, R. Waleffe, H. Xu, T. Rekatsinas, and S. Venkataraman,
+“Marius: Learning massive graph embeddings on a single machine,”
+in 15th USENIX Symposium on Operating Systems Design and
+Implementation, OSDI 2021, July 14-16, 2021 . USENIX Association,
+2021, pp. 533–549. [Online]. Available: https://www.usenix.org/confere
+nce/osdi21/presentation/mohoney
+[19] R. Waleffe, J. Mohoney, T. Rekatsinas, and S. Venkataraman,
+“Mariusgnn: Resource-efficient out-of-core training of graph neural
+networks,” in Proceedings of the Eighteenth European Conference
+on Computer Systems, EuroSys 2023, Rome, Italy, May 8-12,
+2023. ACM, 2023, pp. 144–161. [Online]. Available: https:
+//doi.org/10.1145/3552326.3567501
+[20] S. Agarwal, C. Yan, Z. Zhang, and S. Venkataraman, “Bagpipe:
+Accelerating deep recommendation model training,” in Proceedings of
+the 29th Symposium on Operating Systems Principles, SOSP 2023,
+Koblenz, Germany, October 23-26, 2023 . ACM, 2023, pp. 348–363.
+[Online]. Available: https://doi.org/10.1145/3600006.3613142
+[21] D. Zheng, X. Song, C. Ma, Z. Tan, Z. Ye, J. Dong, H. Xiong, Z. Zhang,
+and G. Karypis, “DGL-KE: training knowledge graph embeddings at
+scale,” in Proceedings of the 43rd International ACM SIGIR conference
+on research and development in Information Retrieval, SIGIR 2020,
+Virtual Event, China, July 25-30, 2020 . ACM, 2020, pp. 739–748.
+[Online]. Available: https://doi.org/10.1145/3397271.3401172
+[22] M. Fey and J. E. Lenssen, “Fast graph representation learning with
+PyTorch Geometric,” in ICLR Workshop on Representation Learning
+on Graphs and Manifolds , 2019.
+[23] D. Zheng, X. Song, C. Yang, D. LaSalle, and G. Karypis, “Distributed
+hybrid CPU and GPU training for graph neural networks on billion-
+scale heterogeneous graphs,” in KDD ’22: The 28th ACM SIGKDD
+Conference on Knowledge Discovery and Data Mining, Washington,
+DC, USA, August 14 - 18, 2022 . ACM, 2022, pp. 4582–4591.
+[Online]. Available: https://doi.org/10.1145/3534678.3539177
+[24] X. Miao, H. Zhang, Y . Shi, X. Nie, Z. Yang, Y . Tao, and B. Cui, “HET:
+scaling out huge embedding model training via cache-enabled distributed
+framework,” Proc. VLDB Endow. , vol. 15, no. 2, pp. 312–320, 2021.
+[Online]. Available: http://www.vldb.org/pvldb/vol15/p312-miao.pdf
+[25] M. Li, D. G. Andersen, J. W. Park, A. J. Smola, A. Ahmed, V . Josifovski,
+J. Long, E. J. Shekita, and B. Su, “Scaling distributed machine learning
+with the parameter server,” in 11th USENIX Symposium on Operating
+Systems Design and Implementation, OSDI ’14, Broomfield, CO, USA,
+October 6-8, 2014 . USENIX Association, 2014, pp. 583–598.
+[26] E. P. Xing, Q. Ho, W. Dai, J. K. Kim, J. Wei, S. Lee, X. Zheng, P. Xie,
+A. Kumar, and Y . Yu, “Petuum: A new platform for distributed machine
+learning on big data,” IEEE Trans. Big Data , vol. 1, no. 2, pp. 49–67,
+2015.
+[27] B. Chandramouli, G. Prasaad, D. Kossmann, J. J. Levandoski, J. Hunter,
+and M. Barnett, “FASTER: an embedded concurrent key-value store
+for state management,” Proc. VLDB Endow. , vol. 11, no. 12, pp.
+
+===== PDF PAGE 8 =====
+1930–1933, 2018. [Online]. Available: http://www.vldb.org/pvldb/vol11
+/p1930-chandramouli.pdf
+[28] B. Recht, C. R ´e, S. J. Wright, and F. Niu, “Hogwild!: A lock-free
+approach to parallelizing stochastic gradient descent,” in Advances in
+Neural Information Processing Systems 24: 25th Annual Conference on
+Neural Information Processing Systems 2011. Proceedings of a meeting
+held 12-14 December 2011, Granada, Spain , 2011, pp. 693–701.
+[29] L. G. Valiant, “A bridging model for parallel computation,” Commun.
+ACM, vol. 33, no. 8, pp. 103–111, 1990.
+[30] Q. Ho, J. Cipar, H. Cui, S. Lee, J. K. Kim, P. B. Gibbons, G. A.
+Gibson, G. R. Ganger, and E. P. Xing, “More effective distributed ML
+via a stale synchronous parallel parameter server,” inAdvances in Neural
+Information Processing Systems 26: 27th Annual Conference on Neural
+Information Processing Systems 2013. Proceedings of a meeting held
+December 5-8, 2013, Lake Tahoe, Nevada, United States , 2013, pp.
+1223–1231.
+[31] “Rocksdb,” Facebook, 2013. [Online]. Available: https://rocksdb.org/
+[32] J. Jiang, B. Cui, C. Zhang, and L. Yu, “Heterogeneity-aware distributed
+parameter servers,” in Proceedings of the 2017 ACM International Con-
+ference on Management of Data, SIGMOD Conference 2017, Chicago,
+IL, USA, May 14-19, 2017 . ACM, 2017, pp. 463–478.
+[33] A. Renz-Wieland, R. Gemulla, Z. Kaoudi, and V . Markl, “Nups: A
+parameter server for machine learning with non-uniform parameter
+access,” in SIGMOD ’22: International Conference on Management of
+Data, Philadelphia, PA, USA, June 12 - 17, 2022 . ACM, 2022, pp.
+481–495.
+[34] S. Idreos and M. Callaghan, “Key-value storage engines,” in
+Proceedings of the 2020 International Conference on Management of
+Data, SIGMOD Conference 2020, online conference [Portland, OR,
+USA], June 14-19, 2020 . ACM, 2020, pp. 2667–2672. [Online].
+Available: https://doi.org/10.1145/3318464.3383133
+[35] Z. Cao, A. Chandra, R. Kuang, and C. Kim, “High-performance and
+cost-effective storage systems for supporting big data applications,”
+Ph.D. dissertation, University of Minnesota, USA, 2020.
+[36] H. Cha, X. Hao, T. Wang, H. Zhang, A. Akella, and X. Yu,
+“Blink-hash: An adaptive hybrid index for in-memory time-series
+databases,” Proc. VLDB Endow. , vol. 16, no. 6, pp. 1235–1248, 2023.
+[Online]. Available: https://www.vldb.org/pvldb/vol16/p1235-cha.pdf
+[37] T. Neumann and M. J. Freitag, “Umbra: A disk-based system with
+in-memory performance,” in 10th Conference on Innovative Data
+Systems Research, CIDR 2020, Amsterdam, The Netherlands, January
+12-15, 2020, Online Proceedings . www.cidrdb.org, 2020. [Online].
+Available: http://cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf
+[38] M. Athanassoulis, S. Idreos, and D. E. Shasha, “Data structures for
+data-intensive applications: Tradeoffs and design guidelines,” Found.
+Trends Databases , vol. 13, no. 1-2, pp. 1–168, 2023. [Online].
+Available: https://doi.org/10.1561/1900000059
+[39] Y . He, J. Lu, and T. Wang, “Corobase: Coroutine-oriented main-memory
+database engine,” Proc. VLDB Endow. , vol. 14, no. 3, pp. 431–444,
+2020. [Online]. Available: http://www.vldb.org/pvldb/vol14/p431-he.pdf
+[40] M. Seltzer and K. Bostic, “Berkeley db,” University of California,
+Berkeley, 1994. [Online]. Available: https://www.oracle.com/database/
+technologies/related/berkeleydb.html/
+[41] D. R. Hipp, “Sqlite,” 2000. [Online]. Available: https://www.sqlite.org/
+[42] “Wiredtiger,” WiredTiger, 2012. [Online]. Available: hhttp://source.wir
+edtiger.com/
+[43] G. Henry, “Howard chu on lightning memory-mapped database,”
+IEEE Softw. , vol. 36, no. 6, pp. 83–87, 2019. [Online]. Available:
+https://doi.org/10.1109/MS.2019.2936273
+[44] V . Leis, M. Haubenschild, A. Kemper, and T. Neumann, “Leanstore:
+In-memory data management beyond main memory,” in 34th IEEE
+International Conference on Data Engineering, ICDE 2018, Paris,
+France, April 16-19, 2018 . IEEE Computer Society, 2018, pp.
+185–196. [Online]. Available: https://doi.org/10.1109/ICDE.2018.00026
+[45] G. X. Yu, M. Markakis, A. Kipf, P. Larson, U. F. Minhas, and
+T. Kraska, “Treeline: An update-in-place key-value store for modern
+storage,” Proc. VLDB Endow. , vol. 16, no. 1, pp. 99–112, 2022.
+[Online]. Available: https://www.vldb.org/pvldb/vol16/p99-yu.pdf
+[46] J. Dean and S. Ghemawat, “Leveldb,” Google, 2011. [Online].
+Available: https://github.com/google/leveldb/
+[47] L. Lu, T. S. Pillai, A. C. Arpaci-Dusseau, and R. H. Arpaci-Dusseau,
+“Wisckey: Separating keys from values in ssd-conscious storage,” in
+14th USENIX Conference on File and Storage Technologies, FAST
+2016, Santa Clara, CA, USA, February 22-25, 2016 . USENIX
+Association, 2016, pp. 133–148. [Online]. Available: https://www.usen
+ix.org/conference/fast16/technical-sessions/presentation/lu
+[48] S. Rajbhandari, O. Ruwase, J. Rasley, S. Smith, and Y . He,
+“Zero-infinity: breaking the GPU memory wall for extreme scale
+deep learning,” in International Conference for High Performance
+Computing, Networking, Storage and Analysis, SC 2021, St. Louis,
+Missouri, USA, November 14-19, 2021 , B. R. de Supinski, M. W.
+Hall, and T. Gamblin, Eds. ACM, 2021, p. 59. [Online]. Available:
+https://doi.org/10.1145/3458817.3476205
+[49] P. Xu, N. Zhao, J. Wan, W. Liu, S. Chen, Y . Zhou, H. Albahar, H. Liu,
+L. Tang, and Z. Tan, “Building a fast and efficient lsm-tree store
+by integrating local storage with cloud storage,” ACM Trans. Archit.
+Code Optim., vol. 19, no. 3, pp. 37:1–37:26, 2022. [Online]. Available:
+https://doi.org/10.1145/3527452
+[50] “Simplyblock’s intelligent storage optimization platform is now
+generally available on aws,” simplyblock, 2024. [Online]. Available:
+https://www.simplyblock.io/press-releases/simplyblock-announces-aws
+-general-availability/
+[51] “Nvme storage for database optimization: Lessons from tech giants,”
+simplyblock, 2024. [Online]. Available: https://www.simplyblock.io/blo
+g/nvme-database-optimization/
+[52] “Mysql,” Oracle, 1995. [Online]. Available: https://www.mysql.com/
+[53] “Sql server,” Microsoft, 1989. [Online]. Available: https://www.micros
+oft.com/sql-server
+[54] K. D. Bollacker, C. Evans, P. K. Paritosh, T. Sturge, and J. Taylor,
+“Freebase: a collaboratively created graph database for structuring
+human knowledge,” in Proceedings of the ACM SIGMOD International
+Conference on Management of Data, SIGMOD 2008, Vancouver, BC,
+Canada, June 10-12, 2008 . ACM, 2008, pp. 1247–1250. [Online].
+Available: https://doi.org/10.1145/1376616.1376746
+[55] W. Hu, M. Fey, M. Zitnik, Y . Dong, H. Ren, B. Liu, M. Catasta, and
+J. Leskovec, “Open graph benchmark: Datasets for machine learning
+on graphs,” in Advances in Neural Information Processing Systems
+33: Annual Conference on Neural Information Processing Systems
+2020, NeurIPS 2020, December 6-12, 2020, virtual , 2020. [Online].
+Available: https://proceedings.neurips.cc/paper/2020/hash/fb60d411a5c
+5b72b2e7d3527cfc84fd0-Abstract.html
+[56] “Criteo kaggle display advertising dataset,” Criteo, 2014. [Online].
+Available: https://go.criteo.net/criteo-research-kaggle-display-advertisi
+ng-challenge-dataset.tar.gz
+[57] “Criteo 1tb click logs dataset,” Criteo, 2015. [Online]. Available:
+https://ailab.criteo.com/criteo-1tb-click-logs-dataset/
+[58] B. F. Cooper, A. Silberstein, E. Tam, R. Ramakrishnan, and R. Sears,
+“Benchmarking cloud serving systems with YCSB,” in Proceedings
+of the 1st ACM Symposium on Cloud Computing, SoCC 2010,
+Indianapolis, Indiana, USA, June 10-11, 2010 . ACM, 2010, pp.
+143–154. [Online]. Available: https://doi.org/10.1145/1807128.1807152
+[59] P. Roose, M. Soltane, D. Makhlouf, and K. Okba, “Predictions &
+modeling energy consumption for it data center infrastructure,” in
+Advances in Intelligent Systems and Computing , vol. 912, 2018, pp.
+1–11.
+[60] L. F. W. Anthony, B. Kanding, and R. Selvan, “Carbontracker:
+Tracking and predicting the carbon footprint of training deep learning
+models,” CoRR, vol. abs/2007.03051, 2020. [Online]. Available:
+https://arxiv.org/abs/2007.03051
+[61] J. You, J. Chung, and M. Chowdhury, “Zeus: Understanding and
+optimizing GPU energy consumption of DNN training,” in 20th USENIX
+Symposium on Networked Systems Design and Implementation, NSDI
+2023, Boston, MA, April 17-19, 2023, M. Balakrishnan and M. Ghobadi,
+Eds. USENIX Association, 2023, pp. 119–139. [Online]. Available:
+https://www.usenix.org/conference/nsdi23/presentation/you

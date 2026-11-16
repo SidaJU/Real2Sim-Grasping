@@ -1,0 +1,1563 @@
+===== PDF PAGE 1 =====
+Xorbits: Automating Operator Tiling for
+Distributed Data Science
+Weizheng Lu1, Kaisheng He 2, Xuye Qin ∗2, Chengjie Li 2, Zhong Wang 2, Tao Yuan3
+Feng Zhang 1, Yueguo Chen ∗1, Xiaoyong Du 1
+1Renmin University of China, 2 Xorbits Inc.,
+3China Communications Information Technology Group Co. , Ltd.
+luweizheng@ruc.edu.cn,{hekaisheng, qinxuye, lichengjie, wangzhong}@xprobe.io,
+yuantao10@ccccltd.cn,{fengzhang, chenyueguo, duyong}@ruc.edu.cn,
+Abstract—Data science pipelines commonly utilize dataframe
+and array operations for tasks such as data preprocessing,
+analysis, and machine learning. The most popular tools for
+these tasks are pandas and NumPy. However, these tools are
+limited to executing on a single node, making them unsuitable
+for processing large-scale data. Several systems have attempted
+to distribute data science applications to clusters while main-
+taining interfaces similar to single-node libraries, enabling data
+scientists to scale their workloads without significant effort.
+However, existing systems often struggle with processing large
+datasets due to Out-of-Memory (OOM) problems caused by
+poor data partitioning. To overcome these challenges, we develop
+Xorbits, a high-performance, scalable data science framework
+specifically designed to distribute data science workloads across
+clusters while retaining familiar APIs. The key differentiator
+of Xorbits is its ability to dynamically switch between graph
+construction and graph execution. Xorbits has been successfully
+deployed in production environments with up to 5k CPU cores.
+Its applications span various domains, including user behavior
+analysis and recommendation systems in the e-commerce sector,
+as well as credit assessment and risk management in the finance
+industry. Users can easily scale their data science workloads by
+simply changing the import line of their pandas and NumPy
+code. Our experiments demonstrate that Xorbits can effectively
+process very large datasets without encountering OOM or data-
+skewing problems. Over the fastest state-of-the-art solutions,
+Xorbits achieves an impressive 2.66 × speedup on average. In
+terms of API coverage, Xorbits attains a compatibility rate
+of 96.7%, surpassing the fastest framework by an impressive
+margin of 60 percentage points. Xorbits is available at https:
+//github.com/xorbitsai/xorbits.
+Index Terms —scalable data science, dataframe, array, tiling,
+computation graph
+I. I NTRODUCTION
+Data science (DS) pipelines are increasingly prevalent in
+today’s world, owing to the emerging applications of ma-
+chine learning (ML), artificial intelligence (AI), and data-
+driven business intelligence (BI) [1], [2]. Dataframe and array
+systems, specifically pandas [4] and NumPy [5], form the
+most substantial portion of data science pipelines. The two
+libraries have gained widespread recognition among develop-
+ers globally [6] primarily attributed to their various operators,
+flexible usage, and user-friendly interfaces. However, these two
+packages suffer scalability problems as they cannot distribute
+∗ Corresponding authors: Yueguo Chen and Xuye Qin.
+to multi-cores or multi-nodes, missing big data processing
+capability [7]. As datasets rapidly grow and workloads become
+more complex, there is an ever-increasing need to scale
+these libraries by utilizing computational resources far beyond
+what a single CPU-only node can offer. Several frameworks,
+such as PySpark [8], Dask [9], Ray [10], mpi4py [11],
+and Modin [12], have been developed to address scalability
+concerns for data science workloads. However, our empirical
+studies reveal two significant issues with these tools. First,
+they struggle with handling extremely large datasets due to
+poor data partitioning and out-of-memory (OOM) problems,
+particularly in data-skewing scenarios. These systems build the
+computation graphs and partition data primarily by estimating
+the size of initial data sources ahead of runtime [2]. However,
+the size of in-memory data can fluctuate after executing a
+series of data science operators, potentially diverging from the
+initial size. This can lead to memory exhaustion on specific
+worker nodes, especially during shuffle-intensive operations
+such as groupby or merge. Second, they are not fully
+compatible with widely-used pandas and NumPy APIs [13],
+[14]. This necessitates substantial code rewriting from users
+and is problematic as most data scientists only specialize
+in data modeling rather than parallel programming. These
+challenges significantly hinder users aiming to scale their data
+science workloads.
+To address these problems, we develop Xorbits, a scalable
+data science engine that enables parallel execution of work-
+loads like data-loading, preprocessing, scientific computing,
+analyzing, machine learning, etc. First, to optimize computa-
+tion graphs at a finer granularity, we design three types of
+graphs—tileable graph (logical plan), chunk graph (coarse-
+grained physical plan), and subtask graph (fine-grained phys-
+ical plan), in conjunction with a multi-stage map-combine-
+reduce programming model. Second, we introduce a novel
+dynamic tiling approach for automatic graph construction. This
+approach can switch between graph construction and graph
+execution, enabling us to build graphs by leveraging metadata
+from execution. It considers the current operator’s actual input
+data shape. Leveraging this real-time metadata, Xorbits can
+effectively partition and process data without encountering
+OOM issues, even when the data’s shape substantially deviates
+from the initial data source. Third, given the tiled graph, we
+arXiv:2401.00865v1  [cs.DC]  29 Dec 2023
+
+===== PDF PAGE 2 =====
+employ graph-level and operator-level fusion. We also apply
+various optimizations, such as an intermediate storage service
+that utilizes different levels of storage devices, especially
+memory.
+Xorbits can act as a drop-in replacement for the single-node
+data science libraries (i.e., pandas, NumPy, HuggingFace’s
+datasets, etc) while ensuring competitive performance. Since
+Xorbits’ APIs are identical to the original libraries, using
+Xorbits simply requires replacing the import code. As a result,
+users can scale data science programs with as many computing
+resources as they desire. As of October 2023, Xorbits and its
+predecessor, Mars [15], have earned 3.4k stars on GitHub and
+have nearly 3k weekly downloads. Our users have successfully
+deployed Xorbits into their production environments, with up
+to 5,000 CPU cores. Xorbits has significantly expedited vari-
+ous data science and machine learning tasks such as financial
+risk management, fraud detection, user behavior analysis, and
+e-commerce recommendations.
+We evaluate Xorbits’ performance on dataframe and array
+operations using a combination of industry-standard bench-
+marks, such as TPCx-AI [16] and TPC-H [17], along with
+real-world workloads. Compared to the fastest state-of-the-
+art solutions, Xorbits achieves a substantial 2.66 × average
+speedup on data science operations that are supported by all
+baseline systems. Regarding API coverage, Xorbits attains a
+compatibility rate of 96.7%, surpassing the fastest framework
+by an impressive margin of 60 percentage points. To provide
+an understanding of our optimizations, including dynamic
+tiling, we present an ablation analysis that delves into their
+effects on performance.
+To summarize, this paper makes the following contributions:
+• We present the design of Xorbits, formalize three types
+of computation graphs, and propose the multi-stage map-
+combine-reduce computation model.
+• We propose the dynamic tiling approach, which leverages
+metadata from execution to partition data automatically.
+• We provide the details of optimization and implementa-
+tions, including graph fusion, intermediate storage ser-
+vice, and auto re-chunking, .
+• We evaluate Xorbits against existing systems like PyS-
+park, Dask, and Modin on various benchmarks. We
+demonstrate significant speedups over these systems on
+data science pipelines, data analysis, and array computing
+workloads. Additionally, Xorbits supports a wide range
+of APIs and usage patterns.
+II. B ACKGROUND AND MOTIVATION
+A. Background
+The daily work of a data scientist primarily revolves around
+tasks such as loading, preprocessing, transforming, and con-
+ducting feature engineering on data [1]–[3]. To accomplish
+these tasks, they often utilize dataframe and array systems
+like pandas [4] and NumPy [5]. According to the annual Stack
+Overflow Developer Survey, which gathered data from 67,231
+respondents, the usage of NumPy and pandas accounts for
+20.25% and 18.97% respectively among diverse programming
+languages and frameworks [6]. These percentages place them
+just behind .Net and well ahead of other frameworks like
+React Native and Apache Hadoop . NumPy, which underpins
+almost every Python scientific computing library, offers a
+n-dimensional array data type ( ndarray) and array-aware
+functions. These functions enable operations such as matrix
+multiplication, finding the median of an array, indexing, etc.
+Pandas, which supports a more user-friendly approach to
+modern data analysis than SQL, offers a functional interface
+that encourages quick and simple data exploration [2]. The
+main data structure of pandas is the dataframe ( DataFrame),
+denoted as a tuple (A, R, C, T). Here, A represents an m× n
+array containing the data entries of the dataframe. R is an array
+consisting of m row labels, C is an array containing n column
+labels, and T is an array that specifies the types for each
+column [12]. Dataframes support a wide range of operations,
+including both relational and non-relational ones. Relational
+operators, such as join (equivalent to the relational JOIN),
+enable combining data from different sources. Non-relational
+operations, like pivot, offer flexible data manipulation capa-
+bilities.
+Both pandas and NumPy are in-memory, single-node, CPU-
+only computing engines. As datasets continue to grow in size
+and exceed the memory capacity of a single computing node,
+the demand for a more advanced distributed solution is becom-
+ing increasingly urgent. To solve this problem, the community
+has invested significant effort into building frameworks such as
+PySpark [8], Dask [9], Ray [10], Modin [2], and mpi4py [11].
+Due to the widespread popularity of pandas and NumPy, these
+frameworks have attempted to mimic their APIs, enabling
+users to transition to the new tools seamlessly.
+B. Observation
+Our empirical study reveals that these frameworks exhibit
+poor scalability and migration issues for users. We conduct
+tests using the TPC-H benchmark [17], which comprises a
+total of 22 queries, to assess the scalability and usability of
+these systems. We use three scale factors (SFs): 10, 100, and
+1000. Initially, we implemented a version using pandas and
+subsequently ported the code to other frameworks. Table I
+presents the number of failed queries. Note that the PySpark
+version is developed using the pandas API on Spark (formerly
+known as the Koalas project) rather than Spark SQL. Based
+on our observations, these frameworks exhibit two primary
+issues.
+TABLE I: Number of failed queries on TPC-H benchmark.
+SF pandas PySpark Dask Modin
+10 0 3 1 0
+100 17 3 1 1
+1000 22 4 5 22
+Scalability and Performance . These systems exhibit poor
+scalability and struggle to handle large datasets effectively.
+While they may be able to successfully execute queries with
+SF10, they encounter failures as the data size increases.
+
+===== PDF PAGE 3 =====
+To investigate the reasons behind these failures, we analyze
+their performance on the SF1000 dataset and summarize the
+findings in Table II. Modin on Ray offers better compatibility
+with pandas and can handle SF10 datasets. However, it faces
+challenges when dealing with larger data sizes, leading to
+OOM problems and termination of Ray workers. Running
+all 22 queries with Modin on SF1000 is difficult. Similarly,
+Dask has five failed queries, two hanging queries, and three
+queries encountering OOM problems. This empirical study
+demonstrates the limited scalability of these systems, as they
+struggle with large datasets.
+TABLE II: Reasons that frameworks fail on TPC-H SF1000.
+Reason PySpark Dask Modin
+API Compatibility 3 0 0
+Hang 0 2 0
+OOM or Killed 1 3 22
+Total 4 5 22
+API Compatibility . These systems face API compatibility
+issues, and migrating data science workloads from a single
+machine to clusters is challenging. Spark, the most popular
+big data engine, fails mostly due to the absence of some
+pandas APIs. As a result, users frequently need to spend hours,
+or even days, searching for workarounds when encountering
+API issues. Notably, both Spark and Dask openly acknowl-
+edge that cannot achieve 100% compatibility with pandas, as
+stated in their official documentation [13], [14], [18], [19].
+It requires users to have a deep understanding and practical
+experience with the frameworks they are using. Additionally,
+users often need to rewrite their single-node code to make their
+program able to run. Dask offers both array and dataframe
+functionalities, but it’s not easy to scale horizontally. When
+using Dask Array, users need to specify the chunk size. If
+the chunk size is too small, Dask will generate many task
+graph nodes (resulting in overhead). If the chunk size is too
+large, the data may not fit into memory [20]. In some cases,
+incorrect chunk size configuration can prevent the program
+from running successfully. For instance, Dask’s qr and svd
+functions only support specific matrix shapes, such as tall-
+and-skinny or short-and-fat matrices. If users fail to follow
+these chunking rules, Dask will throw exceptions. Users must
+define chunk sizes explicitly using the rechunk function, as
+exemplified in the Dask Array example presented in Listing 1.
+Since Dask DataFrame and pandas API on Spark only partition
+data on rows, they lack support for flexible operators. A
+prime example is Dask’s inability to accommodate operations
+like iloc, which involve row slicing. Example of Dask
+DataFrame in Listing 1, which is quite common in the data
+science community, will throw exceptions. Systems like Ray
+and mpi4py are general-purpose parallel computing engines.
+If users want to use Ray or mpi4py, they must build their
+distributed programs from scratch. In short, scaling the single-
+node data science code is not straightforward.
+C. Key Objectives
+Since we open-sourced our large-scale data framework,
+we have collected nearly 4,000 feedback from industry and
+academia. Based on these comments and recent progress in
+data science and artificial intelligence, we have distilled and
+identified the most pressing requirements of the data science
+community.
+Listing 1: API compatibility issues of Dask.
+import dask.array as da
+import dask.dataframe as dd
+# Dask must specify chunk size
+n = 10000
+a = da.random.random(size=(n,n))
+a = a.rechunk(chunks=(n, 1))
+Q, R = da.linalg.qr(a=a)
+# Dask failed with iloc
+df = dd.read_parquet("<path>")
+df = df.iloc[10]
+• High Scalability and High-performance . Data analytic
+and extract-transform-load (ETL) tasks in enterprises
+often need to process terabytes of data or beyond, so
+the data framework must be scalable enough to cope
+with the growing volume of data. Furthermore, faster
+data processing speed can yield multiple benefits, such as
+quicker results for data analysts, more efficient utilization
+of computing resources, and cost savings.
+• API Compatibility. API compatibility stands as another
+vital consideration. Most users start their data science
+journey by learning pandas and NumPy. In the industry,
+a common scenario involves conducting experiments on
+small datasets using a single node and then scaling these
+workloads onto clusters without the need to modify the
+code.
+• Python First . As Python prevails in data science and
+artificial intelligence, users would like to use Python as
+its core or maybe the only programming language. They
+expect that Python could cover the whole data lifecycle,
+including data ingestion, preprocessing, model training,
+tuning, and inference. Since developers only need to be
+proficient in one language and the corresponding software
+stack, this reduces staff and employers’ costs.
+Opportunity. None of the existing solutions mentioned
+before can meet these requirements. These points drive us to
+develop the Xorbits project, a high-performance data science
+engine that is capable of handling terabytes of data and beyond
+and is compatible with single-node libraries. When building
+the project, we face the dual challenges. First, the framework
+should scale seamlessly across a large number of computing
+nodes and can handle very large datasets. Data-skewing, one of
+the toughest issues that every big data framework faces, should
+be avoided. Second, the tiling of data should be done behind
+the scenes. Since single-node libraries do not have tiling or
+partitioning operations, data partitioning should be hidden to
+keep APIs compatible.
+III. T HE XORBITS SYSTEM
+In this section, we first introduce the architecture overview
+of Xorbits. Next, we present the user interface and the com-
+
+===== PDF PAGE 4 =====
+putation graphs.
+A. Overview
+Architecture. The architecture of Xorbits is depicted in
+Figure 1. Users can scale their data science workloads using
+the very familiar APIs of pandas and NumPy. Based on the
+distributed pandas and NumPy, Xorbits offers functionalities
+including data loading, preprocessing, and distributed machine
+learning, akin to PyTorch’s dataloader [21], HuggingFace’s
+datasets [22], XGBoost [23], or scikit-learn [24]. Internally,
+an API is defined as an operator. Our two most fundamental
+data structures are Tensor and DataFrame, where Tensor
+represents distributed arrays, and DataFrame denotes dis-
+tributed dataframes. Xorbits implements several services to
+support the execution of scalable data science. Each service
+plays a particular management role. For instance, the session
+service creates, maintains, or destroys a session on a Xorbits
+cluster. All these services are based on an actor framework
+called Xoscar. Users can start a Xorbits cluster on any infras-
+tructure like bare metal or Kubernetes. Note that this paper
+focuses on scaling data science workloads by dynamic tiling
+and operator fusion, so distributed machine learning and actor
+model of Xoscar are not main contributions of this paper.
+a lightweight actor framework
+Distributed Data Science
+scikitUser 
+Interface
+Execution 
+Layer 
+Service
+Session Cluster Meta Storage
+Task Subtask Scheduling Lifecycle
+Tensor DataFrame datasets
+API
+Operator
+tile execute
+...
+statsmodels
+Actor
+Fig. 1: Overview of the Xorbits architecture.
+Xorbits Cluster. When creating a Xorbits cluster, two kinds
+of daemons should be started: supervisor and worker. Users
+should choose a node (e.g., bare metal, container, virtual
+machine, etc.) to start the supervisor and spawn the workers on
+other nodes. The supervisor’s main job is to manage subtasks,
+sessions, scheduling, etc. The worker is dedicated to task
+execution, carrying out the actual computational processes.
+Once the cluster is set up, users can submit their workloads
+to the supervisor, which will distribute tasks to workers.
+Novelty. First, we introduce the dynamic tiling approach
+(Section IV) to automatically build data science computation
+graphs and tile data. Dynamic tiling can 1) prevent data-
+skewing and OOM issues, 2) generate optimized graphs, and
+3) avoid re-partition code and keep APIs compatible. Second,
+we propose our novel graph fusion algorithm (Section V-A)
+to fuse computation graphs for better performance. Third, we
+have performed substantial optimization work in areas such as
+scheduling V-B and storage services V-C. Fourth, to keep API
+compatible, we design auto rechunk algorithm (Section V-D).
+B. User Interface & Application Scenarios
+User Interface . DataFrame and Tensor are the two
+main distributed computing features provided by Xorbits. Xor-
+bits can act as a drop-in replacement for pandas and NumPy.
+The Xorbits’ APIs (function signatures, arguments, and seman-
+tics) are exactly the same as those of the original packages.
+As demonstrated in Listing. 2, users can easily scale their
+data science workloads by changing lines of the import code
+and adding an init method to tell which runtime Xorbits
+should connect. When using Xorbits, users are relieved from
+manually specifying chunk sizes, the number of partitions, or
+performing operations like repartition. When migrating
+to Xorbits, users do not need extra effort to change their
+single-node code because Xorbits offers seamless integration
+and compatibility with the original packages. Xorbits can
+be effortlessly installed using the command pip install
+xorbits within a Python environment, eliminating the need
+for Java or any compilation processes.
+Listing 2: Drop-in replacement of Xorbits.
+import xorbits
+import xorbits.numpy as np
+import xorbits.pandas as pd
+# init Xorbits runtime locally
+# or connect to an Xorbits cluster
+xorbits.init(http://<ip>:<port>)
+# array example
+a = np.random.rand(n,n)
+Q, R = np.linalg.qr(a=a)
+print(Q)
+# dataframe example 1
+df = pd.read_parquet("<path>")
+df = df.groupby("A").agg("min")
+print(df)
+# dataframe example 2
+df = pd.read_parquet("<path>")
+filtered = df[df["col"] < 1]
+print(filtered.iloc[10])
+Application Scenarios. As Xorbits provides distributed ver-
+sions of dataframes and arrays with the very familiar APIs, it
+is a powerful tool for data scientists working on data-intensive
+applications. For example, there are three types of workloads
+in a real-world fraud detection workflow: dataframe-based
+ETL from raw logs, graph-based processing, and neural-
+network-based deep learning [25]. Xorbits can be adopted
+in workflows of ETL, analysis, and ML. We have received
+feedback from our open-source community, attesting to the
+successful deployment of Xorbits into their production en-
+vironments. Notably, the largest known Xorbits cluster has
+over five thousand CPU cores. Our typical use cases in-
+clude workflows for e-commerce recommendation systems,
+where data scientists analyze user behavior logs, and financial
+fraud detection. Moreover, Xorbits offers scalability for other
+
+===== PDF PAGE 5 =====
+DS libraries. For example, machine learning libraries like
+scikit-learn can be distributed with Xorbits’ Tensor and
+DataFrame.
+C. Computation Graph
+Xorbits use directed acyclic graphs (DAGs) to describe the
+data dependency and the operator execution order. There are
+three different types of computation graphs in Xorbits: the
+tileable graph (logical plan), the chunk graph (coarse-grained
+physical plan), and the subtask graph (fine-grained physical
+plan).
+Figure 2 depicts the workflow of the three types of graphs.
+Figure 3 illustrates the computation graph for the three ex-
+amples provided in Listing 2. More specifically, Figure 3 (a)
+represents a fragment of the chunk graph for the QR decompo-
+sition example, while Figure 3 (b) and (c) depict the pipelines
+for the dataframe examples. Note that Figure 3 is only for
+illustration purposes, that the real graphs may have far more
+nodes than what we show here.
+Tileable  
+Graph
+Client
+Tileable 
+Graph
+Supervisor
+Tileable  
+Graph
+Optimize 
+Column Pruning, etc
+Chunk 
+Graph
+Subtask 
+Graph
+Schedule
+Worker Worker Worker
+Submit
+Tile Optimize 
+Fusion, etc
+Fig. 2: Workflow of optimizing and scheduling the computa-
+tion graph.
+Generally, each API offered by Xorbits is internally defined
+as an operator. In our computation graphs, operators are
+symbolized as circles, while squares signify data placeholders.
+In this case, the xorbits.pandas.read_parquet oper-
+ation is implemented as the ReadParquet operator. For each
+operator, Xorbits implements three core methods: __call__,
+tile, and execute. These three methods align with distinct
+aspects of the processing pipeline: the __call__ method
+corresponds to the tileable graph, the tile method associates
+with the chunk graph, and the execute method relates to the
+subtask graph.
+Tileable Graph. The tileable graph represents a high-level,
+coarse-grained structure functioning as a logical plan. Xorbits
+calls the __call__ method of each operator on the client
+and translates the user code into a node within the tileable
+graph. Note that at this stage, the tileable graph has not yet
+been divided into multiple partitions or chunks.
+Chunk Graph . The tileable graph is then submitted to
+the supervisor, where every operator’s tile method will be
+invoked. The tile method divides the data into multiple
+chunks according to the data size or other relevant cues. For
+complex operators like groupby.agg, the tile method
+adds internal nodes (i.e., the GroupbyAgg::map, Concat, and
+GroupbyAgg:agg nodes in Figure 3 corresponding to the map,
+combine, and reduce stages, respectively). The map stage in-
+gests the upstream chunk data and produces intermediate key-
+value pairs. The combine stage is a pre-aggregation phase that
+combines a subset of chunks. In contrast to the MapReduce
+programming model [29] that uses persistent storage to store
+the key-value pairs, Xorbits is an in-memory computing en-
+gine. All intermediate results are retained within our dedicated
+storage service (Section V-C). We add the combine stage to
+avoid too many chunks aggregating into a single worker node,
+which may overwhelm the worker’s memory. Our combine
+stage’s pre-aggregating can also improve performance. The
+reduce stage will aggregate and convert the key-value pairs
+into the actual result. Note that each operator has its unique
+semantics, and not all operators would use the aforementioned
+map-combine-reduce stages.
+Subtask Graph . The subtask graph, or the coarse-grained
+physical execution plan, is optimized from the chunk graph.
+Although the chunk graph and the subtask graph resembles
+each other, there are two differences. 1) Nearby nodes in the
+chunk graph are fused to a subgraph called subtask. 2) Every
+subtask in the graph is assigned with scheduling information
+indicating which worker it should run on. In Figure 3 (b),
+the ReadParquet and the GroupbyAgg::map are fused
+to form a subgraph, which will be scheduled to a particular
+worker. During the execution phase, the execute method is
+called on the workers. Single-node packages are the backends
+for calculation given the split chunk (i.e., pandas is the
+backend for dataframes, and NumPy for arrays). There is also
+ongoing backend development of CuPy [26] and cuDF [27]
+for GPU support.
+Chunk. Within the computation graph, circles represent op-
+erators, while squares symbolize chunks. Chunks serve as data
+placeholders, functioning as both the output for predecessor
+operators and the input for successor operators. An operator
+typically generates one or more chunks. As illustrated in Fig-
+ure 3 (a), the TensorQR operator yields two output chunks:
+Q and R. Partitioning the entire dataset into chunks, whether
+it’s done row-wise, column-wise, or cell-wise, depends on the
+semantics of the operator and the size of the data itself.
+Indexing and Ordering . One notable distinction between
+pandas dataframes and relational databases is the presence of
+row labels (or index) in pandas, often used for ordering-based
+operators like iloc. To preserve the semantics of pandas’
+index and multi-level index, we introduce a distributed index
+in each chunk. Illustrated in Figure 4, each chunk is a pandas
+dataframe and our distributed index consists of a two-value
+tuple (r, c), where the r indicates the vertical position of
+the chunk in the complete dataframe, while c denotes the
+horizontal position. This distributed index enables Xorbits to
+locate any item in the original data, to implement operators
+like iloc, transpose, and to speedup lookups.
+IV. D YNAMIC TILING
+After getting an overview of Xorbits in Section IV, we
+present the dynamic tiling approach in this section. We first
+
+===== PDF PAGE 6 =====
+Tensor
+QR
+Tensor
+QR
+Tensor
+QR
+... ... ...
+Concat
+Tensor
+QR
+Tensor
+Slice
+... ... ...
+Chunk  
+Graph
+(a) Array example.
+Read 
+Parquet
+Tileable 
+Graph
+Data
+Groupby
+Agg
+Read 
+Parquet
+Read 
+Parquet
+Read 
+Parquet
+Groupby
+Agg
+::map
+Groupby
+Agg
+::map
+Groupby
+Agg
+::map
+Concat
+Groupby
+Agg
+::agg
+Chunk  
+Graph
+map 
+stage
+combine 
+stage
+reduce 
+stage
+Data
+...
+Subtask 
+Graph
+Fusion
+Fused 
+Subtask
+Fused 
+Subtask
+Fused 
+Subtask
+Fused 
+Subtask (b) Dataframe example 1.
+Read 
+Parquet
+Read 
+Parquet
+Read 
+Parquet
+Filter Filter Filter
+ILoc
+Chunk  
+Graph
+4 8 5
+execute
+Unknown 
+Shape
+Known 
+Shape (c) Dataframe example 2.
+Fig. 3: Illustration of computation graphs.
+(0, 0)
+ColumnsRow labels
+...
+...
+...
+...
+...
+Our Index
+(0, 1) (0, 2) (0, 3)
+(1, 0) (1, 1) (1, 2) (1, 3)
+...
+Chunk
+Fig. 4: Distributed index.
+discuss when and why dynamic tiling is necessary (Sec-
+tion IV-A). Then we introduce the mechanism and implemen-
+tation of dynamic tiling (Section IV-B). Finally, we showcase
+three typical scenarios that can benefit from dynamic tiling
+(Section IV-C).
+A. Necessity of Dynamic Tiling
+Performance and availability depend heavily on the tiling
+strategy because tiling too many chunks would increase over-
+heads, while too few may cause memory overflow. On the
+other hand, the single-node packages do not need tiling, and
+these packages have no chunk- or partition-related parameters.
+Making users explicitly specify the tiling-related parameters
+would break the API compatibility and require expertise in
+parallel programming.
+Unknown Shape Problem . Regarding the output data
+shape, there are mainly two types of operators: static and non-
+static. Static operators are those where the output data shape
+can be computed based on the input shape. A classic example
+is matrix multiplication. Non-static operators are characterized
+by output data sizes that cannot be determined solely from the
+input shape. These operators’ output sizes also depend on the
+data content. Hence, the outputs’ shapes of these operators are
+unknown, making tiling the rest of the data science pipeline
+notably difficult, as the exact shapes remain unknown until
+execution. Non-static examples include df["col"] < 1 ,
+groupby, merge, drop_duplicates, etc. A pipeline
+with only static operators is easy to tile because the output
+of each operator’s shape is fixed, given the shape of the data
+source. However, it is challenging to tile pipelines containing
+numerous non-static operators before execution. Because the
+intermediate results’ shapes differ significantly from the origi-
+nal data sources, precisely determining the partitions of every
+operator is difficult.
+B. Dynamic Tiling
+Our dynamic tiling approach leverages the metadata col-
+lected from execution to tile during the graph construction
+phase. Figure 5 (a) shows how this procedure works. Xorbits
+begins by creating a coarse-grained chunk graph (Step 1⃝) and
+running the operator on the first few chunks. Xorbits would
+get the metadata (e.g., shape, columns, dtype, etc.) and then
+store it in the meta service (Step 2⃝) so that the tiling process
+can later access it. This type of metadata enables Xorbits to
+create an optimized computation graph.
+Yield. The core technology underlying Xorbits’ dynamic
+tiling is the ability to switch between tiling (i.e., the graph
+construction phase) and execution seamlessly. Xorbits gener-
+ates the computation graphs on the fly by leveraging Python’s
+yield mechanism. Figure 5 (b) shows a code snippet
+when implementing the GroupByAgg operator. In the tile
+method, metadata (in this case, the actual data size after
+aggregation) is needed but currently missing, Xorbits will
+yield to trigger execution. Unlike the return keyword,
+which terminates the execution of the function, yield returns
+and pauses at where it is called. After the first few chunks
+are executed, and the metadata is collected, the function
+resumes from the same point. With the collected metadata,
+Xorbits can find the optimal way to tile the remaining chunks
+efficiently, and the optimized chunk graph will be scheduled
+again to workers. Although the yield solution sounds sim-
+
+===== PDF PAGE 7 =====
+executetile
+graph
+metadata
+1
+2
+result
+(a) Switching between tiling and execution.
+  def execute(cls, ctx: Dict, op: "GroupByAgg"): 
+    in_df = ctx[op.inputs[0].key] 
+    # map stage 
+    if op.stage == Stage.map: 
+      grouped = in_df.groupby(...) 
+                 metadata = ... 
+      ctx[op.outputs[0].key] = tuple(..., ...) 
+    elif op.stage == Stage.Combine: 
+      ... 
+class GroupByAgg():
+  def tile(cls, op: "GroupByAgg"):
+    chunks = []
+    # run the first few chunks and collect metadata
+    ...   
+    # yield to trigger execution
+    yield chunks
+    # tile the remaining chunks with metadata 
+    chunks = ...
+    
+    return op.new_dataframes(chunks=chunks)
+Task
+Subtask
+Scheduling
+Storage
+MapReduce key-value pairs
+meta
+(b) An example of operator implementation.
+Fig. 5: Dynamic tiling.
+ple, developing the whole system is a non-trivial work, as
+Xorbits provides the services (e.g., task, subtask, scheduling,
+meta, storage, etc.) to guarantee transition between tiling and
+execution.
+Iterative Tiling. As data science workloads usually contain
+a series of operators whose outputs’ shapes are unknown,
+the dynamic tiling is done iteratively. Xorbits iterates over
+each operator and switches between tiling and execution if
+the metadata of that operator is needed. When encountering
+an operator that lacks metadata, Xorbits interrupts the tiling
+process, pauses, and submits a partial computation graph for
+execution. After the metadata (e.g., shape, columns, dtype,
+etc.) is updated, Xorbits continues the tiling process. In the
+second dataframe example of Listing 2, the output shape of
+df["col"] < 1 is unknown until execution. It is impossi-
+ble to know which chunk contains the tenth row of the filtered
+dataframe. This is where iterative tiling is utilized. The chunks
+corresponding to filtered are submitted for execution, and
+Xorbits will update the chunk shape based on the result. As
+shown in Figure 3 (c), suppose the initial dataframe df is
+divided into three chunks, and after filtering, the lengths of
+each chunk are 4, 8, and 5, respectively. To get the tenth row,
+we only need to append an ILoc operator to the second chunk
+to obtain the final result.
+C. Use Cases for Dynamic Tiling
+Dynamic tiling can be applied to many operators and
+scenarios. Here, we showcase three examples to illustrate how
+Tree-reduce Shufﬂe-reduce
+if
+agg_size < limit
+True False
+(a) Auto Reduce Selection.
+...
+merged_size < limit
+while
+Merge
+True (b) Auto Merge.
+Fig. 6: Typical use cases for dynamic tiling.
+it helps to accelerate workloads and prevent OOM issues.
+Auto Reduce Selection . One illustrative example is how
+to choose the optimal reduce algorithm automatically. Fig-
+ure 6 (a) shows the tree-reduce and shuffle-reduce algorithms
+widely used for operators like groupby. Shuffle-reduce in-
+troduces communication overhead as it dispatches data to
+all downstream reducers, whereas tree-reduce transmits data
+solely to the combined nodes. While tree-reduce offers speed
+and simplicity, it is only efficient when the aggregated data
+is small. Tree-reduce may encounter memory overflow as
+the data volume grows. Therefore, a trade-off exists between
+performance and availability. Other systems choose the reduce
+algorithm according to rules or manually specified by users.
+Given that most users lack enough knowledge of the reduce
+mechanism, manual configurations by users could lead to
+memory issues or performance degradation. With the dynamic
+tiling technique, Xorbits can intelligently choose the optimal
+reduce algorithm based on the metadata collected during
+execution. To illustrate, let’s consider the groupby.agg
+operation. Initially, Xorbits builds a temporary chunk graph
+and runs on the first few chunks, obtaining the aggregated and
+raw input data sizes. This metadata is then added to the meta
+service and can subsequently be applied in tiling the remaining
+chunks. If the size of the aggregated data falls below a
+predefined threshold, Xorbits opts for the tree-reduce structure;
+otherwise, it selects the shuffle-reduce. Importantly, this entire
+process runs seamlessly without requiring user intervention.
+Auto Merge. Large graphs would lead to the overhead of
+graph dispatching and graph execution. Our auto merge mech-
+anism can prevent this problem. In Xorbits, the configuration
+file predefines a chunk size limit, which serves as an upper
+bound for data chunk tiling. Initially, we may get a large
+chunk graph with numerous small chunks, potentially causing
+a substantial performance bottleneck. To keep the graph small
+and simple, Xorbits merges chunks in the combine stage.
+Given the metadata (in this case, the chunk size) collected from
+the execution phase, Xorbits keeps concatenating data chunks
+until the merged chunks reach the predefined size limit. This
+process is illustrated in Figure 6 (b).
+Deferred Evaluation . In contrast to lazy systems where
+users are required to explicitly trigger execution, Xorbits
+seamlessly merges both lazy and eager modes. We term this
+approach “deferred evaluation,” signifying a delayed evalua-
+tion until results are needed, without mandating users to trigger
+computation. Since most single-node libraries only support
+
+===== PDF PAGE 8 =====
+eager mode, this feature ensures that Xorbits is compatible
+with those libraries and more user-friendly for exploratory
+tasks within Jupyter Notebooks. In such environments, users
+often rely on immediate feedback for their subsequent ac-
+tions. The underlying technology for deferred evaluation is
+straightforward, facilitated by Xorbits’ ability to seamlessly
+transition between graph tiling and execution. We achieve this
+by customizing the __repr__ method within our Tensor
+and DataFrame classes, where programs will invoke the
+execute function to activate the evaluation. When users
+need to materialize the results, e.g., print, executions are
+launched, but users are unaware of it. Alternatively, users have
+the option to retrieve results without any delay by explicitly
+invoking xorbits.run().
+V. O PTIMIZATIONS AND IMPLEMENTATION HIGHLIGHTS
+This section describes optimizations and key implementa-
+tion highlights that underlie Xorbits’ high-performance and
+scalable attributes.
+A. Data Science Graph Optimization
+When generating the chunk graph and the subtask graph,
+Xorbits’ optimizer conducts a series of optimizations to
+achieve better performance.
+Graph-level Fusion . Xorbits introduces a graph-level fu-
+sion algorithm based on coloring, to merge adjacent nodes.
+A naive approach is to merge nodes straight in line, which
+is insufficient in our data science scenario as many other
+nodes are not involved in the fusion process. The graph-level
+fusion algorithm, based on coloring, assigns distinctive colors
+to each node in the chunk graph. Nodes sharing the same
+color are candidates for merging into a subtask. This process is
+illustrated in Figure 7, where the C label following numerical
+values represent specific colors, as seen with ”C1” signifying
+Color 1. The numbers within the circles serve to differentiate
+between various operators; for instance, 1⃝ represents Operator
+1. The coloring process consists of three main steps. In the
+first step, initial nodes in the graph are assigned colors (C1 for
+Operator 1⃝ and C2 for Operator 2⃝). In the second step, colors
+are propagated based on the topological order. If a node has
+multiple predecessors, and all of these predecessors share the
+same color, the node inherits that color (e.g., C1 for Operator
+3⃝). Otherwise, the node is assigned a new color (e.g., C3
+for Operator 5⃝). The third step involves reverse topological
+order propagation. In this step, each node is assessed alongside
+its successors in the forward topological order. If all of a
+node’s successors possess colors different from the node itself,
+the node is skipped. However, if some successors share the
+same color while others have different colors, new colors
+are assigned to the successor nodes with the same color. For
+example, in this step, the color of Operator 3⃝ is changed from
+C1 to C6, and the color of Operator 7⃝ is changed from C2 to
+C7. These new colors propagate to the respective successors,
+such as C6 for Operator 4⃝. After these three steps, all the
+nodes within the chunk graph are assigned a color label, and
+nearby nodes that share the same color label are merged into a
+subtask. The first two steps of the coloring algorithm identify
+nodes that are in a straight line, while the third step tries to find
+nodes that require separation. In this specific case, Operator 1⃝
+should not be combined with either Operator 3⃝ or Operator
+5⃝.
+Subtask 3
+Subtask 4
+Subtask 5
+Subtask 2
+Subtask 1
+Subtask 7
+Subtask 6
+C1
+C2
+C1 C1
+C3
+C2
+C3
+C4
+C5
+C6 C6
+C7
+1
+3 4
+8
+9
+65
+7
+2
+Fig. 7: Coloring algorithm for graph-level fusion.
+Operator-level Fusion. Operator-level fusion is carried out
+after the completion of graph-level fusion. In this process,
+we harness state-of-the-art operator fusion libraries, such as
+numexpr [30] and JAX [28]. These packages achieve high
+performance by combining multiple operators into a single
+one, thereby preventing memory allocation for intermediate
+results and minimizing memory access. Before execution,
+Xorbits traverses the subtask graph, identifies operators suit-
+able to fuse, substitutes these operators with a fused one,
+and subsequently evaluates the computation with the fused
+operator.
+Column Pruning. Xorbits facilitates column pruning, akin
+to predicate pushdown [33], [34], which removes unnecessary
+data before it is loaded into memory or transmitted over the
+network. Xorbits registers the required columns into every
+operator when building the tileable graph. During the opti-
+mization phase, Xorbits traverses backward from the data sink,
+recording the columns needed for each operator.
+B. Scheduling Data Science Subtasks
+The purpose of graph optimization is to schedule subtasks
+better. In Xorbits, a “band” is the basic unit for subtask
+scheduling and execution. A band can be a NUMA (Non-
+Uniform Memory Access) node or a GPU device. Every band
+associated a hostname (or IP address) and a specific computing
+device, namely a NUMA node or a GPU device. Every
+subtask should be assigned to a particular band. We employ
+a combination of breadth-first and locality-aware strategies to
+guarantee that neighboring subtasks remain contiguous and to
+enhance the overall scheduling efficiency.
+Breadth-first. Xorbits first assigns the initial subtasks of the
+computation graph with the breadth-first strategy. Breadth-first
+means that Xorbits would find the initial subtasks that do not
+have predecessors and try to assign more initial subtasks to one
+worker. In Figure 7, Subtask 1 and Subtask 2 are the initial
+nodes. Xorbits would first assign Subtask 1 to the first worker.
+Subsequently, Xorbits continues to allocate new subtasks to
+this worker until no bands remain available.
+Locality-aware. To minimize the data transfer overhead of
+the non-initial subtasks, Xorbits implements a locality-aware
+
+===== PDF PAGE 9 =====
+strategy. This implies that successor subtasks should ideally
+be scheduled on the same computing worker as their pre-
+decessors, thus reducing data transfer overhead. As depicted
+in Figure 7, it is far more efficient to assign Subtask 2 and
+Subtask 5 to the same worker.
+C. Storage Service of Intermediate Results
+Even though CPU performance has increased dramatically
+in recent years, the storage layer is often the bottleneck due
+to storage devices’ latency. When developing Xorbits, we
+find that the distributed storage service affects performance
+and scalability when data size grows. Consequently, building
+a distributed storage layer is of great importance. To meet
+the performance requirements, we design a storage service to
+hold the intermediate results of all the calculations (i.e., the
+chunks produced by all the operators). Note that we here are
+not discussing the persistent storage layer that holds the data
+source or data sink.
+Storage Backend . Xorbits presently provides multiple
+storage backends (e.g., shared memory, mmap, cuda, Vine-
+yard [25], Alluxio [32], etc.) that serve as the underlying
+infrastructure for the storage service. The implementation of
+the storage backend follows three key considerations. First, the
+storage backend must utilize memory hierarchy. We define sev-
+eral StorageLevels, including memory, GPU, disk, and re-
+mote distributed filesystem. For example, the shared memory’s
+StorageLevel is memory. Users can either only use main
+memory, or combine main memory with disk and spill data
+to disk when data is large. Moreover, if the intermediate data
+is larger than the aggregated memory of a cluster, users can
+switch to a remote filesystem like Alluxio. Second, we must
+minimize data transfer. On each worker, Xorbits starts with
+multiprocessing module, and the data transfer between
+processes would introduce overhead. We adopt pickle5 [35]
+to achieve zero-copy data access between processes. We also
+add Vineyard support for data sharing between different data
+systems, which can reduce (de)serialization overheads. Third,
+the storage backend is a layer of abstraction that hides the
+data access operations. Xorbits uses a unique ID (the key
+highlighted in Figure 5) (b) for data indexing. Each storage
+backend offers put and get methods, with key as one
+parameter, to read and write data. In this way, each worker
+can read and write data by indexing the key without knowing
+where the data actually is.
+Shuffling. Using the abstraction provided by the storage
+service, Xorbits implements shuffling by writing data chunks
+to the storage service. Each subtask is scheduled to a band,
+and every data chunk has a distinct key. Xorbits maintains
+a dictionary that tracks which band each data chunk is on.
+Slightly different from non-shuffle data accesses, the shuffling
+data needs to be sent to the specified bands. We also optimize
+the shuffling by aggregating all the shuffling data together to
+reduce data transfer overheads.
+D. Auto Rechunk
+When the underlying operator requires particular input sizes
+and shapes, our auto rechunk mechanism automatically adapts
+Algorithm 1 Auto Rechunk
+1: function auto rechunk(shape, dim to size, itemsize,
+conf ig)
+2: max chunk size← conf ig.chunk limit
+3: for i < len (shape) do
+4: if i not in dim to size then
+5: lef t dim to size[i]← empty list
+6: lef t unsplit[i]← shape[i]
+7: while T rue do
+8: nbytes← all items in dim to size× itemsize
+9: divided = max chunk size÷ nbytes
+10: lef t dims← len(lef t dim to size)
+11: cur size = max(divided
+1
+lef t dims , 1)
+12: for j, ns in lef t dim to size do
+13: unsplit← lef t unsplit[j]
+14: ns← concat min(unsplit, cur size)
+15: lef t unsplit[j]← lef t unsplit[j]− ns[−1]
+16: if lef t unsplit[j]≤ 0 then
+17: dim to size[j]← ns
+18: lef t dim to size[i]← empty list
+19: if len(lef t dim to size) = 0 then break
+20: return dim to size
+chunk sizes to fulfill these requirements. This eliminates the
+need for users to manually specify chunks or partitions,
+thereby preserving the compatibility of Xorbits’ APIs with the
+original single-node packages.
+Array Auto Rechunk. For array operators like qr or svd,
+Xorbits uses Algorithm 1 to choose the appropriate chunk
+size automatically. shape represents the raw data size before
+tiling. dim_to_size is a dictionary where the key is the
+dimension, and the value is the chunk size we want to partition
+on that dimension.{1 : 10000} indicates that there are 10,000
+elements in the chunked data’ second dimension (index begins
+with 0). itemsize is the number of bytes one array item oc-
+cupies. The algorithm will return the right chunk size for each
+dimension. Take the qr operator for example. Both Xorbits
+and Dask adopt a MapReduce-based algorithm [29]. However,
+before invoking the MapReduce-based QR algorithm, Xorbits
+informs Algorithm 1 that the chunked matrices are tall-and-
+skinny via the dim_to_size parameter. This prevents users
+from manually selecting the appropriate chunk size. The auto
+rechunk algorithm returns the ideal chunk size given the input
+data shape. For instance, to adhere to the tall-and-skinny rule,
+if the raw input shape of QR is (10000, 10000), Xorbits
+specifies the dim_to_size with{1 : 10000 }. The chunk
+sizes determined by the auto rechunk algorithm are as follows:
+(1677, 10000), (1677, 10000), ..., (1615, 10000).
+VI. E VALUATION
+In this section, we conduct experiments to evaluate the
+performance of Xorbits with different workloads. Specifically,
+we seek to answer the following questions:
+1) What is the end-to-end performance of Xorbits com-
+pared with other frameworks, and how well does Xorbits
+scale data science workloads?
+
+===== PDF PAGE 10 =====
+2) How much do our optimizations like dynamic tiling and
+graph fusion accelerate execution?
+3) How well can Xorbit cover APIs and use cases of single-
+node libraries?
+A. Experiment Setup
+The experiments have been carried out on the AWS r6i
+instance family. We start the supervisor of Xorbits (or the
+corresponding component of Spark, Dask, and Ray) on a
+r6i.large instance. All the workers are run on 16 r6i.8xlarge
+instances. Each of these instances has 32 vCPUs and 256GB
+memory. Different experiments use a subset of these instances
+or all of them.
+Benchmarks. We choose three distinct kinds of workloads:
+data science pipelines, ad-hoc queries, and array computing.
+Table III shows the overview of all the workloads we use to
+benchmark different systems. For data science pipelines, we
+concentrate on the data preprocessing and feature engineering
+phases, which are common scenarios for pandas and NumPy.
+We opt for a data science workload from TPCx-AI [16], an
+industry standard, as well as those from Kaggle competitions
+(census and plasticc) that reflect real-world pipelines. TPCx-
+AI benchmark comprises 10 use cases. We focus on use case
+(UC) 10 because other cases are too simple or complicated and
+require additional libraries. For evaluating decision-making
+and analytical processing performance, we use TPC-H [17].
+All 22 SQL queries are rewritten using the pandas API,
+with an emphasis on large datasets of SF100 and SF1000.
+The array benchmark covers scientific computing workloads
+like linear regression (LR) and QR decomposition. These
+workloads span various scenarios, including DS preprocessing,
+machine learning (ML), and analytic processing (AP). In
+Table III, we also show the number of workers we use when
+benchmarking different systems. We believe these workloads
+can effectively evaluate the scalability and compatibility of our
+Xorbits system. We run each workload seven times, excluding
+the maximum and minimum values, to obtain the average
+value.
+TABLE III: Workloads to benchmark different systems.
+Workload Size Format Workers W/ IO Type
+TPCx-AI
+UC10 SF100 34GB CSV 2 True DS, ML
+census 21GB CSV 1 True DS, ML
+plasticc 20GB CSV 1 True DS, ML
+TPC-H
+SF100 36GB Parquet 4 False AP
+TPC-H
+SF1000 358GB Parquet 16 False AP
+QR Scale Synthetic 1-4 True DS
+Linear
+Regression Scale Synthetic 1-4 True DS, ML
+API Coverage . In addition to these performance bench-
+marks, we add an API coverage benchmark to evaluate the
+compatibility of different systems. Most systems target the
+pandas’ APIs, so we select 30 test cases from the airspeed
+velocity (asv) benchmark code of the pandas’ GitHub reposi-
+tory. we primarily focus on groupby, merge, and pivot,
+because the statistics from the dataset [1], which collected
+four million DS notebooks, indicate that these operators are
+the most popular ones.
+Baselines. We compare Xorbits with pandas [4], pandas
+API on Spark [8], Dask [9] DataFrame, and Modin [12] on
+Ray [10] for workloads related to dataframes. We compare
+Xorbits with Dask Array for the workloads based on arrays.
+We use the default configuration without any tuning or perfor-
+mance optimization for all of these systems. Table IV shows
+all the frameworks and their versions we use. In the table, A
+denotes array, and D is short for dataframe.
+TABLE IV: Other data science frameworks used for baselines.
+NumPy pandas Xorbits PySpark Dask Modin
+version 1.26 2.1.1 0.6.3 3.5.0 2023.9 0.24.1
+API A D A + D D A + D D
+B. DataFrame Performance
+Data Science Pipeline. Figure 8 (a) shows the performance
+of data science pipelines. Overall, Xorbits outperforms the
+optimal baseline in each workload. These DS pipelines mainly
+contain operators like data filtering, missing data handling,
+and aggregated calculation for features. These operators are
+quite common, and all these frameworks can support them.
+The TPCx-AI UC10-SF100 includes a customer file of 3.2MB
+and a financial transaction file of 34GB, which is much larger
+than the previous one. The pipeline joins the two imbalanced
+files based on customer IDs via the merge operator. There
+is a severe issue of data imbalance here. Both Dask and
+Modin cannot handle it well, and Xorbits is 29 × and 37×
+faster than the two frameworks because they partition the
+task graph without knowing the actual data size. We observe
+the workers’ CPU utilization; in this case, Dask and Modin
+can only utilize one CPU core, making the rest of the cores
+idle. This case illustrates that in scenarios involving data
+skew, simply partitioning the data during graph construction is
+insufficient. This is where our dynamic tiling approach excels,
+as our approach tiles the first chunks of the data, realizes that
+there is a data-skewing issue, and adjusts our computation
+graph accordingly.
+The census and the plasticc datasets can fit into the memory
+of a single machine in our experimental environment. There-
+fore, these two workloads show how these frameworks scale
+on a single machine to utilize all the CPU cores. Pandas is the
+slowest because it can run on only a single thread. Xorbits is
+2.65× faster than Modin, which is the fastest on the census
+pipeline, and is 3.86 × faster than PySpark on the plasticc
+pipeline.
+Ad-hoc Query. Figure 8 (b) demonstrates the performance
+of the ad-hoc queries on large datasets with the TPC-H
+benchmark, with Xorbits standing out as the most compatible
+and fastest. We use two scale factors of TPC-H (SF100
+and SF1000) to evaluate Xorbits’ performance in analytic
+processing and to assess how our framework scales across
+nodes when dealing with large datasets. Table I and Table II
+provide clear evidence that many other systems frequently
+face challenges related to scalability and API compatibility.
+
+===== PDF PAGE 11 =====
+TPCx-AI UC10 census plasticc
+Workload
+0
+100
+101
+102
+103
+Time (s)
+X
+Data Science Pipeline
+Xorbits
+PySpark
+Dask
+Modin
+pandas
+(a) Data Science Pipeline.
+SF100 SF1000
+Scale Factor
+0
+1
+2
+3
+4
+5
+6
+7Relative Time
+X
+Ad-hoc Query
+Xorbits
+PySpark
+Dask
+Modin (b) Ad-hoc Query.
+1S 2S 4S 6S 8S
+Size
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75Throughput
+1e5
+ LR
+Dask
+Xorbits (c) Linear Regression.
+1S2S 4S 6S 8S
+Size
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8Throughput
+1e6
+ QR
+Dask
+Xorbits (d) QR.
+Fig. 8: End-to-end performance on different data science workloads.
+For instance, three PySpark queries fail to run correctly when
+using code migrated from pandas, while Dask, PySpark, and
+Modin all encounter Out-Of-Memory (OOM) issues.
+The TPC-H benchmark is designed primarily to evalu-
+ate different SQL systems. It is more complex than typical
+data science workloads due to intensive operators, such as
+groupby.agg and merge. Internally, Xorbits, Dask, and
+Modin use pandas as the execution backend to distribute tasks
+to multiple nodes. PySpark, on the other hand, translates
+pandas-like code into Spark’s logical and physical plans. Using
+the TPC-H benchmark to evaluate our system is fundamentally
+unfair, as pandas has no performance advantage over SQL-
+based systems. Despite pandas-based systems having limi-
+tations in SQL queries, Xorbits still outperforms PySpark.
+Since not all of these baselines can successfully execute all
+22 queries, we exclude the unsuccessful ones and calculate
+the overall relative time compared to Xorbits. We tried hard
+to execute Modin on Ray with SF1000, but the Ray workers
+are often dead because of memory overflows and disk space
+shortages.
+C. Array Performance
+We perform a weak-scaling test to evaluate how Xorbits
+scales array workloads. We adjust the input size of each test
+case as computational resources expand, maintaining a con-
+sistent per-socket problem size. We use the linear regression
+and QR workloads: the linear regression is a classical ML
+workload, and the QR decomposition is a typical scientific
+computing operator upon which SVD can be constructed.
+Figure 8 (c) and (d) show the throughput, which is calculated
+via the problem size divided by time. Xorbits far surpasses
+Dask on both of the two workloads. First, on average, Xorbits
+outperforms Dask by factors of 5.88 and 1.74 on the two
+workloads. Second, when we raise the computing resources
+from one CPU socket to two, both workloads show a per-
+formance improvement. Because our machines have 2 CPU
+sockets, Xorbits can effectively schedule subtasks according
+to the NUMA sockets available and utilize the memory access
+patterns. Third, Xorbits shows higher throughput on the linear
+regression workloads as we increase the computing resources.
+Thus, Xorbits is a promising backend for a scalable ML toolkit
+because array APIs can also implement other ML algorithms.
+Fourth, Both Xorbits and Dask employ NumPy’s qr as the
+backend, and the same MapReduce algorithm [36] when
+implementing the distributed version of QR. Xorbits’ auto
+rechunk mechanism not only partitions data more efficiently
+but also avoids manually rechunk operations.
+D. Ablation Study on Dynamic Tiling and Graph Optimization
+We evaluate the potential for dynamic tiling and graph
+fusion to boost applications. For this purpose, we choose
+some TPC-H queries and alternately enable and disable these
+optimizations. The outcomes of these tests are illustrated in
+Figure 9.
+Dynamic Tiling. Dynamic tiling can significantly speed up
+DS workloads, as depicted in Figure 9 (a) (“dy” denotes dy-
+namic tiling). It is by default enabled in Xorbits for operations
+like merge and groupby.agg. In our experiments, Q2 has
+four merge operations, and Q7 has nine. When dynamic tiling
+is enabled, it yields 7.08 × and 10.59× speed enhancement
+over its disabled state for these two queries, respectively. This
+outcome underscores the effectiveness of dynamic tiling.
+Graph Optimization . Graph optimization, particularly the
+coloring-based graph-level fusion (“g” in Figure 9 (b)), plays
+a crucial role in enhancing performance. When the coloring-
+based graph-level fusion is activated, it results in a 3.80 ×
+and 2.04× acceleration in speed for Q7 and Q8, respectively,
+compared to when it is disabled. Operator-level fusion (“o”
+in Figure 9 (b)) is also preferred, as it can provide a 16%
+improvement.
+E. API Coverage
+Table V displays the coverage rate in the API coverage
+benchmark. Xorbits and Modin demonstrate superior com-
+patibility with the original library, while Dask and PySpark
+encounter difficulties during code porting. In particular, the
+merge operators of Dask and PySpark do not support the
+sorting of join keys in the resulting dataframe. PySpark faces
+challenges with its aggregation functions; for instance, it is
+not user-friendly for user-defined aggregation functions, and
+
+===== PDF PAGE 12 =====
+Q2-SF1000 Q7-SF100
+Query
+0
+200
+400
+600Time (s)
+w/ dy
+wo dy
+(a) Dynamic Tiling.
+Q7-SF100 Q8-SF100
+Query
+0
+50
+100
+150Time (s)
+w/ g + w/ o
+wo o
+wo g (b) Graph Fusion.
+Fig. 9: Ablation study of dynamic tiling and graph fusion.
+“dy” means dynamic tiling, “g” stands for graph-level fusion,
+and “o” is for operator-level fusion.
+does not support NamedAgg, which is the helper for column
+specific aggregation with control over output column names.
+PySpark also offers a SQL-based interface [37], which differs
+from conventional dataframe APIs. Online documentation and
+tutorials often mix SQL-based and pandas-based content,
+which increases the learning cost for users. We believe this
+coverage benchmark can, to some extent, show the poten-
+tial challenges users may encounter when transitioning from
+single-node libraries to these frameworks.
+TABLE V: Coverage rate. Higher values are better.
+Xorbits Modin Dask PySpark
+coverage rate 96.7% 96.7% 46.7% 36.7%
+F . Results and Findings
+Among all the baseline frameworks, Xorbits stands out
+as the most scalable, high-performance, and compatible. It
+outperforms all other frameworks in data science, analysis
+and array workloads. While PySpark exhibits competitive
+performance, it encounters compatibility challenges. Users
+frequently have to rewrite their existing single-node code
+to accomplish specific tasks, posing a substantial burden.
+Despite Modin’s compatibility with pandas, it can only handle
+a moderate volume of data. Modin’s lack of support for
+array operations restricts its capability for distributed ML
+tasks. Dask, meanwhile, wrestles with both performance and
+compatibility issues.
+VII. R ELATED WORK
+There is a strong need to scale data science workloads
+horizontally [38], [39], and numerous systems have attempted
+to do so by providing similar APIs of popular libraries of
+pandas [4], [41] and NumPy [5].
+Apache Spark [8], a popular big data engine, provides a
+Python interface called PySpark, enabling users to perform
+dataframe analysis on large datasets. However, PySpark users
+often encounter challenges related to API compatibility and
+are compelled to employ workarounds when migrating their
+code from pandas [13], [18]. While Spark provides an SQL
+optimization technique known as Adaptive Query Execution
+(AQE) that leverages runtime statistics for the selection of
+the execution plan [42], [43], its performance on the PySpark
+DataFrame API appears to be insufficient. Spark runs on JVM,
+and JVM has limitations when integrating with the Python or
+C/C++ ecosystems and using GPU accelerators. PySpark lacks
+array APIs and is less interoperable than other Python-native
+libraries. Dask [9] is another widely used Python library for
+parallel and distributed computing. At the low level, Dask
+designs a tasking mechanism. At the high level, it offers
+distributed arrays and dataframes. Dask’s APIs are similar to
+those of NumPy and pandas, but Dask requires the explicit
+specification of chunks and partitions. Modin [2] claims to be a
+scalable and drop-in replacement for pandas. It formalizes the
+dataframe algebra and outlines a set of decomposition rules.
+However, our empirical study shows that it cannot handle data
+skewing and fails on large datasets. Although it claims it
+can support array computing, it currently lacks NumPy-like
+APIs. Ray [10] and mpi4py [11] serve as general-purpose
+parallel computing engines, necessitating users to re-develop
+their single-node code entirely.
+Legate primarily concentrates on array computing. It is
+implemented with a runtime called Legion [44] and offers
+a limited set of APIs compared to NumPy. JAX, on the
+other hand, provides interfaces similar to NumPy and utilizes
+XLA [45] as its execution backend. While JAX, PyTorch [21],
+and TensorFlow [46] have gained widespread acceptance for
+deep learning training and inference, they may not be as well-
+suited for data science preprocessing.
+Auto-Suggest [1] conducted research into the behavior of
+data scientists, collecting millions of data science notebooks. It
+subsequently introduced an automated method for generating
+data preparation code. MagicPush [34] implemented predicate
+pushdown techniques for data science pipelines.
+VIII. C ONCLUSION
+Data scientists frequently perform various tasks on increas-
+ing volumes of data, typically employing tools like pandas and
+NumPy. It is of great significance to extend pandas and NumPy
+to adapt to modern hardwares. Existing distributed frameworks
+suffer from scalability and usability issues. They do not
+partition big data well by constructing the computation graph
+only before execution. Xorbits can scale well while providing
+compatible interfaces by designing three types of computation
+graphs and introducing a novel dynamic tiling approach.
+Xorbits’ dynamic tiling can switch between graph building
+and graph execution and thus can tile data automatically
+by leveraging the execution metadata. Extensive experiments
+demonstrate that Xorbits significantly outperforms the state-
+of-the-art frameworks on various data science workloads.
+ACKNOWLEDGMENT
+This work is partly funded by the China National Science
+Foundation (Grant No.62272466 and No.62322213). We thank
+AWS and PCC@RUC for providing computing resources. We
+also thank all the contributors of Xorbits and Mars.
+
+===== PDF PAGE 13 =====
+REFERENCES
+[1] C. Yan and Y . He, “Auto-Suggest: Learning-to-Recommend Data Prepa-
+ration Steps Using Data Science Notebooks,” in Proceedings of the 2020
+International Conference on Management of Data (SIGMOD 2020),
+Portland, OR, USA: ACM, 2020, pp. 1539–1554.
+[2] D. Petersohn, S. Macke, D. Xin, W. Ma, D. Lee, X. Mo, et al., “Towards
+scalable dataframe systems,” Proceedings of the VLDB Endowment. vol.
+13, no. 12, pp. 2033–2046, 2020.
+[3] F. Zhang, J. Zhai, et al., “POCLib: A high-performance framework for
+enabling near orthogonal processing on compression,” IEEE transactions
+on Parallel and Distributed Systems, vol. 33, no 2, pp. 459-475, 2022.
+[4] W. McKinney, “Data structures for statistical computing in python,” in
+Proceedings of the 9th python in science conference 2010 (SciPy 2010),
+Austin, USA, 2010, pp. 56–61
+[5] C. R. Harris, K. J. Millman, S. J. van der Walt, R. Gommers, P. Virtanen,
+D. Cournapeau, et al., “Array programming with NumPy,” Nature, vol.
+585, no. 7825, pp. 357–362, Sep 2020
+[6] “2023 Developer Survey” https://survey.stackoverflow.co/2023/ (ac-
+cessed Sep. 28, 2023).
+[7] “GlobalInterpreterLock - Python Wiki.” https://wiki.python.org/moin/
+GlobalInterpreterLock (accessed Jun. 26, 2023).
+[8] M. Zaharia, R. S. Xin, P. Wendell, T. Das, M. Armbrust, A. Dave, et
+al., “Apache spark: a unified engine for big data processing,” Commu-
+nications of the ACM, vol. 59, no. 11, pp. 56–65, 2016.
+[9] M. Rocklin, “Dask: Parallel Computation with Blocked algorithms
+and Task Scheduling,” presented at the Python in Science Conference,
+Austin, TX, USA, 2015, pp. 126–132.
+[10] P. Moritz, R. Nishihara, S. Wang, A. Tumanov, R. Liaw, E. Liang,
+et al., “Ray: A distributed framework for emerging AI applications,”
+in Proceedings of the 13th USENIX conference on operating systems
+design and implementation (OSDI 2018), Carlsbad, CA, USA: USENIX
+Association, 2018, pp. 561–577.
+[11] L. Dalc ´ın, R. Paz, and M. Storti, “MPI for python,” Journal of Parallel
+and Distributed Computing, vol. 65, no. 9, pp. 1108–1115, 2005.
+[12] D. Petersohn, D. Tang, R. Durrani, A. Melik-Adamyan, J. E. Gonzalez,
+A. D. Joseph, and A. G. Parameswaran, “Flexible rule-based decomposi-
+tion and metadata independence in modin: a parallel dataframe system,”
+Proceedings of the VLDB Endowment, vol. 15, no. 3, pp. 739–751, Nov.
+2021.
+[13] “From/to pandas and PySpark DataFrames” https://spark.apache.org/
+docs/3.5.0/api/python/user guide/pandas on spark/pandas on spark/
+pandas pyspark.html (accessed Aug. 26, 2023).
+[14] “Dask DataFrames Best Practices” https://docs.dask.org/en/stable/
+dataframe-best-practices.html (accessed Sep. 26, 2023).
+[15] ”Mars” https://github.com/mars-project/mars (accessed Oct. 21, 2023).
+[16] C. Br ¨ucke, P. H¨artling, R. D. E. Palacios, H. Patel, and T. Rabl, “TPCx-
+AI - an industry standard benchmark for artificial intelligence and
+machine learning systems,” Proceedings of the VLDB Endowment, vol.
+16, no. 12, pp. 3649–3661, 2023.
+[17] P. Boncz, T. Neumann, and O. Erling, “TPC-H analyzed: Hidden
+messages and lessons learned from an influential benchmark,” in Perfor-
+mance characterization and benchmarking, Cham: Springer International
+Publishing, 2014, pp. 61–76.
+[18] “Best Practices” https://spark.apache.org/docs/3.5.0/api/python/user
+guide/pandas on spark/best practices.html (accessed Aug. 26, 2023).
+[19] “Best Practices” https://docs.dask.org/en/stable/array-best-practices.html
+(accessed Sep. 26, 2023).
+[20] “Choosing good chunk sizes in Dask” https://blog.dask.org/2021/11/02/
+choosing-dask-chunk-sizes (accessed Aug. 31, 2023).
+[21] A. Paszke et al., “PyTorch: An Imperative Style, High-Performance
+Deep Learning Library,” in Advances in Neural Information Processing
+Systems, Curran Associates, Inc., 2019. Accessed: Jul. 08, 2022.
+[22] ”Datasets” https://github.com/huggingface/datasets (accessed Oct. 21,
+2023).
+[23] T. Chen and C. Guestrin, “XGBoost: A Scalable Tree Boosting System,”
+in Proceedings of the 22nd ACM SIGKDD International Conference
+on Knowledge Discovery and Data Mining, San Francisco, CA, USA,
+August 13-17, 2016, B. Krishnapuram, M. Shah, A. J. Smola, C. C.
+Aggarwal, D. Shen, and R. Rastogi, Eds., ACM, 2016, pp. 785–794.
+[24] F. Pedregosa et al., “Scikit-learn: Machine learning in python,” Journal
+of Machine Learning Research, vol. 12, no. 85, pp. 2825–2830, 2011.
+[25] W. Yu et al., “Vineyard: Optimizing data sharing in data-intensive
+analytics,” Proceedings of the ACM on Management of Data, vol. 1,
+no. 2, Jun. 2023.
+[26] “CuPy,” CuPy. https://cupy.dev/ (accessed Jun. 26, 2023).
+[27] “RAPIDS — GPU Accelerated Data Science.” https://rapids.ai/ (ac-
+cessed Jun. 26, 2023).
+[28] J. Bradbury, R. Frostig, P. Hawkins, M. J. Johnson, C. Leary, D.
+Maclaurin, et al., “JAX: composable transformations of Python+NumPy
+programs.” 2018.
+[29] J. Dean and S. Ghemawat, “MapReduce: Simplified data processing
+on large clusters,” in Sixth symposium on operating system design
+and implementation (OSDI 2004), San Francisco, CA, USA, 2004, pp.
+137–150.
+[30] R. McLeod, F. Alted, A. Valentino, G. de Menten, M. Wiebe, cgohlke,
+et al., “pydata/numexpr: NumExpr v2.6.9.” Zenodo, Dec. 2018.
+[31] “multiprocessing.shared memory — Shared memory for direct ac-
+cess across processes” https://docs.python.org/3/library/multiprocessing.
+shared memory.html (accessed Aug. 31, 2023).
+[32] H. Li, A. Ghodsi, M. Zaharia, S. Shenker, and I. Stoica, “Tachyon:
+Reliable, memory speed storage for cluster computing frameworks,” in
+Proceedings of the ACM symposium on cloud computing (SOCC 14),
+New York, USA: ACM, 2014, pp. 1–15.
+[33] J. D. Ullman, Principles of database and knowledge-base systems:
+V olume II: The new technologies. USA: W. H. Freeman & Co., 1990.
+[34] C. Yan, Y . Lin, and Y . He, “Predicate pushdown for data science
+pipelines,” Proceedings of the ACM on Management of Data, vol. 1,
+no. 2, 2023.
+[35] “PEP 574 – Pickle protocol 5 with out-of-band data” https://peps.python.
+org/pep-0574/ (accessed Aug. 31, 2023).
+[36] A. R. Benson, D. F. Gleich, and J. Demmel, “Direct QR factorizations
+for tall-and-skinny matrices in MapReduce architectures,” in 2013 IEEE
+international conference on big data, Los Alamitos, CA, USA: IEEE,
+Oct. 2013, pp. 264–272
+[37] “Spark SQL” https://spark.apache.org/docs/3.5.0/api/python/reference/
+pyspark.sql/index.html (accessed Oct. 21, 2023).
+[38] G. E. G ´evay, T. Rabl, S. Breß, L. Madai-Tahy, J.-A. Quian ´e-Ruiz, and
+V . Markl, “Efficient control flow in dataflow systems: When ease-of-use
+meets high performance,” in 37th IEEE international conference on data
+engineering (ICDE 2021), chania, greece: IEEE, 2021, pp. 1428–1439.
+[39] S Xue, S Zhao, et al, “Kronos: towards bus contention-aware job
+scheduling in warehouse scale computers,” Frontiers of Computer Sci-
+ence, vol. 17, no. 1, pp. 171101, 2023.
+[40] M. Bauer and M. Garland, “Legate NumPy: accelerated and distributed
+array computing,” in Proceedings of the International Conference for
+High Performance Computing, Networking, Storage and Analysis (SC
+2019), Denver, USA: ACM, 2019, pp. 1–23.
+[41] W. McKinney, “pandas: a foundational Python library for data analysis
+and statistics,” Python for high performance and scientific computing,
+vol. 14, no. 9, pp. 1–9, 2011.
+[42] “Adaptive Query Execution” https://spark.apache.org/docs/3.5.0/
+sql-performance-tuning.html#adaptive-query-execution (accessed Dec.
+29, 2023).
+[43] M. Olma, M. Karpathiotakis, I. Alagiannis, M. Athanassoulis, and
+A. Ailamaki, “Adaptive partitioning and indexing for in situ query
+processing,” The VLDB Journal, vol. 29, no. 1, pp. 569–591, 2020.
+[44] M. Bauer, S. Treichler, E. Slaughter, and A. Aiken, “Legion: Expressing
+locality and independence with logical regions,” in Proceedings of the
+international conference on high performance computing, networking,
+storage and analysis (SC 2012), Washington, DC, USA: IEEE, 2012.
+[45] A. Sabne, “XLA: Compiling machine learning for peak performance.”
+2020.
+[46] M. Abadi et al., “TensorFlow: A system for large-scale machine learn-
+ing,” in Proceedings of the 12th USENIX conference on operating
+systems design and implementation (OSDI 2016), Savannah, GA, USA:
+USENIX Association, 2016, pp. 265–283.

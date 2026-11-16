@@ -1,0 +1,82 @@
+{
+  "checked_on": "2026-11-16",
+  "purpose": "ICDE 2027 Industry and Application Track fit assessment; public paper copies for local reading",
+  "cfp": {
+    "url": "https://icde2027.github.io/cf-industry-track.html",
+    "submission_deadline": "2026-12-01 23:59 Pacific Time",
+    "notification": "2027-02-15",
+    "camera_ready": "2027-03-03",
+    "review": "single-blind",
+    "required_affiliation": "At least one author must have a non-academic affiliation; this condition alone does not make a paper industrial.",
+    "short_paper_limit": "6 pages of main content plus unlimited reference pages",
+    "long_paper_limit": "12 pages of main content plus unlimited reference pages",
+    "scope": "Innovative industrial-strength data management systems, solutions, and demanding application scenarios; system/project overviews without articulated innovation are discouraged.",
+    "deployment_note": "The CFP does not specify a mandatory production deployment duration, user count, or data volume. Recommendations in the assessment are not official numeric acceptance thresholds."
+  },
+  "papers": [
+    {
+      "title": "Deep Learning with Spatiotemporal Data: A Deep Dive into GeotorchAI",
+      "venue_track": "ICDE 2024 Industry and Application",
+      "accepted_list_url": "https://icde2024.github.io/industry.html",
+      "pdf_url": "https://kanchanchy.github.io/files/GeoTorchAI-ICDE-2024.pdf",
+      "local_pdf": "ICDE2024_GeoTorchAI.pdf",
+      "local_text": "ICDE2024_GeoTorchAI.txt",
+      "pages": 14,
+      "copy_note": "Public author-hosted copy; pagination is PDF pagination, not proceedings page numbering.",
+      "reading_evidence": {
+        "contribution": "Scalable spatial preprocessing using Apache Sedona, ready-to-use deep learning components, and DFtoTorch conversion from preprocessed DataFrames to training tensors.",
+        "evaluation": "PDF pages 9-12, Section V: four application categories; tensor preparation compared with GeoPandas at 1.4M, 14M, 100M, and 250M trip records. The comparison is explicitly single-machine for fairness, not a cluster scaling experiment.",
+        "repeated_runs": "Traffic and weather models evaluated over five runs with variation reported.",
+        "end_to_end_example": "PDF page 12, Table VIII, five transforms: on-the-fly training 32977 s versus preprocessing 1276 s plus pretransformed training 22429 s, totaling 23705 s.",
+        "deployment_note": "The sections inspected demonstrate a reusable library and benchmark experiments; they do not establish a mandatory production deployment requirement for the track."
+      }
+    },
+    {
+      "title": "Xorbits: Automating Operator Tiling for Distributed Data Science",
+      "venue_track": "ICDE 2024 Industry and Application",
+      "accepted_list_url": "https://icde2024.github.io/industry.html",
+      "pdf_url": "https://arxiv.org/pdf/2401.00865v1",
+      "html_url": "https://arxiv.org/html/2401.00865v1",
+      "local_pdf": "ICDE2024_Xorbits_arxiv_v1.pdf",
+      "local_text": "ICDE2024_Xorbits_arxiv_v1.txt",
+      "pages": 13,
+      "copy_note": "Version-pinned author preprint; may differ from the final proceedings version.",
+      "reading_evidence": {
+        "contribution": "Dynamic operator tiling from runtime metadata, multi-level computation graphs, graph fusion, and distributed dataframe/array processing.",
+        "evaluation": "PDF pages 10-12, Section VI: dataframe pipelines, TPC-H and array workloads; Table III includes 20-358 GB workloads, up to 16 worker instances; workload-specific IO timing boundaries are declared.",
+        "baselines": "pandas, pandas API on Spark, Dask, Modin on Ray; Dask Array for array workloads.",
+        "performance": "Authors report 2.66x average speedup over the fastest comparable baseline and 96.7% API coverage on their selected 30-case test suite; these are workload/test-suite-specific, not universal guarantees.",
+        "ablation": "PDF page 11, VI-D: dynamic tiling Q2 and Q7 improvements of 7.08x and 10.59x compared with disabling the feature.",
+        "deployment": "PDF pages 1-2: authors report production adoption with clusters up to 5000 CPU cores, distinct from their own 16-worker evaluation cluster."
+      }
+    },
+    {
+      "title": "MLKV: Efficiently Scaling up Large Embedding Model Training with Disk-based Key-Value Storage",
+      "venue_track": "ICDE 2025 Industry and Application",
+      "accepted_list_url": "https://ieee-icde.org/2025/industry-and-application-papers/",
+      "pdf_url": "https://arxiv.org/pdf/2504.01506v1",
+      "html_url": "https://arxiv.org/html/2504.01506v1",
+      "local_pdf": "ICDE2025_MLKV_arxiv_v1.pdf",
+      "local_text": "ICDE2025_MLKV_arxiv_v1.txt",
+      "pages": 8,
+      "copy_note": "Version-pinned author preprint; may differ from the final proceedings version.",
+      "reading_evidence": {
+        "contribution": "Reusable disk-backed key-value embedding storage based on FASTER with per-embedding bounded staleness and look-ahead prefetching.",
+        "evaluation": "Section IV: seven datasets, including five public datasets and two eBay production datasets; three training task families, end-to-end convergence, throughput and storage overhead.",
+        "scale": "eBay-Trisk 185 million graph nodes; eBay-Payout 1.7 billion graph nodes; the latter case study labels a 2.38 TB embedding model. These numbers are not ICDE minimum requirements.",
+        "performance": "IV-B: larger-than-memory GNN node classification variants show 1.53-12.57x throughput improvements relative to the compared offloading configurations.",
+        "ablation": "IV-C and IV-D isolate bounded staleness and look-ahead prefetching; IV-E uses YCSB to quantify storage overhead."
+      }
+    }
+  ],
+  "additional_abstract_only": [
+    {
+      "title": "CDMap: Complementarity and Disparity-aware Map Inference Quality Enhancement",
+      "venue_track": "ICDE 2025 Industry and Application",
+      "accepted_list_url": "https://ieee-icde.org/2025/industry-and-application-papers/",
+      "abstract_url": "https://pure.ecnu.edu.cn/en/publications/cdmap-complementarity-and-disparity-aware-map-inference-quality-e",
+      "doi": "10.1109/ICDE65448.2025.00310",
+      "note": "Only the institutional abstract and venue metadata were inspected. No PDF was downloaded; do not treat this as full-text experimental evidence. It addresses sparse and mixed trajectory data for map inference, with Didi-collected trajectory data."
+    }
+  ]
+}
