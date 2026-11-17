@@ -1,0 +1,2950 @@
+
+===== PAGE 1 =====
+Query-Guided Analysis and Mitigation of
+Data Verification Errors (Extended Version) ∗
+Ran Schreiber
+The Department of Computer Science
+Bar-Ilan University, Ramat Gan, Israel
+ransch7@gmail.com
+Yael Amsterdamer
+The Department of Computer Science
+Bar-Ilan University, Ramat Gan, Israel
+yael.amsterdamer@biu.ac.il
+August 28, 2026
+Abstract
+Data verification, the process of labeling data items as correct or incorrect, is a preprocessing
+step that may critically affect the quality of results in data-driven pipelines. Despite recent ad-
+vances, verification can still produce erroneous labels that propagate to downstream query results
+in complex ways. We present a framework that complements existing verification tools by assessing
+the impact of potential labeling errors on query outputs and guiding additional verification steps
+to improve result reliability. To this end, we introduce Maximal Error Score (MES), a worst-case
+uncertainty metric that quantifies the reliability of query output tuples independently of the un-
+derlying data distribution. As an auxiliary indicator, we identify risky tuples – input tuples for
+which reducing label uncertainty may counterintuitively increase the output uncertainty. We then
+develop efficient algorithms for computing MES and detecting risky tuples, as well as a generic
+algorithm, named MESReduce, that builds on both indicators and interacts with external veri-
+fiers to select effective additional verification steps. We implement our techniques in a prototype
+system and evaluate them on real and synthetic datasets, demonstrating that MESReduce can
+substantially and effectively reduce the MES and improve the accuracy of verification results.
+1
+Introduction
+Data verification is the process of classifying data items as correct or incorrect, which can be critical
+in data-driven applications that require high data accuracy. Verifying the data may involve fact-
+checking against external knowledge sources or detecting anomalies in format or content, and thus
+can be viewed as part of the broader data cleaning process. Recent advances in machine learning
+have led to growing interest and improved performance in this area (see Section 7).
+∗This paper is an extended version of our paper published in the IEEE International Conference on Data Engineering
+(ICDE) 2026. DOI: 10.1109/ICDE65706.2026.00151.
+1
+arXiv:2603.08612v2  [cs.DB]  26 Aug 2026
+
+===== PAGE 2 =====
+Despite these advances, data verification can be costly in terms of latency and resources, e.g., when
+each tuple must be fact-checked by searching a data lake, using a Large Language Model, or consulting
+a human expert. Moreover, the resulting labels may still be uncertain or erroneous, especially under
+cost-accuracy tradeoffs. For example, data lake searches may be time-limited; verification systems
+that rely on human feedback, e.g., by involving domain experts or crowd workers [7,9,13,19,21,28,
+31, 46, 58, 72, 84, 90], are naturally prone to erroneous decisions – correct data might be labeled as
+incorrect or vice versa; similarly, systems in which labels are produced automatically, e.g., by an ML
+classifier, are also prone to erroneous labels. Such verification errors can then propagate, often in
+non-trivial ways, to downstream tasks [45,60,61]. In the context of queries issued by analysts (which
+we show to be affected non-trivially by the verification errors in Section 3.2), a notable shortcoming
+of existing systems is that the potential error propagation is not quantified and therefore not reported
+properly to the analysts, which can be particularly problematic in data-critical settings, e.g., medical
+applications.
+Example 1. Consider a data analyst deriving business insights from a database that contains both
+valuable data and errors. To focus on the correct portion of the data, the analyst applies an automated
+data verification tool that labels each tuple as correct or incorrect. However, because verification is
+imperfect, these labels may themselves be erroneous and can propagate to downstream query results.
+This raises several key questions: (i) To what extent can the analyst trust the query results? (ii) How
+likely is it that correct output tuples are missing from the results? (iii) What actions can be taken to
+improve the reliability of the results?
+Answering these questions is not straightforward.
+Consider questions (i)-(ii) and suppose the
+query aims to retrieve data about company founders. For some individual X, the database contains
+ten distinct tuples of the form “X founded company Yi,” where Y1, . . . , Y10 are different companies.
+The higher-level conclusion that X is a company founder is supported if at least one of these tuples
+is correct. If all ten tuples are labeled as correct, then all ten labels would have to be erroneous to
+invalidate this conclusion. In contrast, if all ten tuples are labeled as incorrect, a single mislabeled
+tuple would be sufficient to invalidate the opposite conclusion that X is not a company founder.
+Now consider question (iii) and assume that the analyst can hire a domain expert to refine the
+labels. Verifying the entire dataset is costly, so the analyst must decide which tuples the expert should
+check. Prioritizing tuples solely based on their individual error likelihood may be ineffective: e.g., if
+the tuple “X founded company Y1” is labeled as correct with (nearly) 100% certainty, then X is almost
+certainly a company founder, and refining the remaining nine labels is redundant regardless of their
+uncertainty.
+In this work, we present a generic framework that complements existing data verification tools
+by analyzing how uncertainty in the labels they produce affects downstream query results. First,
+we introduce a novel uncertainty measure, Maximal Error Score (MES), which assigns each output
+tuple a worst-case error score based on the uncertainty of the labels assigned to input tuples. This
+measure highlights where verification provides strong reliability guarantees for query outputs and
+2
+
+===== PAGE 3 =====
+Query Results + Provenance
+Database
+Query
+SQL
+Provenance
+University
+Acquired
+U. São Paulo
+BHealthy
+1
+2
+Query Evaluation
+∨𝑖∧𝑗𝑎𝑗
+𝑖
+Verification Tool
+DES: Database with (partial) correctness labels + error probs
+Label + Prob.
+Name
+Role
+Company
+Emil Lime
+Founder
+BHealthy
+𝑣= 1
+𝑒𝑟𝑟= 0.2
+Indicators Calculation
+3
+4
+FindImprovementSet
+NextProbability
+MESReduce
+Figure 1: The flow of our framework
+where outputs remain uncertain. Next, in settings where label error probabilities can be reduced at
+an additional cost, such as in Example 1, we propose a generic algorithm that leverages our uncertainty
+indicators to automatically guide external verifiers and optimize the tradeoff between query result
+reliability and verification cost.
+Example uses of the framework include estimating the reliability of query output, considering
+both tuples labeled as correct and as incorrect; determining whether a fast, low-cost data verification
+tool produces sufficiently reliable results or if a more accurate, costlier tool is needed; and selecting
+which tuples should be labeled by a high-quality verifier under a limited budget.
+1.1
+Framework Components and Flow
+Figure 1 illustrates the high-level flow of our framework. Novel components are enclosed in a high-
+lighted background, and step numbers are shown in circles.
+Step 1: A user-specified query is evaluated together with its provenance information, which
+abstractly captures how output tuples are derived and is used in subsequent steps.
+Step 2: An external verification tool is applied to produce a (possibly partial) correctness labeling
+of input tuples, along with an estimated probability for each label (shown in the Label+Prob. column
+in the figure). Section 2 details how these probabilities can be estimated. The resulting instance is
+referred to as a database with error estimation (DES). If the verifier is query-guided, it also receives the
+3
+
+===== PAGE 4 =====
+query results as input. Output tuples are presented to the analyst together with derived correctness
+labels.
+Step 3: The framework provides two novel indicators to support analyst decision making. Based
+on these, the analyst may retain only reliable, low-MES (i.e., low-uncertainty) output tuples, apply
+a different verifier, or use the risky tuple indicator, which identifies tuples whose further verification
+may increase overall uncertainty, to prioritize non-risky tuples for refinement.
+Step 4: Optionally, the analyst can invoke our MESReduce algorithm, which optimizes the
+verification quality-cost tradeoff by iteratively selecting input tuples for refinement, applying external
+verification tools, and gradually reducing uncertainty in the query results.
+1.2
+Uncertainty Indicators
+We now outline the key ideas behind our uncertainty indicators and how they differ from prior
+work, detailed in Section 3. Our output uncertainty metric, MES, adopts a worst-case perspective
+computing an upper bound on the probability that an output tuple is mislabeled across all possible
+worlds. This score provides a strong reliability guarantee: tuples with low MES are unlikely to be
+mislabeled regardless of the ground truth. Unlike prior work on uncertain databases, which estimates
+expected uncertainty and therefore requires a probability distribution over the ground truth (which
+is sometimes unavailable or hard to obtain), MES relies solely on the inherent uncertainty of the data
+verification process.
+We observe that reducing the error likelihood of input tuple labels does not always decrease output
+uncertainty, as reflected in its MES; in fact, it may even increase it. We call such input tuples risky,
+and identifying them is crucial for planning additional verification efforts.
+1.3
+Contributions Overview and Novelty
+Our work aims at assessing and improving the reliability of query results under uncertain data ver-
+ification. Unlike prior approaches that ignore verification errors or implicitly try to minimize them,
+we explicitly model how such errors propagate through queries and provide quantitative guarantees
+on result reliability. Our main contributions are as follows.
+Formal model of uncertain verification We present a formal model for uncertainty in data
+verification results. In contrast with prior work on uncertain, probabilistic, and possibilistic databases,
+our approach builds directly on uncertainty in the verification process rather than on an estimation
+of the ground truth data.
+Novel reliability indicators We propose two new metrics tailored to this setting: Maximal Error
+Score (MES) and risky tuples, which help users assess query-aware reliability and support multiple
+practical uses. Fundamentally, their formulation clarifies how verification errors propagate to query
+results.
+4
+
+===== PAGE 5 =====
+Efficient indicator computation We analyze the complexity of MES computation and provide
+efficient algorithms for computing our novel indicators.
+Uncertainty reduction algorithm Based on the concepts of MES and risky tuples, we develop a
+generic uncertainty reduction algorithm called MESReduce that builds on top of verification systems
+of the analyst’s choice.
+Prototype implementation and evaluation We implemented our techniques in a prototype sys-
+tem and evaluated them on both real and synthetic datasets. Section 6.3 presents multiple end-to-end
+case studies that illustrate how our framework integrates with prominent verification approaches and
+improves their effectiveness in practice.
+In the first case study, mirroring Example 1, an analyst
+initially applies a low-cost automated verifier to the entire dataset. Our framework then identifies
+which labels should be refined to maximize query result reliability. We demonstrate two refinement
+strategies: deciding how many crowd workers to allocate to selected tuples, and selecting tuples to be
+re-verified using a high-quality LLM. In both settings, our approach improves over initial verification
+results and achieves high output reliability at a substantially lower cost than exhaustive verification.
+Another case study shows how a lower-cost LLM can be used for initial verification with probability
+estimation, and how our framework guides targeted refinement via crowdsourcing to further improve
+reliability.
+Beyond these concrete use cases, we conduct an extensive experimental study to evaluate the
+robustness, scalability, and effectiveness of our framework across diverse scenarios. Because our goal
+is not to replace existing verification systems but to complement and guide their use, we compare
+our approach against alternative strategies for interacting with such tools rather than against the
+tools themselves. The results show that our methods consistently improve verification reliability and
+output quality under limited budgets, scale to large query results and complex provenance structures,
+and offer practical guidance for configuring the framework to effectively interact with real verification
+systems.
+Overall, our work provides the first formal framework for reasoning about and improving query
+reliability under uncertain data verification. It provides both theoretical contributions and practical
+applicability; we anticipate that the contributions will support analysts in improving the effectiveness
+and reliability of their analytical workflows under uncertainty. A short paper describing a demon-
+stration of our framework, along with a prototype GUI system for analysts, was published in [73].
+2
+Model
+In this section, we introduce a formal model for data verification, under which we will later analyze
+potential verification errors. We start by providing a formal generic definition of the possibly erroneous
+output of data verification.
+5
+
+===== PAGE 6 =====
+Table 1: Notation Summary
+Symbol
+Description
+Q
+An SPJU query
+D
+A relational database
+D
+A DES (Def. 1)
+ˆD
+Annotated DES (Def. 5)
+v(t)
+A correctness label given to an input tuple t
+err(t)
+An error probability of a label given to t
+vfull
+A possible world (Def. 2)
+vQ(o)
+The label of an output tuple o
+L(t)
+The variable annotating an input tuple t
+LQ(o)
+The provenance exp. of an output tuple o (Def. 6)
+P(D, vfull, D′)
+Labeling probability (Def. 3)
+Table 2: A Relational database Dex – the input to the data verification process, here including tuple
+annotations.
+Acquisitions
+Acquired
+Acquiring
+Date
+L
+BHealthy
+Fiffer
+04.03.2018
+a1
+NewHealth
+BHealthy
+02.04.2017
+a2
+NewHealth
+Optobest
+01.10.2020
+a3
+Optobest
+microBarg
+08.08.2019
+a4
+Roles
+Company
+Role
+Name
+L
+BHealthy
+Founder
+Emil Lime
+r1
+NewHealth
+Co-founder
+Yara Aray
+r2
+Optobest
+Co-founder
+Nala Alan
+r3
+BHealthy
+Co-founder
+Rima Amir
+r4
+Education
+Name
+University
+Year
+L
+Yara Aray
+U. Melbourne
+2017
+e1
+Emil Lime
+U. S˜ao Paulo
+2014
+e2
+Rima Amir
+U. S˜ao Paulo
+2018
+e3
+Nala Alan
+U. Cape Town
+2002
+e4
+Database with error estimation (DES) We view data verification as a probabilistic process in
+which correctness labels are given to tuples, and each label has some likelihood of an error (Step 2 in
+Fig. 1). Therefore, the output of such a process is called a database with error estimation (DES) and
+is defined as follows.
+Definition 1. A DES is a triplet D = ⟨D, v, err⟩where D is a relational database, v(t) is the
+correctness label given to a tuple t ∈D, and err(t) is the error probability of that label. Formally,
+v : D →{0, 1, ⊥} is a 3-valued labeling function representing the correctness labels assigned by the
+verification process to D’s tuples (where 0, 1 and ⊥stand for correct, incorrect and unknown, i.e.,
+not labeled, resp.), and err : D →[0, 0.5] ∪{⊥} assigns an error probability1 to each tuple t ∈D, such
+that (i) if v(t) ∈{0, 1} then err(t) is the probability that v(t) = ¬v∗(t) for the (unknown) ground truth
+labeling v∗: D →{0, 1}; and (ii) err(t) = ⊥iff v(t) = ⊥.
+Intuitively, the output of data verification is a partial correctness labeling, where each label may be
+erroneous and is associated with an estimated error probability. This definition is intentionally broad
+1We assume w.l.o.g. that the error probability of a label is up to 0.5; otherwise, one may negate the label to achieve
+this.
+6
+
+===== PAGE 7 =====
+Table 3: Uncertain labels produced by a verification tool for Dex. The variables on the header row are
+the tuple annotations from Table 2. The first row includes correctness labels for some of the tuples (⊥stands
+for unassigned labels); the second includes error probabilities for each label; and the third demonstrates a
+possible ground truth.
+a1
+a2
+a3
+a4
+r1
+r2
+r3
+r4
+e1
+e2
+e3
+e4
+vex :
+1
+0
+1
+0
+1
+⊥
+⊥
+⊥
+⊥
+1
+⊥
+⊥
+err:
+0.3
+0.3
+0.2
+0
+0.2
+⊥
+⊥
+⊥
+⊥
+0.4
+⊥
+⊥
+vfull:
+1
+0
+0
+0
+0
+0
+0
+0
+0
+1
+0
+0
+and makes no assumptions about the underlying data or verification method, making it applicable
+across a wide range of systems (see Section 7).
+Crucially, these probabilities apply to errors in the verification process itself, rather than in the
+input data being verified. This distinction is illustrated in the following example.
+Example 2 (DES). Table 2 presents a database Dex with three relations: Acquisitions, with in-
+formation about company acquisitions; Roles, with information about roles in companies; and Edu-
+cation, with information about university alumni. Column L includes a unique variable annotating
+each tuple (to be defined in Def. 5), and we will use these annotations to refer to specific tuples. This
+database is fed as input to a data verification system, resulting in a DES Dex = (Dex, vex, err) with
+vex and err specified in Table 3 (ignore, for now, the last row). For instance, we have vex(r1) = 1
+and err(r1) = 0.2, meaning that the tuple annotated by r1 is estimated to be correct by the verification
+system and that with probability 0.2 this label is wrong, i.e., r1 is incorrect. Note that this does not
+necessarily imply that r1 is more likely to be correct than incorrect: for example, if r1 was produced by
+a very noisy source that has a probability 0.1 of being correct, then we would observe a true “correct”
+label with probability 0.1 · 0.8 = 0.08, whereas having an erroneous “correct” label would have a higher
+probability of 0.9 · 0.2 = 0.18.
+As another example, vex(a2) = 0 and err(a2) = 0.3, meaning that the corresponding tuple is
+estimated to be incorrect, with a likelihood of 0.3 of having an erroneous label; vex(e4) = ⊥means
+that this tuple was not labeled by the verification system and we have no information regarding its
+correctness.
+Cell-level uncertainty Throughout the paper, we assume tuple-level uncertainty. A practical way
+of applying our work to cell-level uncertainty is to represent each tuple as triplets of Tuple-ID,
+Attribute, and Value (assuming a primary key exists). In the new database, tuple-level labels directly
+reflect cell correctness in the original database.
+In addition, every SPJU query over the original
+database can then be reconstructed through joins to operate over the new one.
+7
+
+===== PAGE 8 =====
+Example 3. The Acquisitions relation of Table 2 would be transformed to a relation AcquisitionsC
+with three attributes, ID, Attribute, and Value. In particular, the first tuple would be transformed to
+three tuples: (1, Acquired, BHealthy), (1, Acquiring, Fiffer), (1, Date, 04.03.2018).
+Now, consider the following query over the original database:
+SELECT DISTINCT r.Name, a.Acquiring
+FROM Acquisitions AS a, Roles AS r
+WHERE a.Acquired = r.Company
+It will be transformed to the following query:
+SELECT DISTINCT r2.Value, a2.Value
+FROM AcquisitionsC as a1,
+AcquisitionsC as a2,
+RolesC as r1,
+RolesC as r2,
+WHERE a1.ID = a2.ID AND
+r1.ID = r2.ID AND
+a1.Attribute = ’Acquired’ AND
+a2.Attribute = ’Acquiring’ AND
+r1.Attribute = ’Company’ AND
+r2.Attribute = ’Name’ AND
+a1.Value = r1.Value
+Obtaining error probabilities We now outline practical methods for obtaining error probabilities
+based on the verifiers. Some systems natively provide error estimates (e.g., [46,84]). For verifications
+involving human experts or crowdsourcing, various established models can be used to estimate worker
+or label accuracy (e.g., [23,44,48]). For anomaly detection models, the predicted anomaly scores can
+be translated into estimated error probabilities, as demonstrated in Section 6.3. Similarly, machine
+learning classifiers often output probabilities for each class, and the one assigned to the inverse of the
+predicted label can serve as an error estimate. For LLMs, there are various techniques of estimation,
+and we demonstrate the use of one such approach in Section 6.3 (e.g., [43,47,50,79,87,88]). Lastly,
+when relying on external data sources, published precision metrics may be used as proxies for error
+probabilities (e.g., as in [57]).
+Note that even if we have no knowledge of the uncertainty of the initial verification results, our
+uncertainty reduction algorithm in Section 5 can still be valuable; see Scenario WCS in Section 6.2.
+Possible world semantics To capture the possible ground truth for a given DES, we use possible
+world semantics, following some of the previous work on uncertain databases [28, 38, 49, 81, 81]. A
+possible world is a subset of the input tuples that are correct in this world; the set of all possible
+worlds is the set of every such subset. Equivalently, it is a full labeling of the data (without ⊥), where
+a tuple is assigned as 1 iff it is correct in the world. Formally,
+8
+
+===== PAGE 9 =====
+Definition 2 (Possible worlds and label errors). Let D = ⟨D, v, err⟩be a DES, a possible world for D
+is a Boolean labeling function vfull : D →{0, 1} where a tuple t ∈D is correct in vfull iff vfull(t) = 1.
+A label v(t) of the DES is then erroneous in vfull iff v(t) = ¬vfull(t).
+Example 4 (Possible world). Continuing Example 2, consider the possible world vfull depicted in
+Table 3. With respect to this world, the label of r1 is erroneous (the tuple is labeled by the DES as
+correct but is actually incorrect), and for tuple a2 (that is labeled by the DES as incorrect) and r2
+(that is not labeled), the labels are not erroneous.
+We can use the error probabilities in the DES, to compute the probability of a given labeling in
+a possible world:
+Definition 3 (Labeling probability). Let D = ⟨D, v, err⟩be a DES, let vfull be a possible world for
+D and let D′ ⊆D be a nonempty subset of the database. Assuming that error probabilities in err
+are independent, one can compute the probability of obtaining v from vfull given err and restricting
+attention to D′ as
+P
+ D, vfull, D′
+=
+Y
+t∈Tright
+(1 −err (t)) ·
+Y
+t∈Terr
+err (t)
+(1)
+where we use, for short, Tright = {t ∈D′ | v(t) = vfull(t)} and Terr = {t ∈D′ | v(t) = ¬vfull(t)}.
+Focusing on a subset D′ of the database tuples will be useful later in Section 3.1. Note that both
+Tright and Terr can only contain tuples for which the label is known, i.e. v(t)̸ = ⊥for every tuple t in
+these subsets. Tuples with unknown labels have a probability 1 of having any label, and therefore do
+not affect the computation.
+Example 5. Continuing Example 4 and taking D′ = Dex, we have Tright = {a1, a2, a4, e2} and
+Terr = {a3, r1}. Therefore, P(Dex, vfull, D′) = (1 −err(a1)) · (1 −err(a2)) · (1 −err(a4)) · (1 −err(e2)) ·
+err(a3) · err(r1) = 0.01176.
+Queries over DES We now study how labeling errors propagate to query results, focusing on Select-
+Project-Join-Union (SPJU) queries [1]. See Section 3.1.3 for a discussion about other types of queries.
+The next definition shows how queries are applied over a DES, i.e., how the 3-valued correctness labels
+are defined for query tuples.
+Definition 4 (output correctness labeling). Let D = ⟨D, v, err⟩be a DES and Q an SPJU query over
+D. For l ∈{0, 1, ⊥} denote Dl = {t ∈D | v(t) = l}, i.e., the subset of D labeled as l by v. An output
+correctness labeling is a 3-valued function vQ : Q(D) →{0, 1, ⊥} such that for every o ∈Q(D) we
+have vQ(o) = 1 if o ∈Q(D1), vQ(o) = 0 if o̸ ∈Q(D1 ∪D⊥), and vQ(o) = ⊥otherwise.
+Intuitively, an output tuple o is correct iff it can be derived from correct DES tuples, and incorrect
+iff it is not derived even if all the unlabeled DES tuples are correct. This definition is applicable to
+SPJU queries because of their monotonicity.
+9
+
+===== PAGE 10 =====
+SELECT DISTINCT a.Acquired, e.University
+FROM Acquisitions AS a, Roles AS r, Education AS e
+WHERE a.Acquired = r.Company AND
+r.Name = e.Name AND
+r.Role ILIKE ’%found%’ AND
+e.Year <= DATE_PART(’YEAR’, a.Date)
+Figure 2: Example query Qex
+Example 6 (Querying the DES). Continuing Example 5, define Qex to be the SPJU query in Fig. 2,
+which selects acquired companies along with the universities from which the founding members have
+graduated before the acquisition. Table 4 presents the results of Qex (ignore the LQex column for
+now). The first output tuple can be derived from the input tuples a1, r1, and e2, corresponding to the
+acquisition of BHealthy, having Emil Lime as its founder and as a graduate of U. S˜ao Paulo. Since
+these tuples are considered correct according to vex, so is this query result. The third output tuple
+is considered incorrect, since its derivation requires the acquisition of Optobest (tuple a4), which is
+considered incorrect. The second output tuple is considered unknown since its correctness depends on
+input tuples r2 and e1, which are assigned to ⊥.
+2.1
+Provenance
+Our analysis requires computations over different possible worlds. For that, we will build on the
+notion of Boolean provenance, which allows capturing how query output tuples are derived from
+input tuples independently of a specific ground truth. Indeed, Boolean provenance has been used for
+this purpose in many contexts [18,39,41] and in particular in data cleaning [9,28] and probabilistic
+and uncertain databases [81]. In this work, provenance is useful in the definitions of our uncertainty
+metrics and in our uncertainty reduction algorithm. As we are focusing on SPJU queries, we will use
+the PosK3 semiring, extending the PosBool semiring of [39] with Kleene’s 3-valued logic K3 rather
+than Boolean logic.2 This semiring allows deriving a logical expression for each output tuple, such
+that: (i) each variable corresponds to a related input tuple; (ii) the value of each variable corresponds
+to its correctness label (or its absence); and (iii) the computed value of an expression reflects the
+derived correctness of the corresponding output tuple, according to Def. 4.
+For SPJU queries, provenance can be computed in PTIME as monotone k-DNF formulae [41],
+i.e., disjunctions of conjunctions (terms) containing at most k variables each, without negation. For
+clarity, we assume each term has exactly k variables; but our results apply to the general case.
+Definition 5 (An annotated DES). An annotated DES is a DES in which every tuple is equipped
+with a unique variable. Formally, it is a triplet ˆD = ⟨D, X, L⟩, where D = ⟨D, v, err⟩is a DES, X is
+a set of |D| ternary variables, and L is a bijection L : D →X.
+2Kleene’s K3 logic adds to the usual 0, 1 an unknown value. Truth tables are then extended such that 0 ∧⊥= 0,
+⊥∧1 = ⊥, etc.
+10
+
+===== PAGE 11 =====
+Table 4: The results of Qex over Dex
+Acquired
+University
+LQex
+BHealthy
+U. S˜ao Paulo
+LQex(o1) = (a1 ∧r1 ∧e2) ∨(a1 ∧r4 ∧e3)
+NewHealth
+U. Melbourne
+LQex(o2) = (a2 ∧r2 ∧e1) ∨(a3 ∧r2 ∧e1)
+Optobest
+U. Cape Town
+LQex(o3) = a4 ∧r3 ∧e4
+See, for example, column L in Table 2. The next definition shows how SPJU queries are applied
+over an annotated DES:
+Definition 6. Let ˆD be an annotated DES and Q be an SPJU query. The result of Q over ˆD is the
+result over D where every output tuple is equipped with a provenance expression. Formally, it is a
+triplet Q( ˆD) = ⟨Q(D), Φ, LQ⟩, where Q(D) is the result of Q over D, Φ ⊆PosK3[X] is a set of up to
+|Q(D)| formulae over X, and LQ is a function that labels each output tuple in Q(D) by a formula in Φ
+satisfying the following important property: for every output tuple o ∈Q(D), vQ(o) = v(LQ(o)), where
+vQ is the output correctness labeling of Def. 4, and v(LQ(o)) is the value of the K3 expression LQ(o)
+after substituting every variable x in it by the correctness of its corresponding tuple v(L−1(x)).
+The key property described above reflects a general feature of provenance semirings – namely, their
+commutation with semiring homomorphisms [39]. Specifically, a 3-valued assignment to variables acts
+as a semiring homomorphism from expressions in PosK3[X] to truth values in K3. Intuitively, one
+can either (1) assign correctness labels to input tuples and then compute the query result using
+provenance to derive output labels, or (2) evaluate the query over provenance annotations to get
+abstract expressions and assign labels afterward. The second approach avoids re-evaluating the query
+when labels change, requiring only re-assignment of truth values.
+Example 7. Continuing Example 6, Table 4 contains provenance expressions in 3-DNF form, in the
+LQex column. For convenience, we denote the output tuples by o1, o2, and o3. Notice that applying vex
+on the provenance expressions indeed yields the same labeling of vQex
+ex , as expected: vex(LQex(o1)) =
+(1 ∧1 ∧1) ∨(1 ∧⊥∧⊥) = 1, vex(LQex(o2)) = (0 ∧⊥∧⊥) ∨(1 ∧⊥∧⊥) = ⊥, and vex(LQex(o3)) =
+0 ∧⊥∧⊥= 0.
+3
+Uncertainty Indicators
+In this section, we present and analyze our novel uncertainty indicators, starting with the uncertainty
+metric, Maximal Error Score (MES). These indicators can provide valuable insights to analysts and
+may also guide subsequent data verification (as we do in Section 5).
+3.1
+Maximal Error Score (MES) Metric
+Uncertainty can propagate from input data to query results, as reflected in our running example: for
+instance, in Table 3, the labeling vex marks the first output tuple o1 in Table 4 as correct, while it is
+11
+
+===== PAGE 12 =====
+incorrect according to the ground truth labeling vfull. This error is caused by an erroneous label on
+the input tuple r1. While the uncertainty of the input tuples is generally easily obtainable, at least in
+an approximate form (Section 2), the challenge is in quantifying the uncertainty of the query output.
+We start by focusing on a single output tuple, and in Section 3.1.2 we generalize to multiple tuples
+or full query results.
+3.1.1
+MES for a single output tuple
+To capture the uncertainty in the label of a query output tuple o, we take a worst-case perspective:
+among all the possible worlds in which the label of o is erroneous, we identify the one where the
+observed input labels are most likely. The MES is defined as the likelihood of the observed input
+labels in this worst-case world. This provides an upper bound on how likely it is that the label of o
+is wrong – across all worlds where an error in o occurs.
+A low MES value provides a strong guarantee that the correctness label of an output tuple o is
+reliable, because the observed verification labels are improbable in every possible world in which o’s
+label is erroneous. Conversely, a high MES indicates that there exists a possible world where the
+observed labels are likely, yet the label of o is wrong.
+Definition 7 (Maximal Error Score (MES)). Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU
+query, and o ∈Q(D) be an output tuple with a known correctness label. The Maximal Error Score
+(MES) of o is the maximal labeling probability over all the possible worlds under which o is labeled
+erroneously. Formally,
+MES
+
+ˆD, Q, o
+
+=
+max
+vfull∈Inv( ˆD,Q,o)
+P
+
+D, vfull, Rel
+
+ˆD, o
+
+(2)
+where Inv( ˆD, Q, o) is a set of possible worlds defined by
+Inv
+
+ˆD, Q, o
+
+=
+
+vfull : D →{0, 1}
+ vfull(LQ(o)) = ¬vQ(o)
+	
+(3)
+P(D, vfull, Rel( ˆD, o)) is the labeling probability defined in Eq. 1, and Rel( ˆD, o) is the subset of D with
+the input tuples that participate in the derivation of o, defined by
+Rel
+
+ˆD, o
+
+=
+
+t ∈D
+ L(t) ∈Vars
+ LQ(o)
+	
+(4)
+where Vars(φ) is the set of variables in φ. We refer to possible worlds that achieve the maximum in
+Eq. 2 as worst-case possible worlds.
+Example 8. Continuing Example 7, we will illustrate MES computation for o1 with respect to vex in
+Table 3. Note that among the annotations in o1’s provenance, only a1, r1 and e2 have known labels, and
+that the derived correctness label of o1 is 1; therefore, Inv( ˆD, Q, o1) consists of all the possible worlds
+in which o1 is incorrect. For instance, with the possible world vfull from Table 3, the labeling probability
+restricted to Rel( ˆD, o1)) is (1 −err(a1)) · err(r1) · (1 −err(e2)) = 0.7 · 0.2 · 0.6 = 0.084. For a possible
+12
+
+===== PAGE 13 =====
+world v′
+full for which vex errs only for e2, the labeling probability is (1−err(a1))·(1−err(r1))·err(e2) =
+0.7 · 0.8 · 0.4 = 0.224. It can be shown that v′
+full is the worst-case possible world for o1 and vex, i.e.,
+that it achieves the maximal probability compared with any possible world in Inv( ˆD, Q, o1). Hence,
+MES( ˆD, Q, o1) = 0.224.
+As another example, the MES of output tuple o3 with respect to vex is 0: according to Table 3, the
+probability of an error in the label of a4 is 0. Hence, in every possible world where a4 is correct, the
+probability of the observed labeling vex is 0. However, the derived label of o3 as incorrect can only be
+erroneous if a4 is correct. In this case, a MES score of 0 corresponds to the intuition that there is a
+zero probability of an error in the label of o3, regardless of the ground truth.
+Notice that, as opposed to previous probabilistic or possibilistic approaches to uncertain databases,
+computing the MES does not require prior knowledge (e.g., correctness probabilities) of input tuples,
+domain knowledge that may be unavailable or unaffordable. In addition, it obtains the worst-case
+perspective, which results in a strong guarantee of reliability for analysts.
+Example 9. Recall from Example 1 that even after applying a verifier (even an expensive, high-
+quality one such as an LLM or a human expert), an analyst still faces fundamental questions about
+the reliability of query results and the risk of missing correct output tuples.
+The MES metric addresses these concerns by assigning each output tuple a worst-case uncertainty
+score. Output tuples with low MES are highly reliable, providing strong guarantees about whether they
+are correct query results. These scores also offer practical guidance to analysts: for instance, they
+can highlight the most uncertain output tuples for closer inspection or allow the analyst to retain only
+sufficiently reliable outputs for downstream analysis (as demonstrated in [73]). Importantly, MES can
+be reported independently of the underlying verification mechanism and thus can be used on top of
+existing verification systems, without requiring adoption of the full framework shown in Figure 1.
+How to further improve result reliability under a limited verification budget is addressed in Sec-
+tions 3.2 and 5, which build on the MES metric. Section 6.3 presents end-to-end case studies that
+illustrate these ideas in practice.
+In some cases, e.g., when outputting it in the GUI of a system, it may be convenient to work with
+the averaged value
+MES
+
+ˆD, Q, o
+
+= MES
+
+ˆD, Q, o
+
+−1
+n
+(5)
+where n equals the number of factors in the product, similar to the perplexity measure. In addition,
+it may also be useful to present the log of the MES values. See also Section 5.1.1.
+3.1.2
+MES for multiple tuples
+Def. 7 computes an uncertainty score for each query result. However, in some scenarios – such as the
+one in Section 5 – a single aggregated uncertainty score for the entire query output or a subset of its
+tuples may be desired. We propose, as a natural extension to Def. 7 that preserves the worst-case
+13
+
+===== PAGE 14 =====
+perspective of MES as an uncertainty bound, to compute the MES of multiple output tuples as the
+maximal MES over these tuples: given an annotated database ˆD, a query Q and a set of output
+tuples O ⊆Q(D), we define,
+MES
+
+ˆD, Q, O
+
+= max
+o∈O MES
+
+ˆD, Q, o
+
+(6)
+Indeed, if the maximal MES of tuples in O is low, then the uncertainty of every output tuple o ∈O
+is correspondingly low, and we have a guarantee of reliability for every examined output tuple. On
+the contrary, if the maximal value is high, then there exists a highly uncertain tuple.
+We show
+this aggregation to be useful when we consider lowering the uncertainty in Section 5, and when we
+examine the empirical performance of such algorithms in Section 6. Other aggregations are possible,
+see Section 8.
+3.1.3
+Generalizing beyond SPJU queries
+Our depiction of the formal framework can guide the generalization of the MES metric to additional
+query types. As an example, we outline the necessary steps for adapting the MES metric to aggregate
+queries. First, a suitable provenance system should be adopted for aggregate queries, e.g. [4]; in
+particular, it is used for identifying related input tuples that participate in the derivation of the
+output tuple of interest (Eq. 4). Then, the set Inv( ˆD, Q, o) (Eq. 3) should be redefined, e.g., to one
+where the true aggregation result sufficiently differs from the result computed over tuples labeled as
+correct by the verifier.
+For more complex downstream tasks (e.g., machine learning), SPJU queries can be used to identify
+and extract relevant input data (e.g., features or training instances). The MES metric can be applied
+to assess and filter out uncertain outputs of such queries, thereby improving the reliability of the
+downstream input. Further optimization of verification that accounts for the specific downstream
+task is a direction for future work; see Section 8.
+3.2
+Risky Tuples
+A counterintuitive phenomenon when adopting a worst-case perspective of verification is that lowering
+the error probability of an input label can actually increase the uncertainty of an output tuple. We
+call such input tuples risky tuples. We start with an example illustrating this phenomenon, then we
+formally define risky tuples, and lastly, we give a lemma of properties that is used in Section 4.3 for
+computationally identifying such tuples.
+Example 10. Continuing Example 8, define err′ to be identical to err in Table 3 except that err′(a1) =
+0.1 < err(a1). Denote by ˆ
+D′ the corresponding annotated DES. Both D and D′ represent the same
+verification result, but in D′ we are more confident in the label of a1. Surprisingly, the MES of o1
+has increased from 0.224 in ˆD to 0.288 in ˆ
+D′, i.e. the worst-case uncertainty has increased. Even
+more surprisingly, the other variables in the provenance of o1 all exhibit this property: reducing err(r1)
+14
+
+===== PAGE 15 =====
+to 0.1 while keeping the other error probabilities increases the MES value to 0.252, and reducing err(e2)
+to 0.01 increases the MES value to 0.237.
+When we reduce the error likelihood of a label for a risky tuple, we increase the likelihood of
+the labeling in a possible world; if this is, or becomes, the worst-case possible world, the MES will
+increase accordingly. Formally,
+Definition 8 (Risky input tuples). Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query,
+and o ∈Q(D) be an output tuple with a known correctness label (vQ(o)̸ = ⊥). Let t0 be an input tuple
+with a positive error probability err(t0). A p ∈[0, err(t0)) is called an unsafe error probability for t0 if
+reducing the uncertainty to p results in a higher MES value for o, i.e. MES( ˆ
+D′, Q, o) > MES( ˆD, Q, o),
+where ˆ
+D′ = ⟨D′, X, L⟩and D′ = ⟨D, v, err′⟩with err′(t0) = p and err′(t) = err(t) for every other
+tuple t. t0 is called a risky input tuple if it has an unsafe error probability. If every probability
+p ∈[0, err(t0)) is unsafe, it is called a reliability-impairing input tuple. If there is no unsafe error
+probability for it, it is called a safe input tuple.
+Besides the theoretical interest in the phenomenon, the indication of risky input tuples can practi-
+cally help the data analysts determine how to invest further verification efforts, and can be leveraged
+by automatic verification algorithms, e.g., as in Section 5.
+Example 11. Continuing the analyst scenario from Example 9, suppose the analyst identifies several
+query output tuples that are critical for her task but have high MES, indicating high uncertainty. The
+analyst is willing to invest additional effort to improve reliability, for example, by sending some of the
+input tuples to a domain expert or an LLM for re-verification. The risky tuples indicator intuitively
+means that the choice of tuples to re-verify is crucial, by identifying input tuples whose refinement
+could increase overall output uncertainty. By highlighting such tuples, the indicator helps the analyst
+focus verification efforts on non-risky inputs that are more likely to improve reliability. In [73], we
+demonstrate an interactive graphical interface that enables analysts to inspect risky tuples and make
+informed refinement decisions.
+Note that Def. 8 decreases only a single probability. When multiple probabilities are decreased
+simultaneously, the MES value may decrease even if risky input tuples are involved. A trivial example
+is the decrease of all the error probabilities to zero, in which case a zero MES value is guaranteed.
+We use this observation in Section 5.
+The following example shows that a risky input tuple may not be a reliability-impairing tuple:
+Example 12. Continuing Example 10, 0.01 is an unsafe error probability for e2, so e2 is a risky input
+tuple. However, 0.1 is not an unsafe error probability: it reduces the MES value to 0.216. Therefore,
+e2 is risky but not reliability-impairing.
+The following lemma presents two basic properties of risky input tuples, which will later be useful
+for detecting them.
+15
+
+===== PAGE 16 =====
+Company
+University
+LQex2
+o1
+BHealthy
+U. S˜ao Paulo
+(r1 ∧e2) ∨(r4 ∧e3)
+o2
+NewHealth
+U. Melbourne
+r2 ∧e1
+o3
+Optobest
+U. Cape Town
+r3 ∧e4
+Table 5: The results of Qex2 over ˆDex
+Lemma 1. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple with a known correctness label. Let t0 be a risky input tuple. Then,
+1. If q is an unsafe error probability for t0, then every q′ ∈[0, q) is also unsafe for t0.
+2. There must exist a positive unsafe error probability for t0.
+Proof.
+Part 1. Define a function f : [0, err(t0)] →[0, 1] that maps every probability p to the MES value
+MES( ˆ
+Dp, Q, o), where
+ˆ
+Dp = ⟨Dp, X, L⟩and Dp = ⟨D, v, errp⟩with errp(t0) = p and errp(t) =
+err(t) for any other t.
+For every vfull ∈Inv( ˆD, Q, o) and every p ∈[0, err(t0)), the probability
+P(Dp, vfull, Rel( ˆD, o)) is a linear function of p. Therefore, f is a piecewise linear function.
+By definition, f(q) > f(err(t0)), so there must exist some q0 ∈[q, err(t0)] that lies in an interval
+I ⊂[0, err(t0)] in which the slope of f is negative. All slopes to the left of I must also be negative, so
+for every q′ ∈[0, q), f(q′) > f(err(t0)) as desired.
+Part 2. Assume by contradiction that 0 is the only unsafe probability for t0. Using the same f
+as in the previous part, f(0) > f(err(t0)). Since f is piecewise linear, it’s continuous, so for every
+small ε > 0, f(ε) > f(err(t0)), and there must exist a positive unsafe error probability for t0 in
+contradiction.
+As seen in Example 10, all input tuples participating in the derivation of an output tuple o might
+be risky. The following example shows that this phenomenon may happen regardless of the correctness
+labels of o or the input tuples:
+Example 13. Returning to the annotated DES ˆD presented in Table 2, define Qex2 to be the following
+query, which selects companies along with universities from which the members have graduated:
+SELECT DISTINCT r.Company, e.University
+FROM Roles AS r, Education AS e
+WHERE r.Name = e.Name
+Table 5 presents the results of Qex2 over ˆDex. Define an assignment v1 by v1(r1) = v1(e3) = 1,
+v1(r4) = v1(e2) = 0, and v1(x) = ⊥for any other x, and define the error probabilities function err by
+err(r1) = err(r4) = err(e2) = err(e3) = 0.3, and err(x) = ⊥for any other x. Notice that o1 is labeled
+as incorrect. It can be verified that its MES value is 0.1029 and that for every labeled input tuple –
+16
+
+===== PAGE 17 =====
+Algorithm 1 Calculating MES of an incorrect output tuple
+Input: ˆD = ⟨D, X, L⟩, SPJU query Q, an output tuple o ∈Q(D) labeled as incorrect (i.e. vQ(o) = 0).
+Output: MES( ˆD, Q, o)
+1: maxProb ←0
+2: Calculate the provenance LQ(o) ←Wm
+i=1(Vk
+j=1 ai
+j)
+3: for i ←1 to m do
+4:
+For every t ∈D, set vi
+full(t) to 1 if L(t) ∈
+
+ai
+j
+	
+j, v(L(t)) if v(L(t))̸ = ⊥or 1 otherwise.
+5:
+p ←P(D, vi
+full, Rel( ˆD, o))
+6:
+if p > maxProb then maxProb ←p
+7: return maxProb
+both the tuples labeled as correct and the tuples labeled as incorrect – decreasing the error probability
+to 0.2 increases the MES value.
+Now define an assignment v2 by v2(r1) = v2(e2) = v2(e3) = 1, v2(r4) = 0, and v2(x) = ⊥for any
+other x, and define err as above. Now, o1 is labeled as correct. It can be verified that also in this
+case its MES value is 0.1029, and for every labeled input tuple, decreasing the error probability to 0.2
+increases the MES value.
+4
+Computing the Indicators
+In the previous section, we defined the MES metric and risky tuples; we now analyze their computation
+(Step 3 in Fig. 1). Clearly, computing MES naively is generally infeasible due to the exponential
+growth in possible worlds with respect to the number of labels. We show that, interestingly, the
+complexity of MES computation depends on the correctness label of the output tuple. If labeled as
+incorrect, the problem is tractable, and we provide a PTIME algorithm; if labeled as correct, the
+problem becomes intractable. We identify a tractable query class and reduce the general case to an
+integer linear program (ILP). Our solutions have been implemented and experimentally validated as
+practical in Section 6.
+4.1
+Computing MES for Incorrect Output Tuples
+In the case of output tuples labeled as incorrect, it suffices to iterate over a small subset of Inv( ˆD, Q, o)
+that provably contains a worst-case possible world. It is proved formally in the next proposition, whose
+proof is by an analysis of Alg. 1.
+Proposition 1. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be
+an output tuple labeled as incorrect (i.e. vQ(o) = 0). The value MES( ˆD, Q, o) can be calculated in
+polynomial time in | ˆD|.
+Proof. We will prove the proposition by presenting a PTIME algorithm that calculates the MES
+value of o, depicted in Alg. 1. The algorithm calculates the provenance expression of o in k-DNF
+17
+
+===== PAGE 18 =====
+form (line 2), and iteratively examines m possible worlds, v1
+full, . . . , vm
+full, where m is the number of
+terms in the provenance expression (line 4). Intuitively, each vi
+full is the possible world in which the
+i-th term in LQ(o) is satisfied, and the rest of the variables are labeled as in v unless they have
+an unknown label, in which case they are labeled as 1. For each possible world, the corresponding
+labeling probability is calculated (line 5), and the maximal probability among these is returned.
+Each step of Alg. 1 can be computed in PTIME in the data size, in particular since, as stated
+above, k-DNF provenance can be computed for SPJU query in PTIME [41]. For each i, it holds
+that vi
+full ∈Inv( ˆD, Q, o), since by construction term i is satisfied, whereas we assumed vQ(o) = 0.
+Lemma 2 below proves that iterating over this small subset of possible worlds is indeed sufficient for
+finding a worst-case world.
+Lemma 2. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an output
+tuple labeled as incorrect (i.e. vQ(o) = 0). Denote LQ(o) = Wm
+i=1(Vk
+j=1 ai
+j) the k-DNF provenance
+expression of o, and for every i ∈{1, . . . , m} denote vi
+full(t) as in Alg. 1. Denote A =
+
+v1
+full, . . . , vm
+full
+	
+.
+Then,
+MES
+
+ˆD, Q, o
+
+= max
+vfull∈A P
+
+D, vfull, Rel
+
+ˆD, o
+
+(7)
+Intuitively, we construct each possible world such that it resembles the labeling v as much as
+possible with respect to tuples with known labels, with a minimal change to make one term evaluate
+to 1, which is necessary to make o correct in contrast with its label in vQ. Any other possible world
+can only differ from v in more labels, and hence the probability of v’s labels can only be lower.
+Proof. First, notice that A ⊆Inv( ˆD, Q, o), so the inequality l.h.s ≥r.h.s is immediate. We will prove
+the opposite inequality by showing that for every vfull ∈Inv( ˆD, Q, o) there exists some vi0
+full ∈A such
+that P(D, vfull, Rel( ˆD, o)) ≤P(D, vi0
+full, Rel( ˆD, o)). Let vfull ∈Inv( ˆD, Q, o), then it must satisfy some
+term i0 in the provenance expression LQ(o). We will show that vi0
+full satisfies the desired inequality.
+If P(D, vfull, Rel( ˆD, o)) = 0, the inequality is trivial.
+Assume it’s positive.
+Denote by T the
+set of related input tuples that are labeled: T =
+
+t ∈D
+ v(t)̸ = ⊥∧L(t) ∈Vars(LQ(o))
+	
+. We will
+decompose T into two disjoint sets T1, T2, where T1 contains the tuples whose annotating variables
+are in the i0-th term in the provenance expression of o, and T2 contains the rest of the tuples:
+T1 =
+
+t ∈T
+ L(t) ∈
+n
+ai0
+j
+o
+j
+
+T2 = T \ T1
+Also, for every tuple t denote for convenience
+p(vfull, t) =
+
+
+
+1 −err(t)
+v(t) = vfull(t)
+err(t)
+v(t) = ¬vfull(t)
+18
+
+===== PAGE 19 =====
+Algorithm 2 Calculating MES of a correct output tuple
+Input: ˆD = ⟨D, X, L⟩, Q, an output tuple o ∈Q(D) labeled as correct.
+Output: MES( ˆD, Q, o)
+1: if ExistsZeroError1Certificate( ˆD, Q, o) then return 0
+2: Calculate LQ(o) ←Wm
+i=1(Vk
+j=1 ai
+j) and denote Vars(LQ(o)) = {ai}n
+i=1
+3: Denote pi ←err(L−1(ai)) for every ai with v(L−1(ai))̸ = ⊥
+4: Denote I ←
+
+i ∈[n]
+ v(L−1(ai))̸ = ⊥
+	
+, J ←{i ∈I | pi > 0}
+5: Calculate β ←P
+i∈J(v(ai) · ln(pi) + (1 −v(ai)) · ln(1 −pi))
+6: Define a vector⃗c = (c1, . . . , cn)T by ci ←ln(1 −pi) −ln(pi) for i ∈J ∧v(ai) = 1, ci ←
+ln(pi) −ln(1 −pi) for i ∈J ∧v(ai) = 0 and ci ←0 otherwise.
+7: Solve the following integer linear program over⃗a = (a1, . . . , an)T and denote by ξ its objective:
+8:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+maximize cT · a
+subject to
+Xk
+j=1 ai
+j ≤k −1,
+i = 1, . . . , m
+ai ∈{0,1},
+i ∈J
+ai =
+
+
+
+1
+v(ai) = 1
+0
+v(ai) = 0
+,
+i ∈I \ J
+ai = 0,
+i /∈I
+(8)
+9: return exp(ξ + β)
+Now, we can express the labeling probabilities using p:
+P
+
+D, vfull, Rel
+
+ˆD, o
+
+=
+Y
+t∈T1
+p(vfull, t) ·
+Y
+t∈T2
+p(vfull, t)
+P
+
+D, vi0
+full, Rel
+
+ˆD, o
+
+=
+Y
+t∈T1
+p(vi0
+full, t) ·
+Y
+t∈T2
+(1 −err(t))
+Since err(t) ∈[0, 0.5] for every t, we get that P(D, vfull, Rel( ˆD, o)) ≤P(D, vi0
+full, Rel( ˆD, o)) as
+desired.
+4.2
+Computing MES for Correct Output Tuples
+As noted earlier, when the output tuple is labeled as correct, MES computation is intractable:
+Proposition 2. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple labeled as correct (i.e. vQ(o) = 1). If P̸ = NP, MES( ˆD, Q, o) cannot be calculated in
+polynomial time in LQ(o). This holds even if we assume that all the error probabilities are equal and
+that all the relevant input tuples have known correctness.
+19
+
+===== PAGE 20 =====
+Proof. Assume by contradiction that there is a polynomial-time algorithm for calculating the MES
+value in the described setting. We will show a polynomial algorithm for the independent set problem,
+which is a well-known NP-hard problem [32]:
+INDSET =
+
+(G, l)
+
+G contains an independent
+set of size l or more
+
+Let (G, i) be an input for the problem, and denote G = (V, E) where V = {v1, . . . , vn} and
+E = {e1, . . . , em}.
+We will first construct a relational database D that consists of a single relation edges that contains
+all the tuples (v, v1, . . . , vn, 1) ∈[n]n × {1} where for every k, the element vk equals k if {vi, vk} ∈E
+and v < k, and 0 otherwise.
+Then we will define an SPJ query Q, where x is the last element:
+SELECT DISTINCT R.x FROM edges as R, edges as S
+WHERE R.v1 = S.v
+OR R.v2 = S.v
+OR ...
+OR R.vn = S.v
+Denote by ˆD an annotation of D. It’s easy to see that Q( ˆD) contains a single output tuple o
+whose provenance expression is the 2-DNF formula φ = W
+{u,v}∈E(u ∧v), and the MES value is in the
+form of 0.3k · 0.72m−k.
+The provenance of the single output tuple in Q( ˆD) is (v1 ∧v2) ∨(v1 ∧v3) ∨(v2 ∧v4) ∨(v3 ∧v5).
+Define a DES ˜D = ( ˆD, v, err) with v(L(t)) = 1 and err(t) = 0.3 for all t ∈D. By our assumption,
+we can calculate MES( ˜D, Q, o) in polynomial time. Then, we can extract k from the MES value in
+polynomial time, and we answer that (G, l) ∈INDSET iff k ≥l.
+It’s easy to see that the reduction takes polynomial time. We will prove that (G, l) ∈INDSET
+iff k ≥l. First, notice that there is a natural correspondence between independent sets for G and
+labeling functions V : D →{0, 1} for which o /∈Q(DV ), because the corresponding assignments of
+such labelings don’t satisfy φ. In addition, the size of an independent set equals k from the above
+form of the MES value.
+Now, if G contains an independent set of size l or more, then the corresponding labeling function
+sends at least l variables to 1, and k ≥l. In the opposite direction, if k ≥l, there exists a labeling
+function that sends at least l variables to 1, and the corresponding independent set contains at least
+l vertices.
+We next propose two approaches for dealing with the intractability of MES computation for output
+tuples labeled as correct. First, we state an equivalent result to Prop. 1 for subclasses of SPJU that
+admit CDNF provenance.
+Proposition 3. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SJU or SPU query, and o ∈Q(D)
+be an output tuple labeled as incorrect (i.e. vQ(o) = 0). The value MES( ˆD, Q, o) can be calculated in
+polynomial time in | ˆD|.
+20
+
+===== PAGE 21 =====
+For the subclasses of SPJU queries mentioned above, specifically join-free or projection-free
+queries, CNF provenance (a conjunction of disjunctions) can be computed in PTIME. In these cases,
+MES can be computed using a modified version of Alg. 1, where 1 is replaced with 0, DNF terms
+(conjunctions) are replaced with CNF clauses (disjunctions), and the analysis follows a similar ap-
+proach.
+In the general case, we formulate an integer linear program such that the desired MES value is a
+tractable function of its solution. Alg. 2 presents a PTIME reduction to an ILP solver. Intuitively,
+the provenance expression of o is calculated in k-DNF form (line 2) and is used to define the integer
+linear program (lines 3-8), in which⃗a = (a1, . . . , an)T represents a possible world in Inv( ˆD, Q, o).
+Formally,
+Proposition 4. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple labeled as correct (i.e. vQ(o) = 1). There exists a PTIME algorithm with oracle access
+to an ILP solver that computes MES( ˆD, Q, o).
+Proof. First, notice that I and J are nonempty. For every labeling function V : D →{0, 1} define⃗
+rV ∈{0, 1}n by
+(rV )i =
+
+
+
+1
+V (L−1(ai)) = 1
+0
+V (L−1(ai)) = 0
+Let V be a labeling function in Inv(D, Q, o) with a positive probability P( ˜D, V, o) > 0. For each
+i ∈(I \ J) (if exists), V (L−1(ai)) = v(ai).
+ln
+
+P
+
+˜D, V, o
+
+= ln
+
+Y
+i∈I
+
+
+
+pi
+V (L−1(ai))̸ = v(ai)
+1 −pi
+V (L−1(ai)) = v(ai)
+
+
+= ln
+
+Y
+i∈J
+
+
+
+pi
+V (L−1(ai))̸ = v(ai)
+1 −pi
+V (L−1(ai)) = v(ai)
+
+
+=
+X
+i∈J
+
+
+
+ln(pi)
+V (L−1(ai))̸ = v(ai)
+ln(1 −pi)
+V (L−1(ai)) = v(ai)
+=
+X
+i∈J
+
+
+
+(ln(1 −pi) −ln(pi)) · ((rV )i −1) + ln(1 −pi)
+v(ai) = 1
+(ln(pi) −ln(1 −pi)) · (rV )i + ln(1 −pi)
+v(ai) = 0
+=
+X
+i∈J
+
+
+
+(ln(1 −pi) −ln(pi)) · (rV )i
+v(ai) = 1
+(ln(pi) −ln(1 −pi)) · (rV )i
+v(ai) = 0
++
+X
+i∈J
+
+
+
+ln(pi)
+v(ai) = 1
+ln(1 −pi)
+v(ai) = 0
+= cT · rV + β
+21
+
+===== PAGE 22 =====
+Define A to be the nonempty subset of Inv(D, Q, o) with positive probability, then
+arg max
+V ∈Inv(D,Q,o)
+P
+
+˜D, V, o
+
+= arg max
+V ∈A
+P
+
+˜D, V, o
+
+= arg max
+V ∈A
+ln
+
+P
+
+˜D, V, o
+
+= arg max
+V ∈A
+ cT · rV + β
+
+= arg max
+V ∈A
+ cT · rV
+
+It’s easy to see that the integer linear program in Alg. 2 solves this optimization (and that it’s
+feasible), so ξ = maxV ∈A (cT · rV ) = ln(MES( ˜D, Q, o)) −β, and we get MES( ˜D, Q, o) = eξ+β, as
+desired.
+4.3
+Risky Tuple Computation
+We will now discuss the computation of risky tuples. The following theorem gives an algorithmic
+characterization of risky tuples:
+Theorem 1. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple with a known correctness label. Let t be an input tuple with a positive error probability
+err(t) ∈(0, 0.5]. Then, t is risky iff MES( ˆ
+D0, Q, o) > MES( ˆD, Q, o), where
+ˆ
+D0 = ⟨D0, X, L⟩and
+D0 = ⟨D, v, err0⟩with err0(t) = 0 and err0(t′) = err(t′) for every other tuple t′.
+The ”if” direction is immediate from the definition, and the ”only if” direction derives from the
+first part of Lemma 1. Theorem 1 can be implemented as an algorithm to check if an input tuple is
+risky by performing two MES calculations: one with the current error probabilities and another in a
+hypothetical scenario where the error probability of the tuple is reduced to its minimum (0). MES
+computation is done using the algorithms described earlier. The algorithm can also be extended to a
+parameterized version, where we evaluate if reducing the error probability of tuple t to q > 0 results
+in a MES increase for o. This extension is useful for assessing the risk of specific verification steps,
+especially when the post-verification error probability is known.
+As discussed in Section 4, MES calculation is an intractable problem.
+The following lemma
+presents two special cases in which an input tuple can be checked to be risky in polynomial time:
+Lemma 3. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple with a known correctness label. Let t0 be an input tuple with a positive error probability
+err(t0) ∈(0, 0.5].
+1. If there doesn’t exist a possible world vfull ∈Inv( ˆD, Q, o) such that vfull(t0) = v(t0), then t0 is
+not risky.
+2. If there exists a possible world vfull ∈Inv( ˆD, Q, o) such that vfull(t0) = v(t0), but there doesn’t
+exist a possible world vfull ∈Inv( ˆD, Q, o) such that vfull(t0) = ¬v(t0) then t0 is risky.
+22
+
+===== PAGE 23 =====
+Algorithm 3 MESReduce – Reducing the maximal MES value
+Input: Annotated DES ˆD = ⟨D, X, L⟩, budget B ∈(0, ∞), MES threshold Θ, SPJU query Q, output
+tuples O ⊆Q( ˆD)
+1: budgetLeft ←B
+2: while budgetLeft > 0 and MES( ˆD, Q, O) > Θ do
+3:
+if ∃o ∈O. vQ(o) = ⊥then
+4:
+(⋆) ˆD, budgetLeft ←ReVerify( ˆD, O, budgetLeft)
+5:
+o∗←arg maxo∈O MES( ˆD, Q, o)
+6:
+(⋆) S ←FindImprovementSet( ˆD, o∗, LQ(o∗))
+7:
+(⋆) p ←NextProbability( ˆD, LQ(o∗), S, budgetLeft, Θ)
+8:
+(⋆) ˆD, budgetLeft ←ImproveVerification( ˆD, S, p, budgetLeft)
+5
+Uncertainty Reduction Algorithms
+In this section, we focus on settings where label error probabilities of input tuples can be reduced
+through additional verification, such as by invoking a more reliable verifier or by aggregating feedback
+from additional sources. The goal is to strategically select input tuples for further verification to obtain
+better worst-case reliability guarantees of query output; that is, to reduce the MES metric (Step 4 in
+Fig. 1).
+We begin by introducing a generic algorithm scheme, MESReduce, for reducing MES values in
+query outputs (Section 5.1). This scheme relies on four subroutines, whose possible implementations
+are described in Section 5.2. One may adapt the scheme to other settings by providing alternative
+implementations for them. Lastly, hardness results are presented in Section 5.3.
+5.1
+MESReduce Generic Scheme
+Our generic MESReduce scheme for lowering MES of query outputs is presented in Algorithm 3, with
+subroutines marked by (⋆). As shown in Section 5.3, selecting an optimal batch of tuples under a
+budget is intractable even without label changes, motivating an iterative approach. Selecting multiple
+tuples per iteration is necessary in the presence of risky tuples (Section 3.2).
+Input The algorithm takes as input an annotated DES, an SPJU query, an optional target MES
+threshold, an optional cost budget, and a set of output tuples of interest O, along with provenance
+expressions that allow analysts to focus verification efforts on selected outputs.
+Initial re-verification At each iteration, output tuples in O must have known correctness labels.
+If any are missing, the ReVerify subroutine (lines 3-4) is invoked to generate them using an external
+verification tool. This step is repeated each iteration, as updates to input labels may invalidate derived
+output labels; for example, when changes in a provenance expression require previously unknown
+23
+
+===== PAGE 24 =====
+labels to be resolved. For example, if some o ∈O has provenance x ∨y, v(y) = ⊥, and x changes
+from 1 to 0, we must obtain a label for y to determine o’s correctness.
+Selecting tuples to verify The algorithm identifies the least certain (highest MES) output tu-
+ple o∗∈O (line 5), and selects a subset S of its provenance variables called an improvement set
+via the FindImprovementSet subroutine (line 6). We thus adopt Eq. 6 for optimizing the reliability
+of the set O. Variants may consider multiple high-MES tuples, trading off fewer iterations against
+adaptability (see Section 6.6).
+Executing verification steps Verification is performed using an external tool, which may differ
+from the one used in ReVerify. If the verifier supports controlling error probabilities, the NextProbability
+subroutine (line 7) is used to set target error probabilities for the tuples of S. The verifier is then
+applied to these tuples using the ImproveVerification subroutine (line 8).
+Example 14. Continuing Example 11, suppose the analyst seeks strong reliability guarantees for the
+query results but operates under a limited verification budget. Rather than manually selecting tuples to
+refine, she can invoke the MESReduce algorithm to interact with the verifier on her behalf. In practice,
+this means that MESReduce automatically selects which input tuples to send for re-verification, for
+example, by placing them in a queue for a domain expert or issuing verification requests to an LLM-
+based verifier. Budget constraints naturally arise in such settings: the analyst may only be able to
+afford a fixed amount of expert time or a limited number of LLM queries. Under these constraints,
+MESReduce prioritizes verification actions that will reduce output uncertainty, thereby improving
+query result reliability more effectively than uninformed or uniform selection of tuples. Moreover,
+MESReduce can terminate early, before exhausting the available budget, once a desired reliability level
+is achieved.
+Generalizing to multiple queries MESReduce can be extended to multiple queries with different
+budgets or stopping criteria by annotating each output tuple with the disjunction of its provenance
+expressions across queries and tracking budgets and criteria per tuple.
+5.1.1
+Optimizations for MESReduce
+The generic algorithm described above already admits several useful optimizations:
+1. Verifying the tuples in improvement sets may be done in parallel.
+2. Recalculation of MES values only needs to be done for tuples affected by the verification steps
+of the previous iteration, and can be executed in parallel; the affected tuples can be efficiently
+identified by analyzing the provenance.
+3. To avoid underflow, the algorithms can work with the log of MES values, adjusting the algo-
+rithms in Section 4 accordingly.
+24
+
+===== PAGE 25 =====
+5.2
+Subroutines Implementation
+We next discuss implementations of the MESReduce subroutines, which may vary depending on the
+setting.
+External data verification tools The ReVerify and ImproveVerification subroutines (lines 4 and 8)
+are implemented by invoking external verifiers. For ReVerify, the output of the tool must be converted
+into a DES, including correctness labels and error probabilities. Section 2 discusses how such proba-
+bilities can be obtained in practice, and Section 6.3 presents case studies with state-of-the-art tools.
+The ImproveVerification subroutine requires a verifier that can increase label accuracy for selected
+tuples, either with fixed cost and improvement (e.g., switching to a more accurate model) or with
+cost-dependent improvement, as in crowdsourcing, where increasing the number of workers reduces
+error.
+Improvement sets choice We now present an implementation of the FindImprovementSet sub-
+routine, which selects an efficient batch of input tuples S for verification. This approach leverages
+risky-tuple identification and the structure of the provenance expression for the current output tu-
+ple o∗∈O. If a related safe tuple with positive error probability exists, S includes such a tuple with
+minimal verification cost. Otherwise, S is defined based on vQ(o∗): if vQ(o∗) = 1, S contains the
+tuples in the cheapest satisfied term of the provenance expression LQ(o∗); if vQ(o∗) = 0, S is the
+cheapest set covering at least one unsatisfied variable per term. Provenance expressions are com-
+putable in PTIME as monotone k-DNF formulae [41]. In the former case, |S| ≤k; in the latter, |S|
+is bounded by the number of terms, and while optimal selection is tractable for CDNF provenance
+(Section 4.2), it is intractable in general, requiring an ILP solver or a Hitting Set approximation.
+The following example illustrates that for some formulae, T must be of size Θ(|V ars(ψ)|), where
+φ is the provenance expression of the output tuple:
+Example 15. Define φ = Wn
+i=1(a2i ∧a2i+1) to be the provenance expression of the current output
+tuple, and v ≡f. It’s easy to construct a database and a query that achieve this provenance expres-
+sion. For every set of error probabilities {pi}, when calculating the MES, it suffices to look only at
+ground truth assignments that satisfy exactly two variables. Their probabilities are in the form of
+pjpj+1
+Q
+i/∈{j,j+1}(1 −pi). If we start with p1 = . . . = pn, the MES equals p2(1 −p)n−2, and T cannot
+contain less than n = Θ(|V ars(φ)|) variables.
+Lemma 4. Unless P = NP, the problem of finding the cheapest improvement set according to the
+procedure above, when a relevant safe tuple doesn’t exist, cannot be solved in polynomial time.
+Proof. We will show a reduction from the hitting set problem [32].
+Let C = {S1, . . . , Sm} be a
+collection of subsets of a set S = {s1, . . . , sn} ⊂N and let k be a positive number. We need to
+determine if a hitting set of size at most k exists. We can assume that the sets Si are equipotent
+and each contains l ≥2 elements. If this is not the case, we will first reduce the general hitting set
+problem to this restricted problem by adding new elements.
+25
+
+===== PAGE 26 =====
+Denote by ˆD an annotated DES and Q a query such that Q( ˆD) contains a single output tuple o
+whose provenance expression is the l-DNF formula φ = Wm
+i=1(V
+sj∈Si sj). Define a DES ˆD = ⟨D, X, L⟩
+where D = ⟨D, v, err⟩with v(L(t)) = 0 and err(t) = 0.5 for all t ∈D. Assume equal verification
+costs, so picking the cheapest set is equivalent to picking the smallest set.
+Every input variable is risky: Let si be a variable, for every satisfying assignment for ψ the score
+equals
+1
+2n−1 ·pi or
+1
+2n−1 ·(1−pi), and since no term solely contain si there exists a satisfying assignment
+for ψ which doesn’t satisfy si, so its score is
+1
+2n−1 · (1 −pi) and si is risky.
+Finally, since the smallest selection that covers every term is a hitting set, we can determine if a
+hitting set of size at most k exists iff the smallest selection contains at most k variables.
+Note that improvement sets computed by the above procedure include only tuples with known
+labels. Based on the initial information we have on these tuples, we can prove, as stated by the
+following proposition, that the above-defined improvement sets can indeed lower the MES. Formally,
+Proposition 5. Let ˆD = ⟨D, X, L⟩be an annotated DES, Q be an SPJU query, and o ∈Q(D) be an
+output tuple with a known correctness label. Denote by T the set of input tuples chosen according to
+the procedure above. Then, there exists a sufficiently low probability p > 0 such that MES( ˆ
+D′, Q, o) <
+MES( ˆD, Q, o), where ˆ
+D′ = ⟨D′, X, L⟩and D′ = ⟨D, v, err′⟩for every error probabilities err′ with
+err′(ti) ≤p for every ti ∈T, and err′(t) = err(t) for every other tuple t.
+Proof. By definition, MES( ˆD, Q, o) is the maximal labeling probability over Inv( ˆD, Q, o).
+Since
+Lemma 5 is applicable for every such probability, the desired inequality is achieved for it, and therefore
+it is achieved for the maximal probability as well.
+Lemma 5. Let p1, . . . , pn ∈(0, 1
+2) and let b1, . . . , bn ∈{0, 1}. Assume that at least l > 0 bi-s are 1,
+and let α1, . . . , αn ∈(0, 2
+l−n
+l ). Then,
+n
+Y
+i=1
+(αipi)bi(1 −αipi)1−bi <
+n
+Y
+i=1
+pibi(1 −pi)1−bi
+Proof. Denote by l′ ≥l the exact number of bi-s that are 1. Assume w.l.o.g that the first l′ bis
+are 1, and the rest are 0. If l′ = n, the claim is trivial. Otherwise, Qn
+i=1(αipi)bi(1 −αipi)1−bi =
+Ql′
+i=1 αipi · Qn
+i=l′+1(1 −αipi) < Ql′
+i=1 αipi < Ql′
+i=1 2
+l−n
+l pi = 2
+l′(l−n)
+l
+· Ql′
+i=1 pi. Notice that Qn
+i=l′+1(1 −
+pi) > Qn
+i=l′+1
+1
+2 = 2l′−n, and because l′(l−n)
+l
+≤l(l−n)
+l
+= l −n ≤l′ −n, we get 2
+l′(l−n)
+l
+· Ql′
+i=1 pi <
+2l′−n Ql′
+i=1 pi < Ql′
+i=1 pi · Qn
+i=l′+1(1 −pi) = Qn
+i=1 pibi(1 −pi)1−bi as desired.
+Proposition 5 is demonstrated in the following example:
+Example 16. If p1 = p2 = 0.2, p3 = p4 = 0.3, b1 = b3 = 1, and b2 = b4 = 0, then Q4
+i=1 pibi(1 −
+pi)1−bi = 0.2 · (1 −0.2) · 0.3 · (1 −0.3) = 0.0336. According to the lemma, if we take l = 1, we can
+multiply every probability by 0.125 to get p1 = p2 = 0.025, p3 = p4 = 0.0375, and the product would
+be lowered to 0.025 · (1 −0.025) · 0.0375 · (1 −0.0375) = 0.0008. If we take l = 2, we can multiply
+26
+
+===== PAGE 27 =====
+every probability by 1
+2 to get p1 = p2 = 0.1, p3 = p4 = 0.15, and the product would be lowered to
+0.1 · (1 −0.1) · 0.15 · (1 −0.15) = 0.011475.
+Error probabilities choice There are several ways to implement the NextProbability procedure
+when the external tools support adjusting target error probabilities (e.g., via crowd size in crowd-
+sourcing or computation time in AI models). We propose a strategy inspired by variable step size in
+optimization (e.g., [66,77]):
+1. A monotonically decreasing function is set, e.g. f(n) = 1
+n.
+2. Given an output tuple o∗, the current minimal non-zero error probability q of an input tuple
+that participates in the derivation of the current output tuple is taken, and we set n =
+l
+1
+q
+m
+.
+3. The verification probability is defined to be max{f(n + 1), Θ}, where Θ is the optional target
+MES. Intuitively, we aim at selecting a probability slightly lower than q, but not lower than Θ.
+5.3
+MES reduction hardness
+The following proposition shows that reducing the MES value of a formula labeled as 0 is a compu-
+tationally hard problem:
+Proposition 6. Let φ be a k-DNF formula, v be an assignment such that v(φ) = 0, and {pi}, q be
+probabilities. If P̸ = NP, the minimal selection of variables for which updating their probabilities to q
+would reduce the MES value cannot be done in polynomial time.
+Proof. We will show that the problem is computationally hard in the case where the probabilities are
+all 1
+2 and v ≡0.
+We will show a reduction from the hitting set problem [32]. Let C = {S1, . . . , Sm} be a collection
+of subsets of a set S = {s1, . . . , sn} ⊂N and let l be a positive number. We need to determine if a
+hitting set of size at most l exists. We can assume that the sets Si are equipotent and each contains
+at least two elements. If this is not the case, we will first reduce the general hitting set problem to
+this restricted problem by adding new elements.
+Define φ = Wm
+i=1(V
+sj∈Si sj). Notice that a selection of variables to improve would lower the MES
+value iff it is a hitting set for the terms, assuming that q is low enough. For example, if l variables
+are improved while leaving an unimproved term, the resulting MES value would be (1 −q)l · 2l−n.
+Therefore, if such a selection can be computed in PTIME, then a PTIME solution of the hitting set
+problem would result.
+The following proposition shows that reducing the maximal MES value of multiple formulae labeled
+as 1 is a computationally hard problem:
+Proposition 7. Let φ1, . . . φm be k-DNF formulae, v be an assignment such that v(φi) = 1 for every
+i, and {pi}, q be probabilities. If P̸ = NP, the minimal selection of variables for which updating their
+probabilities to q would reduce the maximal MES value cannot be done in polynomial time.
+27
+
+===== PAGE 28 =====
+Proof. We will show that the problem is computationally hard in the case where the probabilities are
+all 1
+2 and v ≡1.
+As in the previous proposition, we will show a reduction from the hitting set problem where
+the sets are equipotent. Let C = {S1, . . . , Sm} be a collection of equipotent subsets of a set S =
+{s1, . . . , sn} ⊂N and let l be a positive number. We need to determine if a hitting set of size at
+most l exists.
+For every Si, define φi = W
+s∈Si s. As in the previous proposition, a selection of variables to
+improve would lower the maximal MES value iff it is a hitting set for the formulae, assuming that q
+is low enough: the MES value of each formula is the product of the probabilities of its variables; if a
+formula doesn’t contain a variable that is included in the selection, its MES value would remain the
+same; since the sets Si are equipotent, it means that the maximal MES value would also remain the
+same. Therefore, again, if such a selection can be computed in PTIME, then a PTIME solution of
+the hitting set problem would result.
+6
+Experimental Study
+We now describe the experimental study evaluating the usefulness of our indicators and the effective-
+ness of our algorithms.
+6.1
+Implementation
+We have implemented our framework in a prototype system (see [74] for the source code), using
+PostgreSQL 16 as the relational database along with ProvSQL [76] for computing provenance expres-
+sions. Our algorithms were implemented in Python 3 using the NumPy [62] and Pandas [85] libraries.
+The CP-SAT solver from OR-Tools library [67] was used for solving ILPs (in Alg. 2). See [73] for a
+demonstration of an end-to-end interactive framework that incorporates our algorithms.
+MESReduce subroutines For ImproveVerification and the baseline algorithms, we use a majority-
+vote labeling process (as, e.g., in crowdsourcing). The cost of a label corresponds to the number
+of votes (e.g., crowd responses) required to achieve the desired error probability, and unless stated
+otherwise, the budget limit is 1000 votes. This enables consistent experimentation across different
+algorithms and parameter settings. We implement FindImprovementSet and NextProbability following
+Section 5.2, and: (i) we limit the search for risky variables to 10 seconds for efficiency; (ii) we solve the
+mentioned hitting set instance using greedy approximation; (iii) if multiple tuples obtain the maximal
+MES, we consider µ of them for selecting an improvement set – a hyper-parameter defaulted to 50;
+see Section 6.6.
+28
+
+===== PAGE 29 =====
+6.2
+Experimental Setup
+Databases Our experiments were performed on NELL [57] and TPC-H (https://www.tpc.org/tpch/,
+scale 1GB) databases. NELL contains real uncertain data gathered automatically from the internet;
+TPC-H contains synthetic data, and provides scale, diversity, and standardization for algorithmic
+evaluation of our system. For NELL, we used a workload of 8 queries created by [28] independently of
+this work. TPC-H includes a diverse workload with different types of queries; since our framework only
+supports SPJU queries, we ran the experiments with 8 queries that could be naturally transformed
+to SPJU queries while preserving the semantics, e.g., by stripping outer aggregation and replacing
+GROUP BY with SELECT DISTINCT where possible; negation, in particular, is not supported in
+our framework. The query results and their provenance are highly diverse, with 5-300k output tuples
+and provenance size with 2-58506 variable occurrences in k-DNF per output tuple. Unless stated
+otherwise, we have randomly selected the output tuples of interest O ⊆Q(D), by default, |O| = 200.
+Scenarios To evaluate our algorithms in different settings, three scenarios are examined:
+1. Real-labels scenario (RLBL): we use the real human labels provided for a subset of 1.5M
+tuples from NELL. If a tuple is labeled more than once, we treat the majority label as the
+ground truth. We use a state-of-the-art external tool to obtain the (naturally imperfect) initial
+verification.
+2. Worst-case scenario (WCS): we force a highly initial erroneous scenario by setting the ground-
+truth assignment to be all 1, the initial error probabilities to be all 0.499, and the initial
+verification assignment to be all 0.3 This scenario also reflects settings in which no knowledge
+of the uncertainty of the initial verification steps is known.
+3. Average-case scenario (AVG): we randomly generate a ground truth correctness labeling;
+then, we choose initial error probabilities uniformly between 0.2 and 0.499; finally, we generate
+the initial verification assignment according to these probabilities.
+Baselines Our MES metric and the derived risky-tuples indicator are defined over the output of
+a generic verification system. The MESReduce algorithm builds on these indicators to complement
+existing verification tools by coordinating additional verification steps that reduce output uncertainty
+and provide provable worst-case guarantees, without making assumptions about the underlying data.
+Accordingly, our framework is not intended to replace existing systems but to guide and enhance
+their use, and is therefore not directly comparable to them. To the best of our knowledge, no exist-
+ing algorithm addresses this setting. We therefore design a set of baseline strategies that iteratively
+select tuples for verification, against which we evaluate MESReduce. Unlike these baselines, MESRe-
+duce selects verification actions based on the MES and risky-tuple indicators in combination with
+provenance information.
+3We have also examined the symmetric case with ground truth all 0 and assignment all true; as this second scenario
+yielded less errors, we omit it.
+29
+
+===== PAGE 30 =====
+0
+200
+400
+600
+800
+1000
+Cost
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+F1
+Occurrences Count Greedy (p=0.01)
+Formula Count Greedy (p=0.01)
+Random (p=0.01)
+Prob Greedy (p=0.01)
+MesReduce (k=1)
+Figure 3: F1 metric as a function of the verification cost for selected algorithms on NELL’s query Q4
+in Scenario AVG
+Each baseline is parameterized by the target error probability for each step, p. This introduces
+a trade-off: a higher probability lowers the verification cost per tuple and allows more tuples to be
+verified, while a lower one spends more budget per tuple to achieve higher certainty.
+We categorize the baselines according to their use of information about the verified tuples; a base-
+line is Probability-Aware if it uses error probabilities, Structure-Aware if it uses provenance structure,
+and Agnostic if it uses neither.
+• Random(p): Selecting input tuples to verify uniformly at random – Agnostic.
+• Formula-Count Greedy(p): Greedily selecting input tuples by the number of affected target
+output tuples in O ⊆Q(D) – Structure-Aware.
+• Occurrences-Count Greedy(p): Greedily selecting input tuples by the total number of oc-
+currences of their annotating variables in the provenance expressions of tuples in O ⊆Q(D) –
+Structure-Aware.
+• Probability Greedy(p): Greedily selecting input tuples to verify by descending order of error
+probability – Probability-Aware.
+All algorithms are tested under the same budget limit.
+Metrics We evaluate both verification quality and scalability. For quality, we use two complementary
+metrics:
+• Maximal Error Score (MES): Our worst-case uncertainty metric, which can increase or de-
+crease during verification. We report the logarithmic ratio between the final and initial maximal
+MES values, where higher ratios indicate greater quality improvement, while the logarithmic
+form stabilizes computation.
+• Extrinsic Accuracy (F1): A measure comparing the computed correctness labels to the
+ground truth ones (unavailable to the algorithms themselves). Because the final-to-initial ratio
+30
+
+===== PAGE 31 =====
+I have the following tuple from the NELL database: (entity=”E”, relation=”R”, value=”V”). It represents a
+belief, which is a fact that can be correct or incorrect. Determine the correctness of this belief. For example,
+for the following facts you should answer ”Correct”:
+(entity=”chocolate”, relation=”thinghascolor”,
+value=”brown”),
+(entity=”detroit”,
+relation=”citylocatedinstate”,
+value=”michigan”),
+(en-
+tity=”the andy warhol museum”,
+relation=”museumincity”,
+value=”pittsburgh”);
+for
+the
+following
+facts you should answer ”Incorrect”:
+(entity=”arizona”, relation=”statehascapital”, value=”juneau”),
+(entity=”mount katahdin”,
+relation=”mountaininstate”,
+value=”italy”),
+(entity=”the da vinci code”,
+relation=”bookwriter”, value=”paul auster”).
+Figure 4: LLM prompt for the verification of a tuple (entity=”E”, relation=”R”, value=”V”). Con-
+crete values of E, R, V are substituted.
+of F1 was less informative, we instead compute the area under the curve (AUC) of F1 across
+verification steps.
+For illustration, Fig. 3 shows the F1 increase during verification for NELL’s query Q4 in Sce-
+nario AVG, where a sharper and earlier rise indicates better performance, as also reflected in the AUC.
+In this execution, MESReduce outperforms all other baselines in both AUC and final F1 after 1000
+steps. While Random and Formula-Count Greedy(p = 0.01) achieve similar final quality, the latter
+performs better across most budgets and consequently attains a higher AUC.
+6.3
+End-to-End Workflows
+We conducted a few case studies to demonstrate end-to-end verification workflows using our framework
+(Fig. 1) in a real-world setting (Scenario RLBL).
+Case Study (I): crowdsourced improvement of anomaly detection We begin with a case
+study in which initial verification is performed by an anomaly detection tool, and MESReduce is
+used to decide which input tuples to refine via crowdsourcing and how many labels to collect per
+tuple. An analyst executes query Q3 from the workload of [28] over the NELL dataset (Fig. 5). The
+query retrieves teams, sports, and leagues linked through a common athlete and was selected due to
+the large number of relevant labels in the data. As an initial verification step, the analyst applies
+DTE [53], a recent, unsupervised anomaly detection model trained on structural properties of input
+tuples. (The extracted features per attribute: length, number of words, average word length, number
+of special characters, and number of unique characters.) The model is trained for 20 epochs, and the
+10% most anomalous tuples are labeled as incorrect.
+Since DTE produces anomaly scores rather than calibrated error probabilities, we approximate
+error probabilities by mapping the anomaly threshold to a maximum error probability of 0.5 and
+linearly normalizing the remaining scores within the range [0, 0.5] based on their distance from the
+threshold. As shown below, even this coarse estimation is sufficient for our framework to operate
+effectively.
+31
+
+===== PAGE 32 =====
+SELECT DISTINCT a.value AS team,
+b.value AS sport,
+c.value AS league
+FROM beliefs AS a, beliefs AS b, beliefs AS c
+WHERE a.relation = ’concept:athleteplaysforteam’
+AND b.relation = ’concept:athleteplayssport’
+AND c.relation = ’concept:athleteplaysinleague’
+AND a.entity = b.entity
+AND a.entity = c.entity
+Figure 5: NELL query Q3
+0
+200
+400
+600
+800
+1000
+Cost
+0.825
+0.850
+0.875
+0.900
+0.925
+0.950
+0.975
+1.000
+Metrics
+Recall
+Precision
+F-1
+Figure 6: The progress of the precision, recall, and F1 scores in the case study experiment (Sce-
+nario RLBL)
+At this point, the analyst has preliminary verification results with unknown impact on the query
+output. Using our framework, she computes the MES to assess output reliability and identifies a
+highly uncertain output tuple, namely (concept:sportsteam:rangers, concept:sport:baseball,
+concept:sportsleague:nhl).
+Examining the risky-tuples indicator reveals that all input tuples
+contributing to this output are risky, indicating that refining any single input tuple in isolation would
+not reduce its uncertainty.
+To systematically improve reliability under budget constraints, the analyst invokes the MESReduce
+algorithm over the full set of query output tuples. MESReduce automatically selects input tuples
+for re-verification and determines how many crowdsourced labels to collect for each. Final labels are
+assigned by majority vote. As MESReduce progresses, the analyst observes a substantial reduction
+in the query MES log value, from −2.079 to −8.316, reflecting a significantly stronger worst-case
+reliability guarantee without making assumptions about the underlying data.
+This improvement
+is also reflected in extrinsic quality metrics (Fig. 6): precision increases from 0.961 to 1.0, recall
+from 0.833 to 0.933, and F1 from 0.893 to 0.965.
+32
+
+===== PAGE 33 =====
+Case Study (II): Improving upon an LLM with crowdsourcing This case study illustrates
+how an analyst can use an LLM-based verifier to obtain initial verification results with error proba-
+bilities, and then apply MESReduce to guide targeted crowdsourcing for further improvement.
+The analyst again executes NELL query Q3, this time relying on a cost-effective LLM for initial
+verification. She selects Gemini 2.0 Flash-Lite, the smallest and most budget-friendly Gemini model
+available via API (https://ai.google.dev/gemini-api/docs).
+The analyst sends the relevant
+input tuples for verification in separate API calls, using a simple output schema of Correct or Incorrect.
+The prompt, shown in Figure 4, provides examples of correct and incorrect NELL tuples and asks
+the model to verify a given tuple. To estimate error probabilities, the analyst uses the token-level
+probabilities of the two possible outputs [30,42,43], yielding values that range from 4.768 × 10−6 to
+0.487. Using these estimates, she computes the MES log values for the query results and observes an
+initial overall MES of −0.897, indicating substantial uncertainty.
+To improve reliability under budget constraints, the analyst invokes MESReduce on the output
+tuples, using crowdsourcing with a limit of 100 votes. MESReduce automatically selects which of
+the 322 relevant input tuples to refine and how much effort to allocate to each. After refinement, the
+maximal MES log value decreases to −3.262, indicating a substantially stronger worst-case reliability
+guarantee. Extrinsic quality metrics also improve: precision remains at 1.0, recall increases from 0.9
+to 0.966, and the F1 rises from 0.947 to 0.983.
+Case Study (III): Reducing the cost of automated verification Our third case study illus-
+trates how MESReduce can be used to substantially reduce the cost of automated verification. Rather
+than applying an expensive, high-quality verifier to the entire database, which is costly and does not
+scale, the analyst first applies a fast, low-cost anomaly detector (DTE, as in Case Study (I)) and then
+selectively invokes a high-quality LLM-based verifier using MESReduce. In this setting, the LLM is
+powered by the most capable Gemini model available via API, Gemini 3 Pro. MESReduce improves
+both the reliability and quality of the query results while requiring far fewer LLM invocations.
+As in the first case study, the analyst applies DTE as an initial verification step for NELL query Q3.
+Due to the limited accuracy of this automated model, the resulting verification exhibits relatively
+high uncertainty, reflected in elevated MES values. The analyst then invokes MESReduce using the
+Gemini 3 Pro model, limiting the process to 100 API calls. In this scenario, the analyst does not
+have reliable error probability estimates for the LLM and instead treats its outputs as nearly perfect,
+assigning a uniform error probability of 0.
+Despite this coarse and potentially inaccurate probability assumption, which may lead to subop-
+timal behavior compared to using precise probabilities, MESReduce still substantially reduces output
+uncertainty: the maximal MES log value decreases from −2.085 to −7.611. More importantly, extrin-
+sic quality metrics, which are independent of the provided probabilities, also improve significantly:
+precision increases from 0.961 to 1.0, recall remains at 0.833, and the F1 score improves from 0.892
+to 0.909.
+33
+
+===== PAGE 34 =====
+Table 6: Average ratio of final MES to initial MES (log value) in Scenario AVG, the best-performing
+algorithm in bold.
+NELL Queries
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+MESReduce
+1.68
+2.53
+1.93
+6.63
+1.26
+2.26
+1.67
+5.44
+Random
+p = 0.01
+0.74
+0.84
+0.84
+0.63
+0.89
+0.88
+0.62
+0.56
+Random
+p = 0.0001
+0.74
+0.92
+0.91
+0.69
+0.95
+0.94
+0.70
+0.70
+Formula-Count
+p = 0.01
+0.74
+0.63
+1.00
+0.83
+0.71
+0.61
+0.56
+0.70
+Formula-Count
+p = 0.0001
+0.73
+0.65
+0.99
+0.67
+0.70
+0.63
+0.56
+0.58
+Occurrences-Count
+p = 0.01
+0.74
+0.83
+1.00
+0.84
+0.71
+0.71
+0.56
+0.64
+Occurrences-Count
+p = 0.0001
+0.73
+0.88
+1.00
+0.66
+0.70
+0.78
+0.56
+0.63
+Prob-Greedy
+p = 0.01
+0.98
+0.88
+0.88
+0.95
+0.91
+0.88
+0.75
+0.76
+Prob-Greedy
+p = 0.0001
+0.86
+0.93
+0.92
+0.81
+0.96
+0.92
+0.76
+0.77
+TPC-H Queries
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+Q9
+Q10
+MESReduce
+1.59
+∞
+∞
+2.93
+∞
+∞
+1.33
+1.41
+Random
+p = 0.01
+0.74
+1.00
+1.00
+1.00
+0.82
+0.92
+0.83
+0.85
+Random
+p = 0.0001
+0.81
+1.00
+1.00
+1.00
+0.95
+0.96
+0.90
+0.89
+Formula-Count
+p = 0.01
+0.55
+1.00
+1.00
+1.00
+1.37
+1.22
+0.84
+0.82
+Formula-Count
+p = 0.0001
+0.59
+1.00
+1.00
+1.00
+2.44
+1.86
+0.84
+0.80
+Occurrences-Count
+p = 0.01
+0.56
+1.00
+1.00
+1.00
+1.34
+1.24
+0.84
+0.81
+Occurrences-Count
+p = 0.0001
+0.62
+1.00
+1.00
+1.00
+2.44
+1.87
+0.85
+0.81
+Prob-Greedy
+p = 0.01
+0.80
+1.00
+1.00
+1.48
+0.79
+0.96
+0.84
+0.85
+Prob-Greedy
+p = 0.0001
+0.86
+1.00
+1.00
+1.22
+0.92
+1.04
+0.90
+0.89
+Table 7: Worst F1 AUC scores in Scenario WCS
+NELL Queries
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+MESReduce
+342.63
+201.46
+148.70
+587.66
+61.03
+101.10
+181.57
+438.82
+Random
+p = 0.01
+34.09
+0.00
+0.00
+105.28
+0.00
+0.00
+0.00
+15.34
+Random
+p = 0.0001
+2.23
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+Formula-Count
+p = 0.01
+74.03
+0.00
+8.12
+387.08
+7.47
+0.00
+0.00
+301.64
+Formula-Count
+p = 0.0001
+0.00
+0.00
+3.73
+188.67
+0.00
+0.00
+0.00
+91.08
+Occurrences-Count
+p = 0.01
+72.29
+0.00
+12.66
+351.04
+12.01
+0.00
+0.00
+204.61
+Occurrences-Count
+p = 0.0001
+0.00
+0.00
+12.37
+148.35
+11.14
+0.00
+0.00
+83.45
+Prob-Greedy
+p = 0.01
+38.43
+0.00
+0.00
+86.85
+0.00
+0.00
+0.00
+16.51
+Prob-Greedy
+p = 0.0001
+4.76
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+TPC-H Queries
+Q3
+Q6
+Q7
+Q8
+Q9
+Q10
+MESReduce
+189.19
+599.71
+28.02
+8.06
+2.45
+68.01
+Random
+p = 0.01
+0.00
+354.86
+0.00
+0.00
+0.00
+0.00
+Random
+p = 0.0001
+0.00
+212.5
+0.00
+0.00
+0.00
+0.00
+Formula-Count
+p = 0.01
+0.25
+339.26
+0.00
+0.00
+10.78
+26.03
+Formula-Count
+p = 0.0001
+0.00
+193.35
+0.00
+0.00
+0.00
+3.82
+Occurrences-Count
+p = 0.01
+0.00
+337.94
+0.00
+11.97
+11.97
+0.00
+Occurrences-Count
+p = 0.0001
+0.00
+193.35
+0.00
+0.00
+0.00
+0.00
+Prob-Greedy
+p = 0.01
+0.00
+355.98
+0.00
+0.00
+0.00
+0.00
+Prob-Greedy
+p = 0.0001
+0.00
+213.43
+0.00
+0.00
+0.00
+0.00
+6.4
+Verification Quality
+We now present experimental results that evaluate the quality improvement achieved by the different
+algorithms.
+MES reduction We examined the effect of the baseline algorithms on the MES in the average-case,
+Scenario AVG. Table 6 presents the ratio of final to initial MES values in logarithmic form, over NELL
+and TPC-H, averaged over 100 executions. As shown, MESReduce achieves the best improvement
+across all queries in both datasets. Its averaged ratios are all greater than 1 (and ∞when the final
+MES is 0), indicating that MES is reduced and that query output reliability improves with a worst-
+case guarantee. In contrast, for some baselines and queries, the ratio is below 1, meaning that MES
+increases and worst-case reliability degrades despite additional verification effort. The comparative
+performance of the baselines shows no clear trend.
+Extrinsic Accuracy We assessed the impact on label accuracy as measured by the AUC of the
+F1 score, comparing to the ground truth. Focusing on worst-case guarantees, we first examined Sce-
+nario WCS and the worst AUC obtained across 100 executions of each algorithm and query. The results
+for NELL and TPC-H are shown in Table 7.4 Except for TPC-H queries Q8 and Q9, MESReduce
+4TPC-H queries Q4 and Q5, with few output tuples, were omitted from this experiment as their AUC was uninfor-
+mative.
+34
+
+===== PAGE 35 =====
+Table 8: Worst F1 AUC scores in Scenario AVG
+NELL Queries
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+MESReduce
+531.88
+377.22
+533.93
+549.50
+219.45
+236.72
+383.03
+431.67
+Random
+p = 0.01
+335.88
+155.25
+452.95
+67.73
+0.00
+0.00
+76.62
+0.00
+Random
+p = 0.0001
+281.29
+172.19
+458.31
+43.18
+0.00
+0.00
+45.00
+0.00
+Formula-Count
+p = 0.01
+419.46
+208.67
+465.73
+263.17
+246.79
+86.69
+294.52
+0.00
+Formula-Count
+p = 0.0001
+392.39
+159.67
+456.85
+182.80
+242.44
+67.47
+207.44
+0.00
+Occurrences-Count
+p = 0.01
+418.60
+386.28
+466.55
+272.43
+211.15
+249.17
+308.13
+0.00
+Occurrences-Count
+p = 0.0001
+392.39
+259.58
+458.40
+185.15
+242.44
+101.22
+206.82
+0.00
+Prob-Greedy
+p = 0.01
+379.11
+101.44
+423.33
+0.00
+0.00
+0.00
+99.85
+0.00
+Prob-Greedy
+p = 0.0001
+314.17
+89.12
+416.10
+0.00
+0.00
+0.00
+54.90
+0.00
+TPC-H Queries
+Q3
+Q6
+Q7
+Q8
+Q9
+Q10
+MESReduce
+411.68
+733.60
+145.85
+0.00
+0.00
+219.78
+Random
+p = 0.01
+143.86
+664.35
+0.00
+0.00
+0.00
+0.00
+Random
+p = 0.0001
+131.66
+632.65
+0.00
+0.00
+0.00
+0.00
+Formula-Count
+p = 0.01
+432.61
+659.94
+0.00
+0.00
+0.00
+138.15
+Formula-Count
+p = 0.0001
+314.07
+621.11
+0.00
+0.00
+0.00
+112.49
+Occurrences-Count
+p = 0.01
+451.69
+659.94
+0.00
+0.00
+0.00
+215.77
+Occurrences-Count
+p = 0.0001
+323.45
+621.11
+0.00
+0.00
+0.00
+168.04
+Prob-Greedy
+p = 0.01
+165.43
+710.45
+0.00
+0.00
+0.00
+53.10
+Prob-Greedy
+p = 0.0001
+151.22
+650.67
+0.00
+0.00
+0.00
+18.79
+Table 9: Scalability experiments: average MES computation time (milliseconds)
+NELL Queries
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+Correct tuple
+2.094
+2.605
+2.321
+2.170
+2.693
+2.751
+2.114
+2.324
+Incorrect tuple
+0.016
+0.073
+0.042
+0.024
+0.077
+0.093
+0.017
+0.034
+TPC-H Queries
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+Q9
+Q10
+Correct tuple
+2.242
+1450.629
+466.495
+2.017
+2.160
+2.216
+2.285
+2.456
+Incorrect tuple
+0.029
+152.093
+68.364
+0.013
+0.024
+0.028
+0.024
+0.037
+consistently achieves the best score, demonstrating that reducing the MES effectively improves the
+extrinsic accuracy in the worst-case scenario.
+The worst results for Scenario AVG are shown in Table 8 for NELL and TPC-H. In this scenario,
+with fewer output label errors, error detection and correction are more challenging. Nevertheless,
+MESReduce remains robust, outperforming in most queries, and achieving comparable performance
+in others. For this quality metric, baselines with a higher p parameter usually achieved larger im-
+provements.
+In summary, these experiments demonstrate that, despite the MES focusing on a worst-case
+scenario rather than the most likely world, reducing the MES effectively enhances accuracy and
+reduces errors in data verification.
+6.5
+Scalability Experiments
+MES Computation These experiments evaluate the scalability of our MES computation algorithms
+(Section 4). Since different algorithms are used depending on the output label, we randomly gener-
+ated satisfying and non-satisfying assignments for each query, yielding 1 and 0 labels, respectively,
+and measured the MES computation time for every output tuple.
+We then computed the mean
+runtime separately for correct tuples (ILP solver from Algorithm 2) and incorrect ones (PTIME Al-
+gorithm 1). The procedure was repeated ten times, and the averaged results are reported in Table 9.
+All measurements are in milliseconds, with the maximal value in each row highlighted in bold.
+For most queries, the computation is highly efficient, taking less than 3 milliseconds. Only TPC-H
+queries Q4 and Q5 required substantially longer running times due to the longer provenance expres-
+sions per tuple; for Q4, the average computation exceeded one second per correct tuple, which,
+nevertheless, remains reasonable. Unsurprisingly, the PTIME computation for output tuples labeled
+as incorrect is consistently faster than the ILP solver execution for correct ones.
+35
+
+===== PAGE 36 =====
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Portion
+102
+103
+Average Running Time (ms)
+26
+48
+90
+192
+383
+488
+972
+2358
+4394
+(a) Running Time Experiment
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Portion
+101
+102
+Average Peak Memory Usage (MB)
+1.695
+3.341
+6.585
+13.131
+26.601
+33.802
+67.167
+169.952
+293.22
+(b) Memory Usage Experiments
+Figure 7: Scalability Experiment
+2
+4
+6
+8
+10
+Top MES Values
+735
+740
+745
+750
+755
+760
+765
+770
+Worst F1 AUC
+733.604
+750.823
+771.284
+2
+4
+6
+8
+10
+Top MES Values
+2.2
+2.4
+2.6
+2.8
+Average MES Ratio
+2.925
+2.22
+2.047
+Figure 8: Top-k MES values Experiment (TPC-H Q6, Scenario AVG)
+ILP Solver To further assess our usage of the ILP solver, we constructed a stress test by concate-
+nating, via disjunction, three provenance expressions from the most computation-intensive query,
+TPC-H Q4. The resulting expression consisted of 118644 variables and 87084 terms. We randomly
+generated a satisfying assignment and corresponding probabilities, then iteratively increased the frac-
+tion of terms considered (0.005, 0.01, 0.02, 0.04, 0.08, 0.1, 0.2, 0.5, 1). For each portion, we averaged
+ten MES computations. Fig. 7 presents the average running time and memory consumption. The
+runtime ranged from 25 milliseconds to 4.3 seconds, and memory usage from 1.7 MB to 293 MB,
+demonstrating that the algorithm scales well.
+6.6
+Output Tuples Hyperparameters
+MESReduce has two generalizations that consider more output tuples per iteration: one selects the
+top-k tuples by MES, and the other includes up to µ tuples tied for the highest value. We fixed an ar-
+bitrary query, TPC-H Q6, and ran MESReduce in Scenario AVG, varying one hyperparameter at a time
+(k ∈{1, 5, 10}, µ ∈{1, 12, 25, 37, 50}). The aggregated results of 100 independent runs are depicted
+in Figures 8, 9 for the first and second generalizations, resp. Both variants yield larger improvement
+36
+
+===== PAGE 37 =====
+0
+10
+20
+30
+40
+50
+Processed Expressions
+737.5
+740.0
+742.5
+745.0
+747.5
+750.0
+752.5
+Worst F1 AUC
+737.358
+754.11
+743.696
+743.355
+747.777
+0
+10
+20
+30
+40
+50
+Processed Expressions
+2.80
+2.85
+2.90
+2.95
+3.00
+3.05
+Average MES Ratio
+Figure 9: Tie-Breaking Experiment (TPC-H Q6, Scenario AVG)
+sets, resulting in fewer but more computationally intensive iterations and reduced adaptability during
+verification. They slightly improve extrinsic accuracy but show minor degradation in MES reduction;
+overall quality remains comparable, with no clear trend. Hence, these variants could be suitable for
+high-latency yet highly parallelizable verifiers (e.g., crowdsourcing). We plan to further study this
+trade-off between iteration count and adaptability in future work.
+7
+Related work
+Data Quality Our work relates to data verification, anomaly detection, and data cleaning. The
+external verifier used by MESReduce may come from any of these domains.
+Data verification assesses tuple correctness, typically via expert labeling by humans (e.g., [55,
+61]) or trained machine learning models (e.g., [26, 55, 68]), or indirectly through data “unit tests”
+(e.g., [13–15, 17, 72]). In some domains, correctness is assessed by cross-checking overlapping data
+sources (e.g., [82]). Anomaly detection instead flags potentially incorrect tuples based on statistical
+or structural irregularities (e.g., [16, 17, 26, 36, 52, 53, 55, 63, 68, 78]). Finally, large language models
+(LLMs) can be used as verifiers‘ [17], as demonstrated in Section 6.3. Our framework supports two
+complementary uses of LLM-based verification. First, it enables uncertainty-aware analysis of LLM-
+provided labels, accounting for factors such as missing or outdated training data. Even in our case
+studies, which involve largely general-domain data, we further improve the reliability and accuracy
+of LLM verification labels through targeted crowdsourcing (Case Study (II)). Second, the framework
+helps reduce the cost of LLM-based verification by combining a fast, low-cost automated verifier with
+selective LLM calls guided by MESReduce (Case Study (III)).
+Data verification is a component of the broader data cleaning problem, which addresses incorrect
+or inconsistent data (see [40]). Prior work typically defines clean data via constraints and focuses on
+identifying and repairing violations (e.g., [3,9,20,24,33,54,70]), or assumes conformance to statistical
+distributions (e.g., [89]). Techniques include optimal repair computation (e.g., [3,11,20,24,33,34,54,
+70]), machine learning–based approaches (e.g., [60, 69]), and human-in-the-loop methods (e.g., [7, 9,
+19,21,28,31,46,51,59,84,90]).
+37
+
+===== PAGE 38 =====
+Among existing systems, two widely cited approaches are HoloClean [69] and ActiveClean [46].
+Both systems focus on data repair, whereas our framework targets data verification and operates
+on top of existing verifiers rather than replacing them. HoloClean combines constraints, external
+sources, and statistical models to repair erroneous data, while ActiveClean integrates cleaning into
+convex statistical learning workflows (e.g., SVMs) via stochastic gradient descent. Because our frame-
+work analyzes how verification errors propagate to query results and provides worst-case reliability
+guarantees, without performing repairs itself, a direct performance comparison with these end-to-end
+cleaning systems is not meaningful. Nevertheless, it may be interesting future work to adapt the MES
+metric to data repair or learning-based cleaning settings, including machine learning pipelines.
+Closely related is query-guided data cleaning, which focuses on cleaning query-relevant subsets
+rather than entire datasets (e.g., [9, 19, 28, 58, 84]).
+Rather than proposing a new verification or
+cleaning method, this work analyzes how verification errors propagate to query results and introduces
+algorithms that provide query-relevant reliability insights for existing verification systems.
+Uncertain and Probabilistic Databases A large body of work studies uncertainty in databases
+(e.g., [5,6,8,10,22,24,37,49,64,80,81,83,86]). Probabilistic databases model uncertainty by treating
+tuples or attributes as random variables.
+For example, tuple-independent probabilistic databases
+assign each tuple an independent probability of being present in a possible world. A formal model
+of unclean databases that incorporates both probabilistic data and probabilistic cleaning errors was
+proposed in [24].
+Our formal model differs fundamentally from this line of work. Probabilistic models typically
+assume knowledge of the ground truth data distribution and probabilities, which often requires do-
+main expertise and ongoing maintenance. In contrast, our approach assumes knowledge only of the
+verification steps applied to the data, making it substantially more practical. Moreover, while prior
+work focuses primarily on expectation-based or distribution-based guarantees, our objective is to
+provide strong worst-case guarantees suitable for data-critical settings. Finally, we explicitly study
+how gradually reducing verification error probabilities affects query results, whereas most prior work
+assumes these probabilities are fixed.
+Some approaches to uncertain data also adopt a worst-case perspective, most notably certain
+answers and consistent query answering, which compute query results that hold in every possible
+world or every minimal repair of an inconsistent database [5,6,10,34,49,86]. These works differ from
+ours in that consistency is defined via integrity constraints on clean data, leading to fundamentally
+different analyses and solutions.
+Possibilistic Query Answering An alternative approach to handling uncertainty is based on pos-
+sibility theory and fuzzy sets, with fuzzy databases as the central formal model. Several variants
+have been explored, including fuzzy relations and possibility distributions over attribute values (see,
+e.g., [12, 29]). In contrast, our approach does not model data uncertainty at all; instead, it focuses
+exclusively on uncertainty arising from verification processes and remains agnostic to the underlying
+38
+
+===== PAGE 39 =====
+data values. Furthermore, our uncertainty metric MES is not only used to quantify uncertainty but
+also to actively guide verification decisions, as described in Section 5.
+Provenance in databases Provenance, also called lineage, plays a central part in this research,
+and all our algorithms process provenance expressions that are represented by Boolean formulae. In
+general, provenance refers to additional information attached to output tuples about their derivation
+from the input tuples [18,75]. There are multiple definitions for provenance, and in this work, we are
+using an extension of the PosBool semiring of [39,41] to three-valued logic. In general, many works
+in the field of probabilistic and uncertain databases use Provenance. In addition, it has been used in
+various contexts, including data cleaning [9,28,35,65], consent management [27], access control [91],
+causality [56,71], and tuples contribution quantification [2,25]. Many types of provenance have been
+implemented in ProvSQL [76], which has been used in our experiments.
+8
+Conclusions and future work
+In this paper, we studied verification in data-critical settings and introduced MES, a novel worst-case
+metric for the uncertainty of query results. We analyzed its computational complexity and developed
+efficient algorithms for its calculation. We also identified and formalized the notion of risky tuples
+– input tuples for which further verification may increase output uncertainty – and proposed an
+algorithm to detect them. Building on these insights, we presented a generic algorithm, MESReduce,
+that operates on top of existing verification systems to improve the reliability of query results. We
+demonstrated the practicality and effectiveness of our approach through an extensive experimental
+study.
+This work opens several promising directions for future research. First, we have preliminary results
+on alternative uncertainty metrics over sets of tuples (e.g., worst-case expected number of errors).
+Second, our approach could be extended to broader query types beyond SPJU, e.g., aggregate queries,
+as well as to generalized notions of risky tuples. Moreover, while the verified results of SPJU queries
+can be used as training data for machine learning models, it would be interesting to further explore
+the application of our techniques and algorithms within machine learning workflows – specifically, the
+potential uses of MES, the relation between risky tuples and noise in training sets, and the impact of
+lowering the MES on model reliability. In addition, supporting additional classes of verifiers, such as
+constraint-based ones, could also broaden applicability. Finally, an interesting direction is to model
+the verifier’s uncertainty using possibility theory, and apply our techniques and ideas under this
+alternative uncertainty model.
+Acknowledgments ChatGPT was used for minor textual editing of some of the paragraphs in this
+submission, without affecting or generating content, non-textual parts (formulas, figures, tables...),
+or any of our contributions.
+39
+
+===== PAGE 40 =====
+References
+[1] S. Abiteboul, R. Hull, and V. Vianu, Foundations of databases.
+Addison-Wesley Reading, 1995.
+[2] O. Abramovich, D. Deutch, N. Frost, A. Kara, and D. Olteanu, “Banzhaf values for facts in
+query answering,” Proc. ACM Manag. Data, vol. 2, no. 3, 2024.
+[3] F. N. Afrati and P. G. Kolaitis, “Repair checking in inconsistent databases: Algorithms and
+complexity,” in ICDT, 2009.
+[4] Y. Amsterdamer, D. Deutch, and V. Tannen, “Provenance for aggregate queries,” in PODS,
+2011.
+[5] M. Arenas, L. Bertossi, and J. Chomicki, “Consistent query answers in inconsistent databases,”
+in PODS, 1999.
+[6] ——, “Answer sets for consistent query answering in inconsistent databases,” Theory and practice
+of logic programming, vol. 3, no. 4-5, 2003.
+[7] A. Assadi, T. Milo, and S. Novgorodov, “Cleaning data with constraints and experts,” in WebDB,
+2018.
+[8] O. Benjelloun, A. Das Sarma, A. Halevy, M. Theobald, and J. Widom, “Databases with uncer-
+tainty and lineage,” VLDB J., vol. 17, no. 2, 2008.
+[9] M. Bergman, T. Milo, S. Novgorodov, and W.-C. Tan, “Query-oriented data cleaning with
+oracles,” in SIGMOD, 2015.
+[10] L. Bertossi, Database repairing and consistent query answering. Morgan & Claypool Publishers,
+2011.
+[11] L. E. Bertossi, S. Kolahi, and L. V. S. Lakshmanan, “Data cleaning and query answering with
+matching dependencies and matching functions,” Theory Comput. Syst., vol. 52, no. 3, 2013.
+[12] P. Bosc and H. Prade, “An introduction to the fuzzy set and possibility theory-based treat-
+ment of flexible queries and uncertain or imprecise databases,” in Uncertainty Management in
+Information Systems: From Needs to Solutions.
+Springer, 1997.
+[13] E. Breck, M. Zinkevich, N. Polyzotis, S. Whang, and S. Roy, “Data validation for machine
+learning,” in SysML, 2019.
+[14] N. Bylois, F. Neven, and S. Vansummeren, “Data ingestion validation through stable conditional
+metrics with ranking and filtering,” in ADBIS, 2023.
+[15] E. Caveness, P. S. G. C., Z. Peng, N. Polyzotis, S. Roy, and M. Zinkevich, “Tensorflow data
+validation: Data analysis and validation in continuous ml pipelines,” in SIGMOD, 2020.
+40
+
+===== PAGE 41 =====
+[16] C.-H. Chang, J. Yoon, S. O. Arik, M. Udell, and T. Pfister, “Data-efficient and interpretable
+tabular anomaly detection,” in SIGKDD, 2023.
+[17] H. Chen and S. Schelter, “Towards automated task-aware data validation,” in DEEM, 2025.
+[18] J. Cheney, L. Chiticariu, and W. C. Tan, “Provenance in databases: Why, how, and where,”
+Foundations and Trends in Databases, vol. 1, no. 4, 2009.
+[19] R. Cheng, J. Chen, and X. Xie, “Cleaning uncertain data with quality guarantees,” PVLDB,
+vol. 1, no. 1, 2008.
+[20] X. Chu, I. F. Ilyas, and P. Papotti, “Holistic data cleaning: Putting violations into context,” in
+ICDE, 2013.
+[21] X. Chu, J. Morcos, I. F. Ilyas, M. Ouzzani, P. Papotti, N. Tang, and Y. Ye, “Katara: A data
+cleaning system powered by knowledge bases and crowdsourcing,” in SIGMOD, 2015.
+[22] N. N. Dalvi and D. Suciu, “Efficient query evaluation on probabilistic databases,” VLDB J.,
+vol. 16, no. 4, 2007.
+[23] A. P. Dawid and A. M. Skene, “Maximum likelihood estimation of observer error-rates using the
+EM algorithm,” Journal of the Royal Statistical Society: Series C (Applied Statistics), vol. 28,
+no. 1, 1979.
+[24] C. De Sa, I. F. Ilyas, B. Kimelfeld, C. R´e, and T. Rekatsinas, “A formal framework for proba-
+bilistic unclean databases,” in ICDT, 2019.
+[25] D. Deutch, N. Frost, B. Kimelfeld, and M. Monet, “Computing the shapley value of facts in
+query answering,” in SIGMOD, 2022.
+[26] S. Dong, S. Sahri, T. Palpanas, and Q. Wang, “Automated data quality validation in an end-to-
+end GNN framework,” in EDBT, 2025.
+[27] O. Drien, A. Amarilli, and Y. Amsterdamer, “Managing consent for data access in shared
+databases,” in ICDE, 2021.
+[28] O. Drien, M. Freiman, A. Amarilli, and Y. Amsterdamer, “Query-guided resolution in uncertain
+databases,” Proc. ACM Manag. Data, vol. 1, no. 2, 2023.
+[29] D. Dubois and H. Prade, Possibility Theory: An Approach to Computerized Processing of Un-
+certainty.
+Plenum Press, 1988.
+[30] Eric
+Dong,
+“Unlock
+Gemini’s
+reasoning:
+A
+step-by-step
+guide
+to
+log-
+probs
+on
+Vertex
+AI,”
+2025.
+[Online].
+Available:
+https://developers.googleblog.com/
+unlock-gemini-reasoning-with-logprobs-on-vertex-ai/
+41
+
+===== PAGE 42 =====
+[31] A. Fariha, A. Tiwari, A. Meliou, A. Radhakrishna, and S. Gulwani, “CoCo: Interactive ex-
+ploration of conformance constraints for data understanding and data cleaning,” in SIGMOD,
+2021.
+[32] M. R. Garey and D. S. Johnson, Computers and intractability.
+Freeman San Francisco, 1979.
+[33] F. Geerts, G. Mecca, P. Papotti, and D. Santoro, “Cleaning data with Llunatic,” VLDB J.,
+vol. 29, no. 4, 2020.
+[34] A. Gilad, D. Deutch, and S. Roy, “On multiple semantics for declarative database repairs,” in
+SIGMOD, 2020.
+[35] B. Glavic, “Data provenance,” Found. Trends Databases, vol. 9, no. 3-4, 2021.
+[36] P. Gopalan, V. Sharan, and U. Wieder, “Pidforest: Anomaly detection via partial identification,”
+in NeurIPS, 2019.
+[37] S. Greco, C. Molinaro, I. Trubitsyna et al., “Computing approximate certain answers over in-
+complete databases.” in AMW, 2017.
+[38] S. Greco, F. Pijcke, and J. Wijsen, “Certain query answering in partially consistent databases,”
+Proc. VLDB Endow., vol. 7, no. 5, 2014.
+[39] T. J. Green, G. Karvounarakis, and V. Tannen, “Provenance semirings,” in PODS, 2007.
+[40] I. F. Ilyas and X. Chu, Data Cleaning.
+Association for Computing Machinery, 2019.
+[41] T. Imieli´nski and W. Lipski Jr, “Incomplete information in relational databases,” JACM, vol. 31,
+no. 4, 1984.
+[42] James Hills and Shyamal Anadkat, “Using logprobs,” 2024. [Online]. Available:
+https:
+//cookbook.openai.com/examples/using logprobs
+[43] S. Kadavath, T. Conerly, A. Askell, T. Henighan, D. Drain, E. Perez, N. Schiefer, Z. Hatfield-
+Dodds, N. DasSarma, E. Tran-Johnson, S. Johnston, S. E. Showk, A. Jones, N. Elhage, T. Hume,
+A. Chen, Y. Bai, S. Bowman, S. Fort, D. Ganguli, D. Hernandez, J. Jacobson, J. Kernion,
+S. Kravec, L. Lovitt, K. Ndousse, C. Olsson, S. Ringer, D. Amodei, T. Brown, J. Clark, N. Joseph,
+B. Mann, S. McCandlish, C. Olah, and J. Kaplan, “Language models (mostly) know what they
+know,” arXiv:2207.05221, 2022.
+[44] G. Kerrigan, P. Smyth, and M. Steyvers, “Combining human predictions with model probabilities
+via confusion matrices and calibration,” in NeurIPS, 2021.
+[45] F. A. Khan, D. Herasymuk, N. Protsiv, and J. Stoyanovich, “Still more shades of null: An
+evaluation suite for responsible missing value imputation,” PVLDB, vol. 18, no. 9, 2025.
+42
+
+===== PAGE 43 =====
+[46] S. Krishnan, J. Wang, E. Wu, M. J. Franklin, and K. Goldberg, “ActiveClean: Interactive data
+cleaning for statistical modeling,” PVLDB, vol. 9, no. 12, 2016.
+[47] L. Kuhn, Y. Gal, and S. Farquhar, “Semantic uncertainty: Linguistic invariances for uncertainty
+estimation in natural language generation,” in ICLR, 2023.
+[48] Y. Li, J. Gao, C. Meng, Q. Li, L. Su, B. Zhao, W. Fan, and J. Han, “A survey on truth discovery,”
+SIGKDD, vol. 17, no. 2, 2015.
+[49] X. Lian, L. Chen, and S. Song, “Consistent query answers in inconsistent probabilistic databases,”
+in SIGMOD, 2010.
+[50] S. Lin, J. Hilton, and O. Evans, “Teaching models to express their uncertainty in words,” Trans-
+actions on Machine Learning Research, 2022.
+[51] X. Lin, Y. Peng, J. Xu, and B. Choi, “Human-powered data cleaning for probabilistic reachability
+queries on uncertain graphs,” in ICDE, 2018.
+[52] F. T. Liu, K. M. Ting, and Z.-H. Zhou, “Isolation forest,” in ICDM, 2008.
+[53] V. Livernoche, V. Jain, Y. Hezaveh, and S. Ravanbakhsh, “On diffusion modeling for anomaly
+detection,” in ICLR, 2024.
+[54] E. Livshits, B. Kimelfeld, and S. Roy, “Computing optimal repairs for functional dependencies,”
+in PODS, 2018.
+[55] M. Mahdavi, Z. Abedjan, R. Castro Fernandez, S. Madden, M. Ouzzani, M. Stonebraker, and
+N. Tang, “Raha: A configuration-free error detection system,” in SIGMOD, 2019.
+[56] A. Meliou, W. Gatterbauer, K. F. Moore, and D. Suciu, “The complexity of causality and
+responsibility for query answers and non-answers,” Proc. VLDB Endow., vol. 4, no. 1, 2010.
+[57] T. Mitchell, W. Cohen, E. Hruschka, P. Talukdar, J. Betteridge, A. Carlson, B. Dalvi, M. Gard-
+ner, B. Kisiel, J. Krishnamurthy, N. Lao, K. Mazaitis, T. Mohamed, N. Nakashole, E. Platan-
+ios, A. Ritter, M. Samadi, B. Settles, R. Wang, D. Wijaya, A. Gupta, X. Chen, A. Saparov,
+M. Greaves, and J. Welling, “Never-ending learning,” in AAAI, 2015.
+[58] L. Mo, R. Cheng, X. Li, D. W. Cheung, and X. S. Yang, “Cleaning uncertain data for top-k
+queries,” in ICDE, 2013.
+[59] ——, “Cleaning uncertain data for top-k queries,” in ICDE, 2013.
+[60] F. Neutatz, B. Chen, Z. Abedjan, and E. Wu, “From cleaning before ML to cleaning for ML,”
+IEEE Data Eng. Bull., vol. 44, no. 1, 2021.
+43
+
+===== PAGE 44 =====
+[61] T. T. Nguyen, H. Yin, M. Weidlich, B. Zheng, Q. V. H. Nguyen, and B. Stantic, “User guidance
+for efficient fact checking,” PVLDB, vol. 12, no. 8, 2019.
+[62] NumPy, “NumPy,” 2024. [Online]. Available: https://numpy.org
+[63] G. Pang, C. Shen, and A. van den Hengel, “Deep anomaly detection with deviation networks,”
+in SIGKDD, 2019.
+[64] K. Papaioannou, M. Theobald, and M. B¨ohlen, “Supporting set operations in temporal-
+probabilistic databases,” in ICDE, 2018.
+[65] N. N. Parulian and B. Lud¨ascher, “DCM explorer: a tool to support transparent data cleaning
+through provenance exploration,” in TaPP, 2022.
+[66] J. Patterson and A. Gibson, Deep learning: A practitioner’s approach.
+”O’Reilly Media, Inc.”,
+2017.
+[67] L. Perron and F. Didier, “Cp-sat,” Google, 2024. [Online]. Available: https://developers.google.
+com/optimization/cp/cp solver/
+[68] S. Redyuk, Z. Kaoudi, V. Markl, and S. Schelter, “Automating data quality validation for dy-
+namic data ingestion.” in EDBT, 2021.
+[69] T. Rekatsinas, X. Chu, I. F. Ilyas, and C. R´e, “HoloClean: holistic data repairs with probabilistic
+inference,” PVLDB, vol. 10, no. 11, 2017.
+[70] E. K. Rezig, M. Ouzzani, W. G. Aref, A. K. Elmagarmid, A. R. Mahmood, and M. Stonebraker,
+“Horizon: Scalable dependency-driven data cleaning,” PVLDB, vol. 14, no. 11, 2021.
+[71] B. Salimi, L. Bertossi, D. Suciu, and G. Van Den Broeck, “Quantifying causal effects on query
+answering in databases,” in TaPP, 2016.
+[72] S. Schelter, D. Lange, P. Schmidt, M. Celikel, F. Biessmann, and A. Grafberger, “Automating
+large-scale data quality verification,” PVLDB, vol. 11, no. 12, 2018.
+[73] R. Schreiber and Y. Amsterdamer, “CleanEr: Interactive, query-guided error mitigation for data
+cleaning systems,” in ICDE, 2024.
+[74] ——,
+“Code
+git
+repository,”
+2024.
+[Online].
+Available:
+https://github.com/ransch/
+Data-Cleaning-Errors
+[75] P. Senellart, “Provenance in databases: Principles and applications,” in Reasoning Web, 2019.
+[76] P. Senellart, L. Jachiet, S. Maniu, and Y. Ramusat, “ProvSQL: Provenance and probability
+management in PostgreSQL,” PVLDB, vol. 11, no. 12, 2018.
+44
+
+===== PAGE 45 =====
+[77] S. Shalev-Shwartz and S. Ben-David, Understanding machine learning: From theory to algo-
+rithms.
+Cambridge university press, 2014.
+[78] S. Shankar, L. Fawaz, K. Gyllstrom, and A. Parameswaran, “Automatic and precise data vali-
+dation for machine learning,” in CIKM, 2023.
+[79] O. Shorinwa, Z. Mei, J. Lidard, A. Z. Ren, and A. Majumdar, “A survey on uncertainty quan-
+tification of large language models: Taxonomy, open research challenges, and future directions,”
+ACM Comput. Surv., vol. 58, no. 3, 2025.
+[80] D. Suciu, “Probabilistic databases for all,” in PODS, 2020.
+[81] D. Suciu, D. Olteanu, C. R´e, and C. Koch, Probabilistic Databases.
+Morgan & Claypool, 2011.
+[82] Q. Tian, M. Liu, L. Min, J. An, X. Lu, and H. Duan, “An automated data verification approach
+for improving data quality in a clinical registry,” Comput. Methods Programs Biomed., vol. 181,
+2019.
+[83] G. Van den Broeck, D. Suciu et al., “Query processing on probabilistic data: A survey,” Foun-
+dations and Trends® in Databases, vol. 7, no. 3-4, 2017.
+[84] J. Wang, S. Krishnan, M. J. Franklin, K. Goldberg, T. Kraska, and T. Milo, “A sample-and-clean
+framework for fast and accurate query processing on dirty data,” in SIGMOD, 2014.
+[85] Wes McKinney, “Data Structures for Statistical Computing in Python,” in SciPy, 2010.
+[86] J. Wijsen, “Foundations of query answering on inconsistent databases,” SIGMOD Record, vol. 48,
+no. 3, 2019.
+[87] M. Xiong, Z. Hu, X. Lu, Y. Li, J. Fu, J. He, and B. Hooi, “Can llms express their uncertainty?
+an empirical evaluation of confidence elicitation in llms,” in ICLR, 2024.
+[88] M. Xiong, A. Santilli, M. Kirchhof, A. Golinski, and S. Williamson, “Efficient and effective
+uncertainty quantification for LLMs,” in NeurIPS Safe Generative AI Workshop, 2024.
+[89] M. Yakout, L. Berti-´Equille, and A. K. Elmagarmid, “Don’t be SCAREd: use SCalable Auto-
+matic REpairing with maximal likelihood and bounded changes,” in SIGMOD, 2013.
+[90] M. Yakout, A. K. Elmagarmid, J. Neville, M. Ouzzani, and I. F. Ilyas, “Guided data repair,”
+PVLDB, vol. 4, no. 5, 2011.
+[91] V. Zaychik Moffitt, J. Stoyanovich, S. Abiteboul, and G. Miklau, “Collaborative access control
+in WebdamLog,” in SIGMOD, 2015.
+45

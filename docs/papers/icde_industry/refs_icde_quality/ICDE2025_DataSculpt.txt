@@ -1,0 +1,2089 @@
+
+===== PAGE 1 =====
+DataSculpt: Crafting Data Landscapes for Long-Context LLMs
+through Multi-Objective Partitioning
+Keer Lu∗1, Xiaonan Nie∗1, Zheng Liang2, Da Pan2, Shusen Zhang2, Keshi Zhao1, Weipeng Chen2,
+Zenan Zhou2, Guosheng Dong†2, Bin Cui†1, Wentao Zhang†1
+1Peking University 2Baichuan Inc.
+{keer.lu,zhaoks}@stu.pku.edu.cn,{xiaonan.nie,bin.cui,wentao.zhang}@pku.edu.cn
+{liangzheng,panda,zhangshusen,chenweipeng,zhouzenan,dongguosheng}@baichuan-inc.com
+ABSTRACT
+In recent years, foundation models, particularly large language mod-
+els (LLMs), have demonstrated significant improvements across a
+variety of tasks. One of their most important features is long-context
+capability, which enables them to process and generate extended
+text while maintaining coherence, retrieving relevant information,
+and efficiently handling tasks with substantial amounts of text. The
+key to improving long-context performance lies in effective data
+organization and management strategies that integrate data from
+multiple domains and optimize the context window during train-
+ing. Through extensive experimental analysis, we identified three
+key challenges in designing effective data management strategies
+that enable the model to achieve long-context capability without
+sacrificing performance in other tasks: (1) a shortage of long docu-
+ments across multiple domains, (2) effective construction of context
+windows, and (3) efficient organization of large-scale datasets.
+To address these challenges, we introduce DataSculpt, a novel
+data management framework designed for long-context training.
+We first formulate the organization of training data as a multi-
+objective combinatorial optimization problem, focusing on attributes
+including relevance, homogeneity, integrity, and efficiency. Specifi-
+cally, our approach utilizes a coarse-to-fine methodology to opti-
+mize training data organization both efficiently and effectively. We
+begin by clustering the data based on semantic similarity (coarse),
+followed by a multi-objective greedy search within each cluster to
+score and concatenate documents into various context windows
+(fine). Our comprehensive evaluations demonstrate that DataSculpt
+significantly enhances long-context training performance, result-
+ing in improvements of 18.09% in retrieval augmentation, 21.23%
+in summarization, 21.27% in reading comprehension, and a 3.81%
+increase in code completion, while also maintaining overall model
+proficiency with a 4.88% improvement.
+PVLDB Reference Format:
+Keer Lu, Xiaonan Nie, Zheng Liang, Da Pan, Shusen Zhang, Keshi Zhao,
+Weipeng Chen, Zenan Zhou, Guosheng Dong, Bin Cui, Wentao Zhang.
+DataSculpt: Crafting Data Landscapes for Long-Context LLMs through
+Multi-Objective Partitioning. PVLDB, 18(1): XXX-XXX, 2025.
+doi:XX.XX/XXX.XX
+∗Equal Contribution.
+† Corresponding Author.
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International
+License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+this license. For any use beyond those covered by this license, obtain permission by
+emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights
+licensed to the VLDB Endowment.
+Proceedings of the VLDB Endowment, Vol. 18, No. 1 ISSN 2150-8097.
+doi:XX.XX/XXX.XX
+PVLDB Artifact Availability:
+The source code, data, and/or other artifacts have been made available at
+https://github.com/8023looker/DataSculpt.
+1
+INTRODUCTION
+In recent years, artificial intelligence has achieved remarkable mile-
+stones across a wide range of fields [21, 43], including computer
+vision [19, 51, 66], natural language processing [7, 16, 64, 65] and
+generative AI [2]. These breakthroughs are the result of significant
+progress in the development of AI systems, which is built upon three
+critical components: data, algorithms, and computational resources.
+Data forms the foundation, serving as the essential input from
+which models extract and generalize patterns [41, 81]. The quality,
+quantity, and diversity of the data are pivotal in shaping a model’s
+ability to perform effectively across a range of tasks. Algorithms
+define how data is processed and guide the architectural design
+of models, enabling them to address specific problems. Computa-
+tional resources, such as GPUs, are vital for handling the complex
+computations required throughout the training process, ensuring
+scalability and efficiency as models grow in complexity [54, 56].
+Historically, advancements in AI were primarily driven by model-
+centric approaches, where the focus was on refining and optimiz-
+ing algorithmic architectures, such as AlexNet [40], ResNet [27],
+GoogleNet [72] in convolutional neural networks. However, in re-
+cent years, there has been a paradigm shift from the model-centric
+approach to the data-centric approach for foundation models, such
+large language models (LLMs). This shift emphasizes the quality,
+organization, and management of data as the critical factor for
+improving model performance [41, 81, 82]. For example, state-of-
+the-art LLM models, such as ChatGPT [57], PaLM [4], Gemini [73]
+and Mixtral [34] all leverage similar transformer architectures, but
+they employ distinct data organization and management strategies.
+Therefore, effective training data organization and management
+has emerged as a decisive factor in scaling model training and en-
+hancing model capabilities [22, 54, 62, 82], particularly as models
+continue to grow in complexity and size.
+The long-context capability is one of the most important fea-
+tures in LLMs [23, 44, 83], referring to their ability to process and
+generate extended text while maintaining coherence, retrieving
+relevant information [49], and handling tasks that involve substan-
+tial amounts of text efficiently [5]. For instance, GPT-4 [2] can
+handle context windows of up to 128K tokens, and maintain the-
+matic and logical consistency across long-form text. Achieving this
+long-context capability requires training the model on an extended
+arXiv:2409.00997v2  [cs.CL]  2 Oct 2024
+
+===== PAGE 2 =====
+context window, which usually consist of multiple documents of
+varying lengths and different domains.
+The primary challenges lie in determining effective data organi-
+zation and management strategies for long-context model training,
+which ensure the model achieves long-context capability without
+compromising its performance in other tasks, such as multitask
+language understanding [30]. Specifically, the strategy of selecting
+appropriate documents from vast sources of varying lengths to com-
+pose each context window during training remains under-explored,
+yet it is crucial for maximizing model efficiency and performance.
+Existing methods primarily focus on the combination of document
+sources, aiming to enhance the model’s general understanding and
+generation capabilities. However, they often overlook the consider-
+ation of document length, limiting the model’s ability to effectively
+handle long-sequence modeling. For example, ICLM [68] groups
+related documents within the same context window, enabling LLMs
+to access a broader range of relevant contexts, while SPLICE [70]
+employs retrieval-based strategies [33, 67] to implement structured
+packing within the context window. Unlike previous approaches,
+we try to explore the data management strategy for long-context
+model training from a multi-objective combinatorial optimization
+problem, which involves both document source and length:
+How to design a data organization and management
+strategy for LLMs that could achieve long-context
+capability without compromising the models’ perfor-
+mance in other tasks?
+Through extensive experimental analysis, we identified that
+the challenges associated with data organization and management
+strategies stem from the following three key aspects:
+C1: Shortage of Long Documents Across Multiple Domains.
+Achieving a balanced domain mixture in training data is essential, as
+each domain contributes distinct knowledge to the model. However,
+data from various domains exhibit significant variation in length
+distribution, complicating the creation of effective long-context
+training datasets. While some domains provide sufficiently long
+documents suitable for long-context training, others, particularly
+web-sourced data, contain shorter documents, with less than 1%
+exceeding 4K tokens, as shown in Figure 2. To create adequate train-
+ing contexts from such data, it is often necessary to concatenate
+multiple documents. This process, however, introduces potential
+challenges, such as increased cross-attention between unrelated
+documents, leading to undesirable learning signals and higher com-
+putational costs. Consequently, the variation in document length
+across domains can hinder the model’s ability to fully leverage
+long-context capabilities without introducing noise or redundancy.
+C2: Effective Construction for Context Window. Developing
+robust algorithms for constructing context windows is a critical
+challenge in enhancing the long-context capabilities of language
+models. These algorithms must intelligently group related docu-
+ments to preserve semantic coherence while maximizing the utility
+of the available data. Poorly designed methods can result in the
+combination of unrelated or loosely connected documents, which
+diminishes the quality of training signals and ultimately leads to
+suboptimal model performance. Although existing research has
+shown the positive impact of structured data on improving lan-
+guage models’ long-context capabilities [9, 15, 16, 42], these efforts
+remain in their infancy. Previous approaches [68] have frequently
+resulted in isolated documents, as each document in the training
+corpus was accessed only once. This limitation necessitates the
+concatenation of unrelated documents with low semantic correla-
+tion in subsequent stages, as illustrated inTable 2 and Figure 4b.
+Moreover, these methods often neglect the essential task of pre-
+serving individual document integrity, concentrating on a narrow
+set of factors rather than adopting a comprehensive framework for
+context window construction.
+C3: Efficient Organization for Large-Scale Datasets. Effi-
+ciently organizing large-scale datasets into long-context sequences
+presents a significant challenge [11, 74]. This task involves not only
+managing vast amounts of data but also ensuring that the orga-
+nizational process minimizes computational overhead and labor
+costs. Inefficient data management strategies can lead to increased
+training times, elevated computational expenses, and difficulties in
+effectively scaling the model. Consequently, optimizing the data
+organization process is crucial for developing more efficient and
+scalable large language models [1, 58, 60]. Such strategies must
+ensure a balance between long-context processing and the practical
+constraints of resource availability, ultimately leading to improved
+performance and scalability.
+To address these challenges, we introduce DataSculpt, a novel
+data management framework designed for long-context training,
+which formulates the organization of training data as a multi-
+objective combinatorial optimization (MOCO) problem. DataSculpt
+aims to strike a balance among several key objectives, including
+maximizing relevance and homogeneity among documents within
+the same context window (C1, C2), preserving document integrity
+when truncating text that exceeds the context window’s capacity
+(C2), and optimizing computational efficiency in handling large-
+scale datasets (C3). Specifically, our approach employs a coarse-
+to-fine methodology to optimize the organization of training data
+efficiently and effectively. We start by clustering the data based on
+semantic similarity (coarse), then perform a multi-objective greedy
+search within each cluster to score and concatenate documents into
+different context windows (fine).
+To verify the effectiveness of our methods, we conducted contin-
+ual pretraining with 15 billion tokens on a language model with 7
+billion parameters, utilizing varying sequence lengths of 16K, 32K,
+and 64K. This approach enables the model to continuously adapt
+and refine its knowledge, resulting in enhanced performance over
+a one-time pretraining method, making it the most widely used.
+Our experimental results demonstrate that our DataSculpt signif-
+icantly enhances performance across a range of tasks, including
+general understanding (+4.88%), retrieval augmentation (+18.09%),
+summarization (+21.23%), reading comprehension (+21.27%), and
+code completion (+3.81%). These findings indicate that DataSculpt
+effectively synergizes the model’s performance in long-context uti-
+lization during the continual pretraining phase, even with a limited
+number of training tokens.
+Paper Organization. In Section 2, we introduce the background
+concepts relevant to this work, including transformer training and
+the multi-objective combinatorial optimization problem. Then, we
+present a quantitative analysis of the training datasets in Section 3,
+emphasizing the challenges faced in long-context LLM training.
+In Section 4, we introduce DataSculpt, which uses a coarse-to-fine
+2
+
+===== PAGE 3 =====
+methodology for efficiently organizing training data, enabling the
+model to achieve long-context capability without compromising
+performance on other tasks. Finally, we validate the effectiveness
+of DataSculpt through comprehensive experiments in Section 5.
+2
+PRELIMINARY
+2.1
+Transformer Architecture
+Transformers are designed to address sequence modeling and trans-
+duction tasks, such as language modeling and machine transla-
+tion [79]. At the heart of their architecture lie self-attention net-
+works and point-wise feed-forward networks, which are integral
+to each layer. These models perform dense algebraic operations,
+including matrix multiplications, which incurs significant compu-
+tational and memory demands.
+Self-Attention Network.
+Self-attention stands for a critical
+component of the Transformer architecture, allowing the model to
+weigh the importance of different words in a sequence, irrespective
+of their positions [55, 79, 86]. For each word in a sequence, self-
+attention computes a score that represents how much focus to place
+on other parts of the input sequence when encoding that specific
+word. This mechanism involves three sets of weights: query, key,
+and value, which are learned during training. Mathematically, self-
+attention can be described as a mapping of a query and a set of
+key-value pairs to an output, where the output is a weighted sum
+of the values. Each weight assigned to a value is computed by a
+compatibility function of the query with the corresponding key.
+This allows the Transformer to capture complex dependencies and
+relationships within the data, making it highly effective for tasks
+that require an understanding of the entire sequence, such as text
+translation or summarization.
+Feed-Forward Network.
+Each transformer layer includes a
+position-wise feed-forward network (FFN), which is applied to
+each position separately and identically. This consists of two linear
+transformations with a ReLU activation in between. The purpose
+of the FFN is to transform the representation independently at
+each position with the same, learned linear transformation. This
+means that while the self-attention layers share information across
+positions in the input, the feed-forward network processes each
+position independently. This component is crucial as it introduces
+non-linearity into the model, enabling it to learn more complex
+functions. Moreover, it ensures that the Transformer can adapt to
+different data types and tasks, providing additional flexibility and
+power to the model [79].
+2.2
+LLMs Training
+Large Language Models (LLMs) denote Transformer-based archi-
+tectures equipped with hundreds of billions (or more) of param-
+eters [87], initially introduced to address sequence modeling and
+transduction challenges. Below, we have outlined several key con-
+cepts about LLMs training.
+Pretraining.
+The pretraining phase of LLMs is a crucial period
+for developing their general knowledge capabilities. During this
+phase, LLMs undergo unsupervised training with large-scale raw
+text to cultivate their language modeling skills. Given a sequence
+x = {𝑥1,𝑥2, ...,𝑥𝑛}, the primary training task for LLMs at this stage
+is to predict subsequent tokens 𝑥𝑖based on preceding tokens x<𝑖as
+a1    a2    a3    a4
+b1    b2    b3    b4    b5
+Raw Documents
+c1    c2    c3
+Concatenation and Truncation
+Context Window
+Harm Document Integrity
+3 Documents with 1 Truncation 
+b1    b2    b3    b4    b5
+c1    c2    c3   
+a1    a2    a3    a4
+Pretraining and Continual Pretraining
+Cross-Document  
+Attention
+Visible
+Self-Attention
+Large Language Model
+Masked
+Next Token 
+Prediction
+Figure 1: An illustration of the data processing workflow,
+training task, context window and self-attention mechanism.
+context, outlined in Fig. 1. The objective function aims to maximize
+the likelihood of Equation (1).
+L𝑃𝑇
+𝐿𝐿𝑀(x) =
+𝑛
+∑︁
+𝑖=1
+log 𝑃(𝑥𝑖|x<𝑖)
+(1)
+Continual Pretraining.
+Continual pretraining is a phase that
+extends the initial pretraining, using the same objective as shown
+in Equation (1). The key distinction is that continual pretraining
+builds on an already trained model rather than starting from scratch.
+At this stage, the LLM has basic language modeling capabilities;
+the aim now is to enhance its specialized functions, such as long
+context modeling, leveraging the foundational skills acquired during
+the initial pretraining phase. This phase is increasingly seen as a
+practical approach to improving model performance without the
+exorbitant computational costs associated with starting anew, as
+argued in recent studies [26, 32, 59].
+Context Window.
+The context window is the span of text
+that a model actively considers when predicting the next word or
+deciphering the text’s structure. This window defines the range of
+contextual neighbors used in calculating vector representations [48].
+During both the pretraining and continual pretraining phases, raw
+texts from various documents are concatenated to form a continuous
+sequence that matches the length of the context window. Any text
+exceeding this length is truncated. The size of the context window
+is pivotal, as it directly impacts the model’s capacity for language
+comprehension and generation.
+2.3
+Multi-Objective Combinatorial Optimization
+The multi-objective combinatorial optimization (MOCO) problem
+involves optimizing several objectives simultaneously, which typi-
+cally conflict with each other [76] and can be formulated as:
+max
+𝑥∈𝜒f (𝑥) := (𝑓1 (𝑥) , 𝑓2 (𝑥) , ..., 𝑓𝑚(𝑥))
+s.t. 𝑔𝑘(𝑥) ≤𝑏𝑘+ 𝜖𝑘,𝑘= 1, ...,𝑛
+(2)
+where 𝑥denotes a solution in the decision space 𝜒⊂R𝑛, f : 𝜒→
+R𝑚represents an 𝑚-dimensional vector-valued objective function,
+and 𝑔𝑘(𝑥) ≤𝑏𝑘+ 𝜖𝑘where𝑘= 1, ...,𝑛stands for a series of soft
+constraints. Importantly, the evaluation process is computation-
+ally expensive for each individual objective 𝑓𝑖(𝑥) ,𝑖= 1, ...,𝑚. The
+complexity of MOCO challenges lies in the fact that improving the
+outcome of one objective often leads to the deterioration of another,
+making it necessary to find a balance or trade-off between them.
+3
+
+===== PAGE 4 =====
+<4k
+4k-8k
+8k-16k
+16k-32k
+32k-64k
+>64k
+Document Token Number
+Paper (English)
+Code
+Paper (Chinese)
+Web (English)
+Web (Chinese)
+Others
+0%
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+90%
+100%
+Book (Chinese)
+Book (English)
+Paper (Chinese) 
+(3.5%)
+Code (25%)
+Book (English) 
+(6.5%)
+Web (Chinese)
+(13.5%)
+Others(5%)
+Book (Chinese) (6.5%)
+Paper (English) 
+ (8.5%)
+Domain 
+Mixture
+Web (English)
+(31.5%)
+Domain Knowledge
+Long Documents
+Figure 2: An illustration on the shortage of long documents across multiple domains. Left: The length distribution of individual
+documents across various domains, arranged in descending order by the proportion of documents exceeding 64K tokens.
+Documents, such as books and academic papers predominantly conist of medium to long lengths (L ≥16K), whereas other
+domains, particularly web-sourced data, contain documents almost exclusively shorter than 4K tokens. Right: The proportion
+of each domain in the overall training dataset.
+Table 1: Token statistics across domains. We analyzed the maximum, minimum, and average token counts for different domains.
+Domain
+Book (Chinese)
+Book (English)
+Paper (English)
+Code
+Paper (Chinese)
+Web (English)
+Web (Chinese)
+Others
+Max Len
+24,203,838
+8,241,838
+10,721,906
+1,000,000
+1,471,297
+1,267,049
+80,688
+21,839
+Min Len
+667
+322
+127
+173
+696
+289
+132
+23
+Avg Len
+176,156
+216,969
+20,555
+2,578
+6,216
+886
+358
+224
+3
+OBSERVATIONS AND CHALLENGES
+3.1
+Observations on Training Datasets
+The training data is sourced from a variety of domains, such as
+web content, books, academic papers, and code repositories, with
+the composition and respective weight proportions shown on the
+right side of Figure 2. We conducted a statistical analysis of token
+count characteristics across various domains, as shown in Table 1.
+Additionally, we categorized tokenized documents into different
+length intervals based on the token counts of each data source.
+The proportional distributions across domains are visualized as
+a normalized stacked horizontal bar chart on the left size of Fig-
+ure 2, offering a hierarchical view of the domains according to the
+prevalence of longer texts.
+From Table 1 and Figure 2, we have observed that data from
+the book and academic paper domains predominantly consist of
+long documents, with over half exceeding 64K tokens in length.
+Academic papers, however, tend to fall within the medium-length
+range, with documents typically spanning 4K to 32K tokens. In con-
+trast, web-sourced data is primarily composed of short documents,
+with the vast majority under 4K tokens. As a result, web-sourced
+data is not naturally suited for long-context training due to its
+shorter document lengths, which often requires the concatenation
+of multiple documents to form sequences of adequate length for
+long-context training.
+3.2
+Challenges
+Given the token count statistics across documents, one of the pri-
+mary challenges lies in the variation of sequence lengths among dif-
+ferent data sources. In efforts to preserve domain diversity, shorter
+documents in the training dataset tend to increase the incidence
+of cross-document attention, where the model focuses on multiple,
+unrelated documents within the same context window. This can
+lead to model hallucinations and increased computational consump-
+tion. The problem becomes more prominent as the model’s context
+window expands during training.
+Model Hallucinations. Model hallucinations occur when mod-
+els generate incorrect or irrelevant content that is not grounded in
+the input data. While well-trained models generally reduce cross-
+document attention, this behavior is not always strictly controlled,
+which may potentially lead to spurious outputs as well as unin-
+tended correlations [17, 61].
+Computational Consumption. Moreover, cross-document at-
+tention expends unnecessary computational resources by focusing
+on unrelated tokens that contribute little to the model’s learning
+process [39, 78]. The unnecessary processing of unrelated tokens
+not only diminishes the model’s performance but also amplifies
+the computational demands, which is especially crucial given the
+attention mechanism’s quadratic complexity [79].
+3.3
+Problem Formulation
+Based on the above observations and analysis, we frame the sce-
+nario of data organization and management for long-context train-
+ing as a multi-objective partition allocation problem with soft
+constraints at a massive data scale. This is fundamentally an in-
+stance of the multi-objective combinatorial optimization (MOCO)
+problem [47] described in Section 2.3.
+Setup.
+Given a training dataset D and training sequences
+W awaiting sampling, with each context window limited to a
+length of 𝐿, the multi-objective partition allocation problem focuses
+4
+
+===== PAGE 5 =====
+Variant of ISODATA
+0.2
+0.1
+0.3
+...
+0.3
+Semantic Clustering
+Cluster Number Estimation
+Nc =
+|D| × (ρ1 + ρ2 + ... + ρn)  
+n
+ρ2
+ρn
+ρ1
+d1 d2 d3 d4
+d1
+d2
+d3
+d4
+subset 2
+subset 1
+d1 d2 d3 d4
+d1
+d2
+d3
+d4
+d1 d2 d3 d4
+d1
+d2
+d3
+d4
+Based on Distance Matrix
+subset n
+merge clusters
+create new cluster
+add to existing
+≤ δ
+> δ
+Score
+Doc
+DataSculpt: Multi-Objective Partition Allocation
+Relavance
+Integrity
+Homogeneity
+Compute Efficiency
+Vector Embedding
+0.2
+0.1
+0.3
+...
+0.3
+0.2
+0.2
+0.2
+...
+0.35
+0.1
+0.1
+0.4
+...
+0.2
+0.5
+0.1
+0.2
+...
+0.1
+0.4
+0.3
+0.1
+...
+0.1
+Data Preprocessing
+Raw Documents
+Document Trucation
+Context Window
+Embedding Vectors
+Embedding Model
+Document Chunks
+Sequence Residual Capacity
+MOCO Score
+Greedy Semantic-Driven Largest-Fit Policy
+Document Chunk
+Context Window
+Where to place?
+p
+q
+nn
+Layer 2
+Layer 1
+Layer 0
+FAISS Semantic Search Using HNSW
+Search
+Top 1 
+Figure 3: Illustration of DataSculpt. In the data preprocessing stage, documents are initially divided into chunks with ≤context
+length 𝐿, which are subsequently transformed into vector embeddings. During the semantic clustering phase, we implement a
+variant of the ISODATA algorithm, which is augmented with the FAISS vector searching library, to aggregate documents based
+on semantic similarity. Following this, a greedy semantic-driven largest-fit algorithm is utilized to arrange these clusters into
+sequences that are multi-objective optimally configured for long-context training.
+on optimizing several key objectives. The overarching goal is to
+efficiently enhance the homogeneity of concatenated documents
+within the same attention sequence:
+• G1: Relevance. The primary goal is to maximize seman-
+tic coherence among documents within the same context
+window. Increasing relevance has been shown to reduce
+language model perplexity, improving overall model per-
+formance [68].
+• G2: Homogeneity. Reducing cross-document attention
+during the model’s training phase is crucial. This can be
+achieved by minimizing the number of concatenated doc-
+uments within each context window, ensuring the model
+focuses on fewer, more cohesive sequences.
+• G3: Integrity.Preserving the integrity of individual docu-
+ments by minimizing unnecessary truncation during con-
+catenation is essential. This ensures that the contextual
+richness and completeness of each document are retained
+as much as possible [17].
+• G4: Efficiency.Efficiency is a key concern when managing
+large-scale training datasets for LLMs. Achieving a balance
+between accuracy, processing speed, and space consump-
+tion is critical for optimizing long-context training perfor-
+mance while minimizing resource usage.
+Soft constraints ensure that the total length of documents within
+each context window does not exceed its capacity, aiming to maxi-
+mize document integrity and minimize the proportion of truncated
+tokens within the same document (G3). Consequently, Equation (2)
+can be written as:
+max
+𝑥∈𝜒f (𝑥) := 𝛼𝑓1 (𝑥) + 𝛽𝑓2 (𝑥) + 𝜆𝑝(𝑥)
+(3)
+where soft constraints are incorporated as penalty terms, while 𝛼,
+𝛽, 𝜆are non-negative hyper-parameters that control the weight of
+each objective and penalty function.
+The respective objective functions can be formulated as:
+𝑓1 (𝑥) =
+∑︁
+𝑤∈W
+∑︁
+𝑑𝑖∈D
+∑︁
+𝑑𝑗∈D
+𝑗≠𝑖
+𝑥𝑑𝑖𝑤𝑥𝑑𝑗𝑤cos  𝐸(𝑑𝑖), 𝐸(𝑑𝑗)
+𝑓2 (𝑥) =
+∑︁
+𝑤∈W
+𝐿
+Í
+𝑑𝑖∈D 𝑥𝑑𝑖𝑤
+(4)
+where 𝑓1 (𝑥) aims to ensure the overall similarity of concatenated
+documents (G1), while 𝑓2 (𝑥) seeks to guarantee the homogeneity
+within a training sequence (G2). 𝐸(𝑑𝑖) denotes the embedding of
+document 𝑑𝑖∈D employed embedding model [10] and cosine
+similarity is used to determine the similarity between any pair of
+documents, while 𝑥𝑑𝑖𝑤equals 1 if 𝑑𝑖∈𝑤and 0 otherwise. 𝐿is used
+to divide the objective function 𝑓2 (𝑥) to transform the minimization
+problem into a maximization problem for resolution.
+Furthermore, the penalty term 𝑝(𝑥) is defined as:
+𝑝(𝑥) =
+(
+1, if Í
+𝑤∈W
+Í
+𝑑𝑖∈D 𝑥𝑑𝑖𝑤𝑙(𝑑𝑖) ≤𝐿
+𝐿
+Í
+𝑤∈W
+Í
+𝑑𝑖∈D 𝑥𝑑𝑖𝑤−1, otherwise
+(5)
+where 𝑙(𝑑𝑖) represents the length of document 𝑑𝑖. The penalty term
+ensures that the total length of concatenated documents remains
+within the capacity 𝐿of the context window. If the total sequence
+length exceeds 𝐿, the penalty increases to discourage overfitting
+the context window.
+Solving MOCO problems exactly is NP-hard, but coarse-to-fine
+algorithms are known for providing efficient approximate solutions
+(G4). The primary challenge, however, lies in effectively balancing
+5
+
+===== PAGE 6 =====
+multiple objectives within the constraints of limited computational
+resources and the vast scale of the training corpus D [88].
+Let |D| denote the total number of documents in D. The number
+of documents 𝑘selected for concatenation within a given context
+window is significantly smaller than the total document count,
+such that 𝑘<< |D|. As a result, even though score-based sorting
+is performed on the remaining |D| −𝑘documents during each
+iteration, they remain unselected, consuming substantial time and
+computational resources.
+To address this inefficiency, we first apply semantic clustering
+to the entire training corpus D at a coarser granularity. This is
+followed by a greedy algorithm that optimizes the trade-off be-
+tween computational efficiency and precision during the document
+organization process.
+4
+DATASCULPT
+In this work, we introduce DataSculpt, a novel data management
+framework designed for long-context training. This framework
+aims to effectively integrate data from multiple domains and op-
+timize the context window during training. Figure 3 presents the
+workflow of DataSculpt. In the data preprocessing phase, we first
+tokenize the raw documents from the training corpus, D, accord-
+ing to the context window length, 𝐿, of the model. This process
+involves dividing the documents into segments, each containing
+no more than 𝐿tokens, to comply with the model’s context length
+constraints. Following this, each document segment 𝑑𝑖is processed
+through the embedding model to generate its embedding 𝐸(𝑑𝑖).
+4.1
+Phase 1: Semantic Clustering
+In the initial phase, the documents undergo a process of semantic
+clustering at a relatively coarse granularity. To estimate the ini-
+tial cluster number, we derive inspiration from the construction
+of a distance matrix by quantifying semantic distances between
+documents within the training corpus D. We first divide D into 𝑛
+subsets 𝐷1, 𝐷2, ..., 𝐷𝑛, where each subset 𝐷𝑗= {𝑑1,𝑑2, ...,𝑑𝑘} ⊂D
+and Ð𝑛
+𝑗=1 𝐷𝑗= D. For each subset 𝐷𝑗, we compute the density 𝜌𝑗
+of its distance matrix, which demonstrates the average dissimilarity
+score in relation to the entire subset.
+𝜌𝑗=
+2
+𝑛(𝑛−1)
+∑︁
+𝑑𝑖∈𝐷𝑗
+∑︁
+𝑑𝑘∈𝐷𝑗
+𝑘≠𝑖
+cos (𝐸(𝑑𝑖), 𝐸(𝑑𝑘))
+(6)
+Ultimately, the approximate number of clusters 𝑁𝑐for semantic
+clustering is ascertained to be equivalent to the total number of
+documents within the training corpus multiplied by the average
+score of dissimilarity among subsets 𝐷1, 𝐷2, ..., 𝐷𝑛, denoted as
+𝑁𝑐= ⌊|D| ∗¯𝜌⌋=
+$
+|D| ∗
+Í
+𝐷𝑗⊂D 𝜌𝑗
+𝑛
+%
+(7)
+We have implemented modifications to the ISODATA cluster-
+ing algorithm [53], tailoring the algorithm’s splitting and merging
+phases to better align with the specific characteristics of our text
+corpus, as outlined in Algorithm 1. Furthermore, to enhance the
+efficiency of vector similarity assessments, we have integrated the
+FAISS index [35], a sophisticated method for conducting high-speed
+pairwise similarity searches.
+Algorithm 1: Variant of ISODATA
+Input: Training corpus D, Cluster number 𝑁𝑐gained from
+Equation (7), Hyperparameters: distance threshold 𝛿,
+alteration threshold 𝜖, maximum iterations 𝑇;
+Parameter: Unclustered data U, Alteration distance 𝑑𝑠𝑡;
+Ouptut: Clusters C =
+
+𝑐𝑗
+	𝑁𝑐
+𝑗=1;
+Define: 𝜇(𝑐) is center vector of cluster 𝑐;
+1 Sample 𝑁𝑐centroids in C =
+
+𝑐𝑗
+	𝑁𝑐
+𝑗=1 randomly from D,
+𝜇(𝑐𝑗) ←𝐸(𝑑𝑗) for all 𝑗= 1, ..., 𝑁𝑐;
+2 U,𝑑𝑠𝑡←[ ], 0 ;
+3 for 𝑡= 1, 2, . . . ,𝑇do
+4
+for each documnet 𝑑𝑖in D do
+5
+if max𝑐𝑗∈C 𝑐𝑜𝑠 𝐸(𝑑𝑖) , 𝜇 𝑐𝑗
+ > 𝛿or 𝑡== 𝑇then
+6
+Add 𝑑𝑖to 𝑐𝑗∗= arg max𝑐𝑗∈C 𝑐𝑜𝑠(𝐸(𝑑𝑖), 𝜇(𝑐𝑗));
+7
+U.𝑎𝑝𝑝𝑒𝑛𝑑(𝑑𝑖);
+8
+for each 𝑑𝑢in U do
+9
+Add new cluster 𝑐𝑢, 𝜇(𝑐𝑢) ←𝐸(𝑑𝑢), 𝑁𝑐←𝑁𝑐+ 1;
+10
+for each cluster 𝑐𝑗do
+11
+𝑑𝑠𝑡←𝑑𝑠𝑡+ ||𝜇(𝑐𝑗) −
+1
+|𝑐𝑗|
+Í
+𝑑𝑖∈𝑐𝑗𝐸(𝑑𝑖)||;
+12
+Recalculate centroid 𝜇(𝑐𝑗) ←
+1
+|𝑐𝑗|
+Í
+𝑑𝑖∈𝑐𝑗𝐸(𝑑𝑖);
+13
+for each pair of clusters 𝑐𝑖and 𝑐𝑗do
+14
+if 𝑐𝑜𝑠(𝜇(𝑐𝑖), 𝜇(𝑐𝑗)) > 𝛿then
+15
+Merge cluster 𝑐𝑖and cluster 𝑐𝑗, 𝑁𝑐←𝑁𝑐−1;
+16
+if 𝑑𝑠𝑡< 𝜖then
+17
+Break;
+18
+𝑑𝑠𝑡←0;
+19 return Clusters C =
+
+𝑐𝑗
+	𝑁𝑐
+𝑗=1 where ∪𝑁𝑐
+𝑗=1𝑐𝑗= D ;
+As shown in Algorithm 1, we first randomly select 𝑁𝑐data sam-
+ples from the entire training corpus D to serve as the initial clus-
+tering centers (Line 1), which is based on the calculations from
+Equation (7). These sampled data points are then indexed using the
+FAISS vector searching library. Throughout the clustering process
+with a maximum iteration count of 𝑇(Line 3-18), for each docu-
+ment 𝑑𝑖, we employ the HNSW method [52] from FAISS to retrieve
+its nearest cluster center 𝑐𝑗(Line 4-7). If the semantic similarity
+between the current center and 𝑑𝑖exceeds a predefined threshold 𝛿,
+then 𝑑𝑖is assigned to cluster 𝑐𝑗(Line 5-6). Conversely, if the similar-
+ity does not surpass 𝛿, 𝑑𝑖is designated as a new cluster center (Line
+7). Moreover, as the iterative clustering progresses, adjustments to
+the cluster centers are made by calculating the mean of the docu-
+ment embedding vectors within each cluster, thereby establishing
+new cluster centroids (Line 10-12). Additionally, if the similarity
+between any two clusters exceeds the threshold 𝛿, those clusters are
+merged (Line 13-15). This approach not only refines the clustering
+process by dynamically adjusting cluster centers based on semantic
+coherence but also ensures that clusters remain distinct and mean-
+ingful by merging overly similar clusters, thereby enhancing the
+overall structure and interpretability of the clustering outcome.
+Time Complexity.
+The computational complexity of the
+original ISODATA algorithm is denoted as O(|𝐷|𝑇𝑁𝑐), where |𝐷|
+represents the quantity of the entire dataset, 𝑁𝑐denotes the initial
+6
+
+===== PAGE 7 =====
+Algorithm 2: Semantic-Driven Largest-Fit Allocation
+Input: Cluster 𝑐𝑗∈C, Context sequence capacity 𝐿,
+Context sequence quantity 𝑁𝑤, Hyperparameters:
+impact of objective and penalty function 𝛼, 𝛽, 𝜆;
+Parameter: Available context sequence A, Semantic
+relevance 𝑓1, Residual capacity proportion 𝑓2,
+Truncation penalty 𝑝, Concatenation score 𝐹;
+Ouptut: Constructed sequences S = {𝑠𝑙}𝑁𝑤
+𝑙=1;
+Define: 𝑟(𝑠) is remaining capacity of context sequence 𝑠;
+Define: 𝑙(𝑑) is token quantity of document 𝑑;
+Define: 𝜇(𝑠) is center vector of context sequence 𝑠;
+1 {𝑟(𝑠𝑙) ←𝐿}𝑁𝑤
+𝑙=1: Initialize empty context sequences;
+2 𝑆𝑐𝑗: Sort 𝑑𝑖∈𝑐𝑗by token quantity in descending order;
+3 for each documnet 𝑑𝑖in 𝑆𝑐𝑗do
+4
+A = {𝑠𝑙|𝑟(𝑠𝑙) ≥0}𝑁𝑤
+𝑙=1;
+5
+if A = ∅then
+6
+Break;
+7
+for each context sequence 𝑠𝑎in A do
+8
+𝑓1(𝑑𝑖,𝑠𝑎) = 𝑐𝑜𝑠(𝐸(𝑑𝑖), 𝜇(𝑠𝑎));
+9
+𝑓2(𝑑𝑖,𝑠𝑎) = 𝑟(𝑠𝑎)/𝐿;
+10
+𝑝(𝑑𝑖,𝑠𝑎) =
+(
+1, if 𝑙(𝑑𝑖) ≤𝑟(𝑠𝑎)
+𝐿/(𝐿+ 𝑙(𝑑𝑖) −𝑟(𝑠𝑎)), otherwise
+;
+11
+𝐹(𝑑𝑖,𝑠𝑎) = 𝛼𝑓1(𝑑𝑖,𝑠𝑎) + 𝛽𝑓2(𝑑𝑖,𝑠𝑎) + 𝜆𝑝(𝑑𝑖,𝑠𝑎);
+12
+Add 𝑑𝑖to 𝑠𝑎∗where 𝑠𝑎∗= arg max𝑠𝑎∈S 𝐹(𝑑𝑖,𝑠𝑎);
+13
+𝑟(𝑠𝑎∗) ←𝑟(𝑠𝑎∗) −𝑙(𝑑𝑖);
+14
+𝜇(𝑠𝑎∗) ←((|𝑠𝑎∗| −1)𝜇(𝑠𝑎∗) + 𝐸(𝑑𝑖))/|𝑠𝑎∗|;
+15 return Constructed sequences S = {𝑠𝑙}𝑁𝑤
+𝑙=1;
+cluster count, and𝑇signifies the number of iterations. However, the
+integration of FAISS library leveraging HNSW search significantly
+accelerates the querying for relative vectors through the establish-
+ment of a multi-layered indexing architecture, which optimizes the
+process of pinpointing similar data points across expansive datasets.
+The construction phase of the index is typically completed within a
+time frame of 𝑂(𝑁𝑐log 𝑁𝑐), which then supports the rapid search
+for each query vector. By executing a hierarchical traversal within
+the index structure, the algorithm efficiently locates the nearest
+neighbor, showcasing a time complexity of O(log 𝑁𝑐). This opti-
+mization reduces the overall time complexity to O(|𝐷|𝑇log 𝑁𝑐),
+representing a critical step towards improving the computational
+efficiency of our data scheduling procedures, enabling more rapid
+and precise clustering outcomes (G4).
+4.2
+Phase 2: Greedy Policy
+In the preliminary phase, documents within the training corpus
+D are clustered based on their semantic similarities at a broader
+level of granularity. The subsequent stage leverages a sophisticated
+multi-objective partition allocation algorithm, strategically applied
+across these preliminary clusters. The purpose of this algorithm,
+as depicted in Algorithm 2, is to systematically arrange documents
+into various context sequences for concatenation.
+As delineated in Section 3.3, our objective encompasses augment-
+ing the relevance (G1) and homogeneity (G2), while maintaining
+integrity (G3) of the textual content encapsulated within each con-
+text window. This enhancement is realized through a strategic
+reduction in the quantity of documents concatenated into a sin-
+gle context sequence, amplifying the semantic congruence among
+these documents, and eliminating unnecessary truncations.
+Initially, documents within each previously formed cluster are
+organized in descending order by their token count (Line 2). Fol-
+lowing this organization, for each document 𝑑𝑖pending allocation,
+the process seeks to integrate it into an existing sequence 𝑠𝑎with
+content length that does not exceed the maximum context win-
+dow capacity 𝐿(Line 3-14). The sequence 𝑠𝑎is selected based on
+achieving the highest composite score 𝐹(𝑑𝑖,𝑠𝑎), which reflects a
+weighted consideration of semantic similarity (G1, Line 8), available
+residual capacity (G2, Line 9), and the minimization of truncation
+penalties (G3, Line 10). Through this approach, we aim to ensure
+that the allocation of documents to sequences is not only comput-
+ing efficient but also optimally maintains semantic consistency,
+maximizes capacity utilization, and preserves the integrity of indi-
+vidual documents within each training sequence (Line 11-12). The
+strategy is pivotal in enhancing the overall effectiveness of context
+sequences for LLMs, by fostering a training environment that is
+both informationally rich and contextually coherent.
+4.3
+Semantic Clustering Analysis
+To demonstrate the robustness of our approach, we compared the
+effectiveness of semantic clustering across different methodologies.
+Our analysis encompasses two key dimensions: the statistical fea-
+tures related to the document quantities within each cluster, and the
+application of t-SNE [77] for dimensionality reduction to project
+and analyze clusters. These clusters were derived from two distinct
+approaches: the greedy traversal of incomplete graphs as described
+in ICLM [68], for which we refer to the official implementation 1,
+and the semantic clustering achieved through an ISODATA variant
+(Algorithm 1) implemented by our DataSculpt.
+4.3.1
+Numerical Narratives.
+Initially, we performed a quantitative analysis of the number of clus-
+ters generated by two distinct methodologies, as detailed in Table 2.
+It revealed that the clusters produced through greedy graph traver-
+sal in ICLM totaled 323,428,858, markedly surpassing the 611,981
+clusters formed via semantic clustering with Algorithm 1, which
+suggests a more fragmented clustering approach by the former
+method. Moreover, clusters initiated at the commencement of the
+traversal process encompassed a substantially larger number of doc-
+uments compared to those established later, leading to a pronounced
+imbalance in document distribution. Specifically, a significant skew
+was observed in the distribution of clusters from ICLM, with 53.56%
+comprising isolated single-document clusters. The dominance of
+such minimal-scale clusters hinders the ability to adequately fill
+the context window during the concatenation process for long se-
+quences, thereby inadequately mitigating cross attention in training
+despite the potential for high semantic similarity among documents.
+Conversely, DataSculpt exhibited a more equitable distribution of
+1https://github.com/swj0419/in-context-pretraining
+7
+
+===== PAGE 8 =====
+Table 2: Document statistics among clusters. The clusters formed through ICLM’s greedy traversal of an incomplete graph
+demonstrate a significant bias in the distribution of document quantities, with 99.8% of clusters containing fewer than 100
+documents and 53.56% comprising only a single document. In contrast, clusters generated by DataSculpt’s semantic clustering
+approach display a more balanced distribution of document numbers.
+Method
+Cluster Number
+Stats of Docs Number in Clusters
+Max
+Min
+Mean
+Median
+Less than 100
+Single Doc
+ICLM
+323,428,858
+26,630
+1
+3.458
+1
+322,926,996
+173,231,427
+DataSculpt
+611,981
+11,747
+1
+1,827
+763
+1,479
+29
+-120
+-90
+-60
+-30
+0
+30
+60
+90
+120
+-120
+-90
+-60
+-30
+0
+30
+60
+90
+(a) T-SNE on clusters built from Algorithm 1.
+-120
+-90
+-60
+-30
+0
+30
+60
+90
+120
+-120
+-90
+-60
+-30
+0
+30
+60
+90
+(b) T-SNE on clusters built from graph traversal in ICLM.
+Figure 4: Visualization using t-SNE on document embeddings sampled from the web derived (English) training corpus, with each
+cluster denoted by a distinct color. Left (4a) presents the semantic clustering results generated by the methodology outlined in
+Algorithm 1, and right (4b) illustrates clusters where nodes are united by a shared traversal path, as identified by the greedy
+graph traversal algorithm discussed in ICLM [68].
+cluster sizes throughout the semantic clustering process, enabling
+the majority of clusters containing semantically akin documents
+to extend to the length required for a long context sequence. This
+strategy efficiently capitalizes on the advantages of clustering simi-
+lar documents, which significantly enhances the model’s training
+efficiency by promoting semantic coherence within clusters.
+4.3.2
+T-SNE Visualization Journeys.
+Data visualization is crucial for helping decision-making during
+massive data management [63]. Here we employed the dimension-
+ality reduction technique t-SNE to visualize the semantic clusters
+generated via Algorithm 1 and those identified through greedy
+graph traversal on an incomplete graph as described in ICLM. For
+the latter approach, each document was connected to its 20 nearest
+neighbors, facilitating the construction of the incomplete graph.
+Figure 4 clearly demonstrates the effectiveness of Algorithm 1
+in achieving semantic clustering, wherein the documents within
+each cluster display a pronounced semantic concentration. Upon
+applying t-SNE for dimensionality reduction and subsequent visu-
+alization, distinct clusters can be clearly delineated, showcasing
+notable semantic boundaries among them. This method underscores
+the capacity of semantic clustering to aggregate documents with
+high semantic similarity, enhancing the interpretability of large
+datasets. However, clusters obtained through the greedy graph tra-
+versal in ICLM exhibit substantial size variances, attributed mainly
+to the restriction of single visitation per document and absence of a
+strategic path truncation policy. As a result, such clusters display a
+wider range of semantic cohesion internally, which leads to a dimin-
+ished relational coherence among documents concatenated into the
+same context sequence, potentially undermining the efficacy of the
+clustering process. The ability of Algorithm 1 to produce semanti-
+cally concentrated clusters suggests a more robust framework for
+handling the complexities of large-scale training datasets.
+8
+
+===== PAGE 9 =====
+5
+EXPERIMENTS AND RESULTS
+In this section, we describe details of our experimental setup (Sec-
+tion 5.1), the baseline methods we use for comparison (Section 5.2),
+and experimental results (Section 5.3).
+5.1
+Experimental Setup
+We continue pretraining a Transformer decoder-only 7B model [18]
+similar to LLaMA framework [75] by different sources with the
+same distribution ratios to the previous pretraining stage, where
+we structured the data derived from the web (English) domain
+in accordance with a previously defined multi-objective partition
+allocation strategy (Section 4). The details of training datasets can
+be found in Section 4.3.
+Data Processing Details.
+During the data preprocessing
+phase, we tokenize raw documents from the training corpus [6],
+which collectively encompass 855 billion tokens, and then truncated
+the documents at varying sequence lengths of 16K, 32K, and 64K.
+In conducting vector embedding across our training datasets, we
+employed the BGE-m3 model [10] as our embedding model, encod-
+ing each document into a 1024-dimensional vector. The encoding
+process necessitated approximately 9 days using a 1,044,090 GPU
+cluster. Following this, we constructed an HNSW index based on
+FAISS index [35] to facilitate efficient similarity search for seman-
+tic clustering (Section 4.1). The greedy semantic-driven largest-fit
+partition algorithm (Section 4.2) within each cluster was executed
+on a 4114 CPU Ray cluster.
+Model Details.
+The model comprises a Transformer decoder
+with 32 attention heads across 32 layers. It features a hidden layer
+size of 4096, coupled with a dimensionality of 11008 for the forward
+propagation layers, and the base of Rotary Positional Encoding
+(RoPE) [71] is modified to accommodate longer context. We train
+with 16K, 32K, 64K sequence lengths using 15B tokens for the
+7B base model (recall that base model has the 16K context length),
+applied on 112 H800 GPUs across 14 nodes. We employ global batch
+sizes of 224, 112, and 56 sequences per step for context lengths of
+16K, 32K, and 64K, which aims at maintaining a uniform number
+of tokens for model parameter updates. The learning rate is set to
+3e-4 with linear warm-up over the first 1,000 optimization steps
+and cosine decay schedule.
+5.2
+Baselines
+We compare DataSculpt with the following baselines: (1) Random
+sampling is the standard method that places randomly shuffled and
+concatenated documents within each input context. (2) ICLM [68]
+utilizes a greedy graph traversal strategy to concatenate seman-
+tically similar documents within the context sequence, but only
+constructing an incomplete graph and restricting each document
+node to a single visit during traversal due to the extensive volume
+of the training corpus.
+5.3
+Results
+We perform evaluations to validate the effectiveness of DataSculpt
+on both common capabilities and long-context utilization across
+various downstream tasks, including general understanding (Sec-
+tion 5.3.1), retrieval augmentation (Section 5.3.2), summarization
+(Section 5.3.3), reading comprehension (Section 5.3.4) and code
+completion (Section 5.3.5).
+5.3.1
+General Understanding.
+General understanding tasks require the model to comprehend the
+text holistically, extracting key elements and answering queries,
+which focuses on broad understanding over specific task execution.
+We evaluate the 7B continual pretrained natural language models
+with zero-shot on MMLU [28], TyDiQA [13], BBH [69] and few-
+shot in-context learning on TREC [45]. The evaluation tasks cover
+different kinds of types, including question answering and text
+classification. Each dataset includes multiple subtasks, and each
+subtask comes with few-shot examples. In Table 3, we compare
+our models trained via DataSculpt with other baseline models in
+general understanding across various context window size. DataS-
+culpt not only aligns but also slightly outperforms the baselines,
+particularly in areas requiring multi-hop logical reasoning tasks
+(+4.88% compared to random sampling, +4.38% compared to ICLM).
+Table 3: Evaluation on general understanding tasks. Despite
+DataSculpt targeting to long-context utilization, it achieves
+performance slightly exceeds that of the baselines.
+Context Length
+Method
+MMLU
+TYDIQA
+BBH
+TREC
+16K
+random
+52.37
+21.45
+37.87
+68
+ICLM
+52.03
+22.27
+38.52
+71
+DataSculpt
+51.92
+24.75
+39.7
+71.5
+32K
+random
+47.09
+17.27
+33.81
+70.5
+ICLM
+48.09
+18.8
+29.95
+67.5
+DataSculpt
+48.36
+19.53
+35.35
+74.5
+64K
+random
+45.26
+15.28
+32.9
+68
+ICLM
+46.69
+16
+33.14
+69.5
+DataSculpt
+46.27
+17.55
+34.54
+71
+5.3.2
+Retrieval Augmentation.
+Retrieval augmentation involves LLMs to access external knowl-
+edge sources, such as databases or text corpora to retrieve pertinent
+information as required, effectively extending their memory and
+knowledge capabilities beyond what is available in their pretrained
+state. In assessing the performance of models on retrieval augmen-
+tation tasks, we focus on the models’ synthetic key-value retrieval
+performance [49] under settings of 140 and 300 key-value pairs and
+conduct a zero-shot evaluation using the TriviaQA dataset [36]. Fur-
+ther experiments are also undertaken on the “needle in a haystack”
+task [23, 37] with a maximum of 64K tokens to gain a comprehensive
+understanding of the effectiveness of these models in identifying
+specific information within extensive contexts.
+Results in Table 4 shows the superior performance of DataSculpt
+in key-value retrieval tasks across both 140 and 300 key-value pairs
+configurations, showcasing improvements of up to 59.09% over
+random sampling and 34.33% over ICLM. Since it proves challenging
+for a model trained with 16K sequence length to extrapolate its
+capabilities to 24K, models trained under such setting did not yield
+measurable scores in the 300 key-value pairs task. Additionally,
+Figure 5 illustrates the visualization outcomes for the “needle in
+a haystack” task, indicating that DataSculpt notably enhances the
+model’s ability to extrapolate beyond the training context lengths.
+9
+
+===== PAGE 10 =====
+Table 4: Key-value retrieval performance on dictionaries of 140 (≈11.2K tokens) and 300 (≈24K tokens) key-value pairs. 𝑝𝑖
+represents the scenario where the pertinent information is located at the 𝑖-th position. “-” indicates instances where the result
+is not applicable, as the tokenized context length exceeds the model’s capacity. Each position underwent evaluation across 500
+examples. The model trained with DataSculpt performs much higher accuracy on hard-to-retrieve positions.
+Context Length
+Method
+140 Key-Value Pairs
+300 Key-Value Pairs
+𝑝1
+𝑝35
+𝑝70
+𝑝105
+𝑝140
+Avg.
+𝑝1
+𝑝50
+𝑝100
+𝑝150
+𝑝200
+𝑝250
+𝑝300
+Avg.
+16K
+random
+97.2
+59.6
+20.6
+16.2
+8.8
+40.48
+-
+-
+-
+-
+-
+-
+-
+-
+ICLM
+99.8
+20.2
+25.6
+13.6
+11.6
+34.16
+-
+-
+-
+-
+-
+-
+-
+-
+DataSculpt
+99
+77.6
+46.8
+36.4
+12.6
+64.48
+-
+-
+-
+-
+-
+-
+-
+-
+32K
+random
+82.4
+48.8
+46.8
+38
+15
+46.2
+71.8
+15.8
+6.4
+4.4
+15.2
+6.6
+68.6
+26.97
+ICLM
+68
+53.8
+56.2
+52.6
+47.2
+55.56
+75
+17.7
+12.3
+8.6
+17.5
+22.3
+72.4
+32.26
+DataSculpt
+87
+91
+89.4
+81.6
+51.4
+80.08
+97
+26.2
+16
+13.6
+15.6
+29.8
+83.6
+40.26
+64K
+random
+99.6
+52.4
+43
+49.4
+45.4
+57.96
+99.4
+26.6
+26.2
+22.4
+4.2
+5.4
+45.4
+32.8
+ICLM
+92.4
+74
+78.8
+73.6
+56.8
+75.12
+88
+51.8
+48.2
+31.4
+16.7
+22.6
+56.3
+45
+DataSculpt
+99.8
+96.1
+92.4
+87.7
+61.5
+85.5
+97.4
+64.4
+56.8
+38
+24.8
+30.2
+72.6
+54.89
+Figure 5: “Needle in a haystack” performance comparison, where the x-axis represents the document’s length (the “haystack”),
+and the y-axis reflects the position of the “needle” (a short sentence) within the document, ranging from 1K to 64K tokens. The
+model’s performance in reciting information from the “needle” across various document lengths and positions is assessed on a
+scale from 1 to 10, represented through a color gradient transitioning from red (score of 1) to green (score of 10).
+5.3.3
+Summarization.
+Summarization tasks involve generation of concise and coherent
+abstracts from a given source text, which serves as a measure of
+a model’s ability to distill key information, maintain the original
+text’s intent, and present it in a brief and comprehensible manner.
+Compared to traditional QA and text classification tasks, which
+predominantly depend on local context for deriving solutions, sum-
+marization requires a broader understanding of the entire docu-
+ment [5]. This capability is more closely associated with the long-
+context processing capabilities of LLMs.
+10
+
+===== PAGE 11 =====
+Table 5: Average performance on retrieval augmentation
+tasks. DataSculpt outperforms the baselines on almost all
+datasets, with the mean improvement at 19.33%.
+Context Length
+Method
+K-V Retrieval
+TriviaQA
+Needle.
+16K
+random
+-
+86.15
+32.1
+ICLM
+-
+87.86
+33.7
+DataSculpt
+-
+89.58
+44.9
+32K
+random
+36.59
+86.31
+49.4
+ICLM
+43.91
+85.48
+58.2
+DataSculpt
+60.17
+84.12
+63.7
+64K
+random
+45.38
+85.85
+77.4
+ICLM
+60.06
+86.02
+82.8
+DataSculpt
+70.20
+86.84
+90
+We assess the continued pretrained models in a zero-shot setting
+on real-world benchmarks including GovReport [31] as well as
+QMSum [89], and employ few-shot in-context learning on SAM-
+Sum [24]. Here we utilize the ROUGE-L [46] metric, an N-gram
+based measure extensively adopted in QA and summarization tasks.
+Improvements in summarization tasks achieved through DataSculpt
+are documented in Table 6, showcasing enhancements of 21.21%
+over random sampling and 18.18% over ICLM.
+Table 6: Evaluation on summarization tasks. DataSculpt con-
+sistently surpasses baseline models across nearly all three
+datasets and various context lengths.
+Context Length
+Method
+GovReport
+QMSum
+SAMSum
+16K
+random
+24.51
+18.6
+15.83
+ICLM
+25.5
+17.43
+16.67
+DataSculpt
+27.66
+21.41
+20.41
+32K
+random
+24.04
+18.42
+12.23
+ICLM
+27.71
+18.72
+12.85
+DataSculpt
+28.83
+17.87
+24.04
+64K
+random
+26.75
+18.92
+12.47
+ICLM
+25.92
+17.82
+13.65
+DataSculpt
+29.42
+20.25
+18.41
+5.3.4
+Reading Comprehension.
+Reading comprehension assesses the capacity of models to generate
+responses to queries, grounded in the context provided within a
+given textual passage. We evaluate the models’ ability in reading
+comprehension with zero-shot on NarrativeQA [38], Qasper [14],
+HotPotQA [85] and 2WikiMultihopQA [29]. NarrativeQA and Qasper
+fall into the category of single-document question-answering (QA)
+datasets, whereas HotPotQA and 2WikiMultihopQA are recognized
+as Wikipedia-based, multi-hop QA datasets. Evaluation across these
+datasets is conducted using the F1 metric, and enhancements attrib-
+uted to our DataSculpt in reading comprehension tasks are further
+detailed in Table 7 and Table 8.
+5.3.5
+Code Completion.
+Code completion serves as a critical and challenging task for eval-
+uating a model’s long context modeling ability, which facilitates
+user coding by predicting and completing code segments based on
+Table 7: In zero-shot evaluations on the validation subsets of
+NarrativeQA and Qasper, DataSculpt records improvements
+of 27.06% over random sampling and 13.22% over ICLM.
+Context Length
+Method
+NarrativeQA
+Qasper
+16K
+random
+7.46
+7.53
+ICLM
+12.34
+9.6
+DataSculpt
+19.33
+9.83
+32K
+random
+11.09
+10.55
+ICLM
+16.47
+9.63
+DataSculpt
+18.33
+11.35
+64K
+random
+16.53
+9.16
+ICLM
+14.07
+9.97
+DataSculpt
+18.45
+9.07
+Table 8: Zero-shot F1 performance on the reading compre-
+hension tasks of HotPotQA and 2WikiMultihopQA datasets,
+with an average improvement of 10.54% on HotPotQA and
+6.86% on 2WikiMultihopQA.
+Context Length
+Method
+HotPotQA
+2WikiMultihopQA
+16K
+random
+3.52
+8.66
+ICLM
+8.07
+9.57
+DataSculpt
+7.68
+9.82
+32K
+random
+10.09
+10.45
+ICLM
+8.73
+10.39
+DataSculpt
+8.31
+11.24
+64K
+random
+8
+9.98
+ICLM
+8.47
+9.51
+DataSculpt
+9.92
+10.23
+previous inputs and contextual understanding. For code completion
+tasks, we assess the models using zero-shot learning on the Hu-
+manEval dataset [12], LCC [25], and RepoBench-P [50], where the
+latter two datasets are specifically designed for long code modeling
+evaluation. Here we applied execution-based accuracy (Pass@1)
+for HumanEval evaluation and Edit Sim (Levenshtein distance) for
+the remaining two code generation tasks.
+Table 9: Performance on code completion, with an enhance-
+ment of 4.23% over random sampling and 3.46% on ICLM.
+Context Length
+Method
+HumanEval
+LCC
+RepoBench-P
+16K
+random
+10.37
+65
+60.24
+ICLM
+10.58
+64.22
+55.64
+DataSculpt
+11.74
+68.28
+61.54
+32K
+random
+12.2
+64.52
+57.85
+ICLM
+12.26
+62.91
+60.94
+DataSculpt
+12.68
+68.58
+59.21
+64K
+random
+12.8
+64.01
+57.06
+ICLM
+12.88
+67.11
+58.9
+DataSculpt
+13.01
+64.37
+60.04
+Results of zero-shot evaluation are presented in Table 9, which
+reveals a modest advantage of DataSculpt in synergizing average
+11
+
+===== PAGE 12 =====
+General Understanding
+Retrieval 
+Augmentation
+Summarization
+Reading Comprehension
+Code 
+Completion
+General Understanding
+Summarization
+Reading Comprehension
+Code 
+Completion
+Retrieval 
+Augmentation
+General Understanding
+Retrieval 
+Augmentation
+Summarization
+Reading Comprehension
+Code 
+Completion
+ICLM
+DataSculpt
+Random Sample
+16K
+32K
+64K
+Figure 6: Radar charts depicting the average performance metrics of models trained with varying sequence lengths on a
+spectrum of benchmark categories. Among all evaluated training lengths, models developed using the DataSculpt approach
+surpass baseline-trained models in performance metrics across a diverse range of benchmark categories.
+scores for models’ code capabilities. While the data was not explic-
+itly structured for the coding domain, advancements in long-context
+processing achieved through DataSculpt have correspondingly man-
+ifested in enhanced coding performance.
+6
+RELATED WORK
+6.1
+Data-Centric Long-Context Training
+Training Large Language Models (LLMs) with expanded context
+windows facilitates the execution of tasks that surpass the capa-
+bilities defined by the existing paradigm, such as multi-document
+question answering [8], long document summarization [5], and
+enhanced retrieval functionalities [49]. However, LLMs’ efficacy in
+handling long context does not consistently meet the expected stan-
+dards. Data-focused approaches hold substantial importance [81]
+for enhancing LLMs’ long-context capabilities.
+The construction of long-context data involves more than a
+mere concatenation of short documents, which can lead to cross-
+document attention within a sequence. In these circumstances,
+formulating high-quality or domain-specific long sequences holds
+significant research value [15]. There have been data-centric efforts
+made in improving LLMs’ capabilities for long context process-
+ing. ICLM [68] and SPLICE [70] combine similar training instances
+through a sophisticated retrieval process, which emphasizes the
+critical role of high-quality long-context training data in enhancing
+the context expansion capabilities of LLMs without necessitating
+extensive data resources. Additionally, Krell et al. [39] deliberate on
+the challenges associated with the conventional concat-and-chunk
+approach, proposing an approximate bin-packing algorithm as a
+potential solution. As an improvement, dataset decomposition [61]
+and Best-fit Packing [17] both propose the sequence length aware
+optimization technique to minimize truncations, thereby facilitating
+more efficient pretraining on long sequences and achieving scalabil-
+ity relative to the size of dataset. Moreover, ProLong [11] introduces
+an evaluation framework for assessing the quality of long-context
+data, further enriching the field’s methodological toolkit. Nonethe-
+less, these methods have not performed a systematic framework
+tailored for data construction in long context training. Our work
+conceptualizes data management for extended-context training as
+a multi-objective combinatorial optimization problem, and provide
+a comprehensive framework for long sequence data organization.
+6.2
+MOCO-Augmented LLMs
+Existing works have integrated Multi-objective combinatorial op-
+timization (MOCO) problems with relevant concerns in the LLMs
+field. Wang et al. [80] employed the MOCO approach within the
+Reinforcement Learning from Human Feedback (RLHF) framework
+for LLMs, where the reward models aggregate multiple reward ob-
+jectives with coefficients into a scalar score. Akiba et al. [3] viewed
+model merging as a MOCO challenge, and introduced an innovative
+approach that leverages evolutionary algorithms to facilitate the
+automated development of robust foundation models. Furthermore,
+integration of MOCO with data-centric LLMs have been explored
+for training data selection [11, 20, 84], which applies heuristic tech-
+niques to assign weights to different data evaluation metrics and
+facilitates a phased resolution approach. Considering the extensive
+scale of training dataset, data construction for long context is treated
+as a MOCO challenge, for which the coarse-to-fine algorithm is
+identified as a suitable resolution strategy.
+7
+CONCLUSION
+The ability to process long contexts is crucial for Large Language
+Models (LLMs), making the effective training of LLMs for extended-
+context tasks from a data-centric perspective a worthy area of in-
+vestigation. A pressing challenge lies in organizing long-sequence
+data for domains lacking extensive text, while ensuring diversity
+in domain knowledge. In this work, we introduced DataSculpt,
+a framework for organizing long-context training data, conceptu-
+alizing the task as a multi-objective combinatorial optimization
+problem. This framework considered factors including relevance,
+homogeneity, integrity, and computational costs associated with
+data construction, employing a coarse-to-fine method for phased
+greedy solutions. Experimental results indicated that data organized
+via DataSculpt significantly enhances long-context capabilities with-
+out compromising general inference abilities, marking a substantial
+improvement over existing data management methods.
+12
+
+===== PAGE 13 =====
+REFERENCES
+[1] Daniel J. Abadi, Adam Marcus, Samuel R. Madden, and Kate Hollenbach. 2009.
+SW-Store: a vertically partitioned DBMS for Semantic Web data management.
+The VLDB Journal 18, 2 (apr 2009), 385–406. https://doi.org/10.1007/s00778-008-
+0125-y
+[2] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Floren-
+cia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal
+Anadkat, et al. 2023. Gpt-4 technical report. arXiv preprint arXiv:2303.08774
+(2023).
+[3] Takuya Akiba, Makoto Shing, Yujin Tang, Qi Sun, and David Ha. 2024. Evolu-
+tionary optimization of model merging recipes. arXiv preprint arXiv:2403.13187
+(2024).
+[4] Rohan Anil, Andrew M Dai, Orhan Firat, Melvin Johnson, Dmitry Lepikhin,
+Alexandre Passos, Siamak Shakeri, Emanuel Taropa, Paige Bailey, Zhifeng Chen,
+et al. 2023. Palm 2 technical report. arXiv preprint arXiv:2305.10403 (2023).
+[5] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang,
+Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, et al. 2023. Longbench: A
+bilingual, multitask benchmark for long context understanding. arXiv preprint
+arXiv:2308.14508 (2023).
+[6] Baichuan. 2023. Baichuan 2: Open Large-scale Language Models. arXiv preprint
+arXiv:2309.10305 (2023). https://arxiv.org/abs/2309.10305
+[7] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan,
+Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, et al. 2020. Language models are few-shot learners. Advances in neural
+information processing systems 33 (2020), 1877–1901.
+[8] Avi Caciularu, Matthew E Peters, Jacob Goldberger, Ido Dagan, and Arman Cohan.
+2023. Peek across: Improving multi-document modeling via cross-document
+question-answering. arXiv preprint arXiv:2305.15387 (2023).
+[9] Stephanie Chan, Adam Santoro, Andrew Lampinen, Jane Wang, Aaditya Singh,
+Pierre Richemond, James McClelland, and Felix Hill. 2022. Data distributional
+properties drive emergent in-context learning in transformers. Advances in
+Neural Information Processing Systems 35 (2022), 18878–18891.
+[10] Jianlv Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. 2024.
+Bge m3-embedding: Multi-lingual, multi-functionality, multi-granularity text
+embeddings through self-knowledge distillation. arXiv preprint arXiv:2402.03216
+(2024).
+[11] Longze Chen, Ziqiang Liu, Wanwei He, Yunshui Li, Run Luo, and Min Yang. 2024.
+Long Context is Not Long at All: A Prospector of Long-Dependency Data for
+Large Language Models. arXiv preprint arXiv:2405.17915 (2024).
+[12] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde
+De Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph,
+Greg Brockman, et al. 2021. Evaluating large language models trained on code.
+arXiv preprint arXiv:2107.03374 (2021).
+[13] Jonathan H Clark, Eunsol Choi, Michael Collins, Dan Garrette, Tom Kwiatkowski,
+Vitaly Nikolaev, and Jennimaria Palomaki. 2020. Tydi qa: A benchmark for
+information-seeking question answering in ty pologically di verse languages.
+Transactions of the Association for Computational Linguistics 8 (2020), 454–470.
+[14] Pradeep Dasigi, Kyle Lo, Iz Beltagy, Arman Cohan, Noah A Smith, and Matt
+Gardner. 2021. A dataset of information-seeking questions and answers anchored
+in research papers. arXiv preprint arXiv:2105.03011 (2021).
+[15] Harm de Vries. 2023. In the long (context) run. https://www.harmdevries.com/
+post/context-length/
+[16] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2018. Bert:
+Pre-training of deep bidirectional transformers for language understanding.
+arXiv preprint arXiv:1810.04805 (2018).
+[17] Hantian Ding, Zijian Wang, Giovanni Paolini, Varun Kumar, Anoop Deoras, Dan
+Roth, and Stefano Soatto. 2024. Fewer truncations improve language modeling.
+arXiv preprint arXiv:2404.10830 (2024).
+[18] Guosheng Dong, Da Pan, Yiding Sun, Shusen Zhang, Zheng Liang, Xin Wu,
+Yanjun Shen, Fan Yang, Haoze Sun, Tianpeng Li, Mingan Lin, Jianhua Xu, Yufan
+Zhang, Xiaonan Nie, Lei Su, Bingning Wang, Wentao Zhang, Jiaxin Mao, Zenan
+Zhou, and Weipeng Chen. 2024. BaichuanSEED: Sharing the Potential of Exten-
+sivE Data Collection and Deduplication by Introducing a Competitive Large Lan-
+guage Model Baseline. arXiv:2408.15079 [cs.CL] https://arxiv.org/abs/2408.15079
+[19] Alexey Dosovitskiy. 2020. An image is worth 16x16 words: Transformers for
+image recognition at scale. arXiv preprint arXiv:2010.11929 (2020).
+[20] Qianlong Du, Chengqing Zong, and Jiajun Zhang. 2023. Mods: Model-oriented
+data selection for instruction tuning. arXiv preprint arXiv:2311.15653 (2023).
+[21] Yogesh K Dwivedi, Laurie Hughes, Elvira Ismagilova, Gert Aarts, Crispin Coombs,
+Tom Crick, Yanqing Duan, Rohita Dwivedi, John Edwards, Aled Eirug, et al. 2021.
+Artificial Intelligence (AI): Multidisciplinary perspectives on emerging chal-
+lenges, opportunities, and agenda for research, practice and policy. International
+journal of information management 57 (2021), 101994.
+[22] Raul Castro Fernandez, Aaron J Elmore, Michael J Franklin, Sanjay Krishnan, and
+Chenhao Tan. 2023. How large language models will disrupt data management.
+Proceedings of the VLDB Endowment 16, 11 (2023), 3302–3309.
+[23] Yao Fu, Rameswar Panda, Xinyao Niu, Xiang Yue, Hannaneh Hajishirzi, Yoon
+Kim, and Hao Peng. 2024. Data engineering for scaling language models to 128k
+context. arXiv preprint arXiv:2402.10171 (2024).
+[24] Bogdan Gliwa, Iwona Mochol, Maciej Biesek, and Aleksander Wawer. 2019. SAM-
+Sum corpus: A human-annotated dialogue dataset for abstractive summarization.
+arXiv preprint arXiv:1911.12237 (2019).
+[25] Daya Guo, Canwen Xu, Nan Duan, Jian Yin, and Julian McAuley. 2023. Longcoder:
+A long-range pre-trained language model for code completion. In International
+Conference on Machine Learning. PMLR, 12098–12107.
+[26] Kshitij Gupta, Benjamin Thérien, Adam Ibrahim, Mats L Richter, Quentin An-
+thony, Eugene Belilovsky, Irina Rish, and Timothée Lesort. 2023. Continual
+Pre-Training of Large Language Models: How to (re) warm your model? arXiv
+preprint arXiv:2308.04014 (2023).
+[27] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. 2016. Deep residual
+learning for image recognition. In Proceedings of the IEEE conference on computer
+vision and pattern recognition. 770–778.
+[28] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn
+Song, and Jacob Steinhardt. 2021. Measuring Massive Multitask Language Under-
+standing. Proceedings of the International Conference on Learning Representations
+(ICLR) (2021).
+[29] Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. 2020.
+Constructing a multi-hop QA dataset for comprehensive evaluation of reasoning
+steps. arXiv preprint arXiv:2011.01060 (2020).
+[30] Haoyang Huang, Yaobo Liang, Nan Duan, Ming Gong, Linjun Shou, Daxin Jiang,
+and Ming Zhou. 2019. Unicoder: A universal language encoder by pre-training
+with multiple cross-lingual tasks. arXiv preprint arXiv:1909.00964 (2019).
+[31] Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng Ji, and Lu Wang.
+2021. Efficient attentions for long document summarization. arXiv preprint
+arXiv:2104.02112 (2021).
+[32] Adam Ibrahim, Benjamin Thérien, Kshitij Gupta, Mats L Richter, Quentin An-
+thony, Timothée Lesort, Eugene Belilovsky, and Irina Rish. 2024. Simple and
+scalable strategies to continually pre-train large language models. arXiv preprint
+arXiv:2403.08763 (2024).
+[33] Gautier Izacard, Mathilde Caron, Lucas Hosseini, Sebastian Riedel, Piotr Bo-
+janowski, Armand Joulin, and Edouard Grave. 2021. Unsupervised dense in-
+formation retrieval with contrastive learning. arXiv preprint arXiv:2112.09118
+(2021).
+[34] Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, De-
+vendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel,
+Guillaume Lample, Lucile Saulnier, et al. 2023.
+Mistral 7B.
+arXiv preprint
+arXiv:2310.06825 (2023).
+[35] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2019. Billion-scale similarity
+search with GPUs. IEEE Transactions on Big Data 7, 3 (2019), 535–547.
+[36] Mandar Joshi, Eunsol Choi, Daniel S Weld, and Luke Zettlemoyer. 2017. Triviaqa:
+A large scale distantly supervised challenge dataset for reading comprehension.
+arXiv preprint arXiv:1705.03551 (2017).
+[37] Gregory Kamradt. 2023. Needle In A Haystack - pressure testing LLMs. https:
+//github.com/gkamradt/LLMTest/NeedleInAHaystack/tree/main. Accessed: 2024-
+08-13.
+[38] Tomáš Kočisk`y, Jonathan Schwarz, Phil Blunsom, Chris Dyer, Karl Moritz Her-
+mann, Gábor Melis, and Edward Grefenstette. 2018. The narrativeqa reading
+comprehension challenge. Transactions of the Association for Computational
+Linguistics 6 (2018), 317–328.
+[39] Mario Michael Krell, Matej Kosec, Sergio P Perez, and Andrew Fitzgibbon. 2021.
+Efficient sequence packing without cross-contamination: Accelerating large
+language models without impacting performance. arXiv preprint arXiv:2107.02027
+(2021).
+[40] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. 2012. ImageNet Clas-
+sification with Deep Convolutional Neural Networks. In Advances in Neural
+Information Processing Systems, F. Pereira, C.J. Burges, L. Bottou, and K.Q. Wein-
+berger (Eds.), Vol. 25. Curran Associates, Inc. https://proceedings.neurips.cc/
+paper_files/paper/2012/file/c399862d3b9d6b76c8436e924a68c45b-Paper.pdf
+[41] Arun Kumar, Matthias Boehm, and Jun Yang. 2017. Data Management in Machine
+Learning: Challenges, Techniques, and Systems. In Proceedings of the 2017 ACM
+International Conference on Management of Data (Chicago, Illinois, USA) (SIGMOD
+’17). Association for Computing Machinery, New York, NY, USA, 1717–1722.
+https://doi.org/10.1145/3035918.3054775
+[42] Yoav Levine, Noam Wies, Daniel Jannai, Dan Navon, Yedid Hoshen, and Amnon
+Shashua. 2021. The inductive bias of in-context learning: Rethinking pretraining
+example design. arXiv preprint arXiv:2110.04541 (2021).
+[43] Aitor Lewkowycz, Anders Andreassen, David Dohan, Ethan Dyer, Henryk
+Michalewski, Vinay Ramasesh, Ambrose Slone, Cem Anil, Imanol Schlag, Theo
+Gutman-Solo, et al. 2022. Solving quantitative reasoning problems with language
+models. Advances in Neural Information Processing Systems 35 (2022), 3843–3857.
+[44] Jiaqi Li, Mengmeng Wang, Zilong Zheng, and Muhan Zhang. 2023. LooGLE:
+Can Long-Context Language Models Understand Long Contexts? arXiv preprint
+arXiv:2311.04939 (2023).
+13
+
+===== PAGE 14 =====
+[45] Xin Li and Dan Roth. 2002. Learning Question Classifiers. In COLING 2002: The
+19th International Conference on Computational Linguistics. https://www.aclweb.
+org/anthology/C02-1150
+[46] Chin-Yew Lin. 2004. Rouge: A package for automatic evaluation of summaries.
+In Text summarization branches out. 74–81.
+[47] Xi Lin, Zhiyuan Yang, Xiaoyuan Zhang, and Qingfu Zhang. 2022. Pareto set learn-
+ing for expensive multi-objective optimization. Advances in neural information
+processing systems 35 (2022), 19231–19247.
+[48] Pierre Lison and Andrey Kutuzov. 2017. Redefining context windows for word
+embedding models: An experimental study. arXiv preprint arXiv:1704.05781
+(2017).
+[49] Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua,
+Fabio Petroni, and Percy Liang. 2024. Lost in the middle: How language models
+use long contexts. Transactions of the Association for Computational Linguistics
+12 (2024), 157–173.
+[50] Tianyang Liu, Canwen Xu, and Julian McAuley. 2023. Repobench: Benchmarking
+repository-level code auto-completion systems. arXiv preprint arXiv:2306.03091
+(2023).
+[51] Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin,
+and Baining Guo. 2021. Swin transformer: Hierarchical vision transformer
+using shifted windows. In Proceedings of the IEEE/CVF international conference
+on computer vision. 10012–10022.
+[52] Yu A Malkov and Dmitry A Yashunin. 2018. Efficient and robust approximate
+nearest neighbor search using hierarchical navigable small world graphs. IEEE
+transactions on pattern analysis and machine intelligence 42, 4 (2018), 824–836.
+[53] Nargess Memarsadeghi, David M Mount, Nathan S Netanyahu, and Jacqueline
+Le Moigne. 2007. A fast implementation of the ISODATA clustering algorithm.
+International Journal of Computational Geometry & Applications 17, 01 (2007),
+71–103.
+[54] Xupeng Miao, Zhihao Jia, and Bin Cui. 2024. Demystifying Data Management
+for Large Language Models. In Companion of the 2024 International Conference
+on Management of Data. 547–555.
+[55] Xupeng Miao, Yujie Wang, Youhe Jiang, Chunan Shi, Xiaonan Nie, Hailin Zhang,
+and Bin Cui. 2022. Galvatron: Efficient Transformer Training over Multiple
+GPUs Using Automatic Parallelism. Proc. VLDB Endow. 16, 3 (Nov. 2022), 470–479.
+https://doi.org/10.14778/3570690.3570697
+[56] Xiaonan Nie, Yi Liu, Fangcheng Fu, Jinbao Xue, Dian Jiao, Xupeng Miao, Yangyu
+Tao, and Bin Cui. 2023. Angel-PTM: A Scalable and Economical Large-Scale
+Pre-Training System in Tencent. Proc. VLDB Endow. 16, 12 (Aug. 2023), 3781–3794.
+https://doi.org/10.14778/3611540.3611564
+[57] OpenAI. 2022. ChatGPT: Optimizing Language Models for Dialogue. https:
+//openai.com/blog/chatgpt/.
+[58] James Jie Pan, Jianguo Wang, and Guoliang Li. 2024. Survey of vector database
+management systems. The VLDB Journal 33, 5 (jul 2024), 1591–1615.
+https:
+//doi.org/10.1007/s00778-024-00864-x
+[59] Jupinder Parmar, Sanjev Satheesh, Mostofa Patwary, Mohammad Shoeybi, and
+Bryan Catanzaro. 2024. Reuse, Don’t Retrain: A Recipe for Continued Pretraining
+of Language Models. arXiv preprint arXiv:2407.07263 (2024).
+[60] Neoklis Polyzotis, Sudip Roy, Steven Euijong Whang, and Martin Zinkevich. 2017.
+Data Management Challenges in Production Machine Learning. In Proceedings of
+the 2017 ACM International Conference on Management of Data (Chicago, Illinois,
+USA) (SIGMOD ’17). Association for Computing Machinery, New York, NY, USA,
+1723–1726. https://doi.org/10.1145/3035918.3054782
+[61] Hadi Pouransari, Chun-Liang Li, Jen-Hao Rick Chang, Pavan Kumar Anasosalu
+Vasu, Cem Koc, Vaishaal Shankar, and Oncel Tuzel. 2024. Dataset Decomposition:
+Faster LLM Training with Variable Sequence Length Curriculum. arXiv preprint
+arXiv:2405.13226 (2024).
+[62] Kishore Prakash, Shashwat Rao, Rayan Hamza, Jack Lukich, Vatsal Chaudhari,
+and Arnab Nandi. 2024. Integrating LLMs into Database Systems Education. In
+Proceedings of the 3rd International Workshop on Data Systems Education: Bridging
+education practice with education research. 33–39.
+[63] Xuedi Qin, Yuyu Luo, Nan Tang, and Guoliang Li. 2019. Making data visualization
+more efficient and effective: a survey. The VLDB Journal 29, 1 (nov 2019), 93–117.
+https://doi.org/10.1007/s00778-019-00588-3
+[64] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya
+Sutskever, et al. 2019. Language models are unsupervised multitask learners.
+OpenAI blog 1, 8 (2019), 9.
+[65] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang,
+Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. 2020. Exploring the
+limits of transfer learning with a unified text-to-text transformer. Journal of
+machine learning research 21, 140 (2020), 1–67.
+[66] Carlos Riquelme, Joan Puigcerver, Basil Mustafa, Maxim Neumann, Rodolphe
+Jenatton, André Susano Pinto, Daniel Keysers, and Neil Houlsby. 2021. Scaling
+vision with sparse mixture of experts. Advances in Neural Information Processing
+Systems 34 (2021), 8583–8595.
+[67] Stephen Robertson, Hugo Zaragoza, et al. 2009. The probabilistic relevance
+framework: BM25 and beyond. Foundations and Trends® in Information Retrieval
+3, 4 (2009), 333–389.
+[68] Weijia Shi, Sewon Min, Maria Lomeli, Chunting Zhou, Margaret Li, Victoria Lin,
+Noah A Smith, Luke Zettlemoyer, Scott Yih, and Mike Lewis. 2023. In-Context
+Pretraining: Language Modeling Beyond Document Boundaries. arXiv preprint
+arXiv:2310.10638 (2023).
+[69] Aarohi Srivastava, Abhinav Rastogi, Abhishek Rao, Abu Awal Md Shoeb,
+Abubakar Abid, Adam Fisch, Adam R Brown, Adam Santoro, Aditya Gupta,
+Adrià Garriga-Alonso, et al. 2022. Beyond the imitation game: Quantifying and
+extrapolating the capabilities of language models. arXiv preprint arXiv:2206.04615
+(2022).
+[70] Konrad Staniszewski, Szymon Tworkowski, Sebastian Jaszczur, Henryk
+Michalewski, Łukasz Kuciński, and Piotr Miłoś. 2023. Structured Packing in LLM
+Training Improves Long Context Utilization. arXiv preprint arXiv:2312.17296
+(2023).
+[71] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng
+Liu. 2024. Roformer: Enhanced transformer with rotary position embedding.
+Neurocomputing 568 (2024), 127063.
+[72] Christian Szegedy, Wei Liu, Yangqing Jia, Pierre Sermanet, Scott Reed, Dragomir
+Anguelov, Dumitru Erhan, Vincent Vanhoucke, and Andrew Rabinovich. 2015.
+Going deeper with convolutions. In Proceedings of the IEEE conference on computer
+vision and pattern recognition. 1–9.
+[73] Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste
+Alayrac, Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth,
+et al. 2023. Gemini: a family of highly capable multimodal models. arXiv preprint
+arXiv:2312.11805 (2023).
+[74] Quoc-Cuong To, Juan Soto, and Volker Markl. 2018. A survey of state manage-
+ment in big data processing systems. The VLDB Journal 27, 6 (dec 2018), 847–872.
+https://doi.org/10.1007/s00778-018-0514-9
+[75] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yas-
+mine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhos-
+ale, et al. 2023. Llama 2: Open foundation and fine-tuned chat models. arXiv
+preprint arXiv:2307.09288 (2023).
+[76] Ekunda Lukata Ulungu and Jacques Teghem. 1994. Multi-objective combinatorial
+optimization problems: A survey. Journal of Multi-Criteria Decision Analysis 3, 2
+(1994), 83–104.
+[77] Laurens Van der Maaten and Geoffrey Hinton. 2008. Visualizing data using
+t-SNE. Journal of machine learning research 9, 11 (2008).
+[78] Dušan Variš and Ondřej Bojar. 2021. Sequence length is a domain: Length-based
+overfitting in transformer models. arXiv preprint arXiv:2109.07276 (2021).
+[79] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. Advances in neural information processing systems 30 (2017).
+[80] Haoxiang Wang, Wei Xiong, Tengyang Xie, Han Zhao, and Tong Zhang. 2024.
+Interpretable Preferences via Multi-Objective Reward Modeling and Mixture-of-
+Experts. arXiv preprint arXiv:2406.12845 (2024).
+[81] Zige Wang, Wanjun Zhong, Yufei Wang, Qi Zhu, Fei Mi, Baojun Wang, Lifeng
+Shang, Xin Jiang, and Qun Liu. 2023. Data management for large language
+models: A survey. arXiv preprint arXiv:2312.01700 (2023).
+[82] Steven Euijong Whang, Yuji Roh, Hwanjun Song, and Jae-Gil Lee. 2023. Data
+collection and quality challenges in deep learning: a data-centric AI perspective.
+The VLDB Journal 32, 4 (jan 2023), 791–813. https://doi.org/10.1007/s00778-022-
+00775-9
+[83] Wenhan Xiong, Jingyu Liu, Igor Molybog, Hejia Zhang, Prajjwal Bhargava, Rui
+Hou, Louis Martin, Rashi Rungta, Karthik Abinav Sankararaman, Barlas Oguz,
+et al. 2023. Effective long-context scaling of foundation models. arXiv preprint
+arXiv:2309.16039 (2023).
+[84] Yang Xu, Yongqiang Yao, Yufan Huang, Mengnan Qi, Maoquan Wang, Bin Gu,
+and Neel Sundaresan. 2023. Rethinking the instruction quality: LIFT is what you
+need. arXiv preprint arXiv:2312.11508 (2023).
+[85] Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William W Cohen, Ruslan
+Salakhutdinov, and Christopher D Manning. 2018. HotpotQA: A dataset for di-
+verse, explainable multi-hop question answering. arXiv preprint arXiv:1809.09600
+(2018).
+[86] Han Zhang, Ian Goodfellow, Dimitris Metaxas, and Augustus Odena. 2019. Self-
+attention generative adversarial networks. In International conference on machine
+learning. PMLR, 7354–7363.
+[87] Wayne Xin Zhao, Kun Zhou, Junyi Li, Tianyi Tang, Xiaolei Wang, Yupeng Hou,
+Yingqian Min, Beichen Zhang, Junjie Zhang, Zican Dong, et al. 2023. A survey
+of large language models. arXiv preprint arXiv:2303.18223 (2023).
+[88] Ying Zhao, George Karypis, and Usama Fayyad. 2005. Hierarchical clustering
+algorithms for document datasets. Data mining and knowledge discovery 10
+(2005), 141–168.
+[89] Ming Zhong, Da Yin, Tao Yu, Ahmad Zaidi, Mutethia Mutuma, Rahul Jha,
+Ahmed Hassan Awadallah, Asli Celikyilmaz, Yang Liu, Xipeng Qiu, et al. 2021.
+QMSum: A new benchmark for query-based multi-domain meeting summariza-
+tion. arXiv preprint arXiv:2104.05938 (2021).
+14
